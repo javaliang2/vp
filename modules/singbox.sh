@@ -615,6 +615,41 @@ manage_configs() {
     echo -e "${GREEN}===============================================${PLAIN}"
     echo -e "\n${YELLOW}>>>> 节点分享链接 <<<<${PLAIN}"
 
+    # ================== 新增：Cloudflare CDN 入站优选拦截 ==================
+    local IS_CDN_VLESS=false
+    if [[ "$TYPE" == "vless" ]]; then
+        local SID; SID=$(echo "$CONF" | jq -r '.tls.reality.short_id[0] // ""')
+        local WSPATH; WSPATH=$(echo "$CONF" | jq -r '.transport.path // ""')
+        # 如果是 vless 协议，且没有 short_id (非Reality)，且有 transport 路径，说明是标准 WS-TLS 套 CDN 节点
+        if [[ -z "$SID" && -n "$WSPATH" ]]; then
+            IS_CDN_VLESS=true
+        fi
+    fi
+
+    if [[ "$IS_CDN_VLESS" == "true" ]]; then
+        read -p "提示：检测到该节点为 WebSocket 节点，是否启用 Cloudflare 入站优选生成链接？(y/N): " choice_cf
+        if [[ "${choice_cf,,}" == "y" ]]; then
+            echo -e "\n------------------------------------------------"
+            echo -e "请选择要注入客户端的 Cloudflare 优选 CNAME 方案："
+            echo -e "  ${GREEN}1.${PLAIN} 自动轮询方案 (推荐: 汇聚多方测速，每15分钟动态更新)"
+            echo -e "  ${GREEN}2.${PLAIN} 台湾全网优化方案 (适配各大运营商优质节点)"
+            echo -e "------------------------------------------------"
+            read -p "请选择 [1-2, 默认1]: " cname_choice
+            
+            local target_server="cf.090227.xyz"
+            [[ "$cname_choice" == "2" ]] && target_server="icook.tw"
+            
+            local UUID; UUID=$(echo "$CONF" | jq -r '.users[0].uuid')
+            SNI=$(echo "$CONF" | jq -r '.tls.server_name // ""')
+            WSPATH=$(echo "$CONF" | jq -r '.transport.path // ""')
+            
+            echo -e "\n${GREEN}✔ 优选配置生成成功！${PLAIN}"
+            # 核心调包点：将连接目标改为 target_server，同时强制锁死 host 和 sni 为你的真实伪装域名
+            echo -e "${BLUE}vless://$UUID@$target_server:$PORT?encryption=none&security=tls&type=ws&host=$SNI&sni=$SNI&path=$WSPATH#${TAG}-CF优选入站${PLAIN}"
+            echo ""; pause; return
+        fi
+    fi
+    # =====================================================================
     if [[ -f "$LINK_DIR/${TAG}.link" ]]; then
         echo -e "${BLUE}$(cat "$LINK_DIR/${TAG}.link")${PLAIN}"
     else
@@ -626,9 +661,8 @@ manage_configs() {
                 local UUID; UUID=$(echo "$CONF" | jq -r '.users[0].uuid')
                 local SID;  SID=$(echo  "$CONF" | jq -r '.tls.reality.short_id[0] // ""')
                 if [[ -n "$SID" ]]; then
-                    # [F07] Reality 公钥不在配置文件中，提示并建议重建
                     echo -e "${RED}Reality 节点公钥 (pbk) 未存储于 config.json。${PLAIN}"
-                    echo -e "${YELLOW}请查看 $LINK_DIR/${TAG}.link，或删除重建该节点。${PLAIN}"
+                    echo -e "${YELLOW}请查看 $LINK_DIR/${TAG}.link，或删除重建该节点. ${PLAIN}"
                 else
                     local WSPATH; WSPATH=$(echo "$CONF" | jq -r '.transport.path // ""')
                     echo -e "${BLUE}vless://$UUID@$HOST:$PORT?encryption=none&security=tls&type=ws&host=$SNI&path=$WSPATH#$TAG${PLAIN}"
