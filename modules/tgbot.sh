@@ -191,6 +191,36 @@ register_commands() {
 }
 
 # ──────────────────────────────────────────
+# CPU 使用率获取（修复版）
+# ──────────────────────────────────────────
+get_cpu_usage() {
+    local cpu1 cpu2 idle1 idle2 total1 total2 diff_total diff_idle
+    
+    # 从 /proc/stat 获取第一次采样
+    read cpu1 user1 nice1 sys1 idle1 iowait1 rest1 < <(awk '/^cpu[^0-9]/ {print $1,$2,$3,$4,$5,$6,$7}' /proc/stat)
+    
+    sleep 0.1
+    
+    # 获取第二次采样
+    read cpu2 user2 nice2 sys2 idle2 iowait2 rest2 < <(awk '/^cpu[^0-9]/ {print $1,$2,$3,$4,$5,$6,$7}' /proc/stat)
+    
+    # 计算总的 tick 变化（user + nice + sys + idle + iowait + irq + softirq）
+    total1=$(( user1 + nice1 + sys1 + idle1 + iowait1 + rest1 ))
+    total2=$(( user2 + nice2 + sys2 + idle2 + iowait2 + rest2 ))
+    diff_total=$(( total2 - total1 ))
+    
+    # 计算空闲时间的变化
+    diff_idle=$(( idle2 - idle1 ))
+    
+    if [[ $diff_total -gt 0 ]]; then
+        # CPU使用率 = (1 - idle_change / total_change) * 100
+        awk "BEGIN{printf \"%.1f\", (1 - $diff_idle/$diff_total) * 100}"
+    else
+        echo "N/A"
+    fi
+}
+
+# ──────────────────────────────────────────
 # 数据采集函数
 # ──────────────────────────────────────────
 
@@ -255,10 +285,9 @@ get_system_stats() {
     local load
     load=$(uptime | awk -F'load average:' '{print $2}' | xargs 2>/dev/null || echo "N/A")
 
-    local cpu_idle cpu_pct
-    cpu_idle=$(top -bn1 2>/dev/null | grep "Cpu(s)" | \
-        awk '{for(i=1;i<=NF;i++) if($i~/id,/) print $(i-1)}')
-    cpu_pct=$(awk "BEGIN{printf \"%.1f\", 100 - ${cpu_idle:-0}}" 2>/dev/null || echo "N/A")
+    # 修复：使用新的 get_cpu_usage 函数
+    local cpu_pct
+    cpu_pct=$(get_cpu_usage)
 
     local dev rx tx
     dev=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
@@ -343,7 +372,7 @@ KB_MAIN='{
         [{"text":"📊 完整报告","callback_data":"full_report"},
          {"text":"⚙️ 服务管理","callback_data":"menu_singbox"}],
         [{"text":"🔗 节点列表","callback_data":"menu_nodes"},
-         {"text":"📂 分享链接","callback_data":"menu_links"}],
+         {"text":"�� 分享链接","callback_data":"menu_links"}],
         [{"text":"🖥 系统监控","callback_data":"menu_system"},
          {"text":"🔄 刷新","callback_data":"full_report"}]
     ]
@@ -364,7 +393,7 @@ KB_REFRESH_MAIN='{"inline_keyboard":[[{"text":"🔄 刷新","callback_data":"ful
 
 # ──────────────────────────────────────────
 # 告警检测
-# ──────────────────────────────────────────
+# ───────────────────────────���──────────────
 
 check_alerts() {
     local now
