@@ -2,24 +2,6 @@
 
 # ========================================================
 # sing-box 综合管理脚本  v2.1
-# 修复列表:
-#   F01 临时文件竞态 — mktemp + trap 保底清理
-#   F02 数组越界保护 — validate_index 统一校验
-#   F03 端口占用检测 — check_port (TCP+UDP, 纯 ss)
-#   F04 日志查看 — 独立 view_logs 函数
-#   F05 Socks5/HTTP outbound jq 语法错误
-#   F06 insecure 布尔值类型错误 (字符串→jq boolean)
-#   F07 Reality 公钥丢失 — edit_node 从 .link 文件读 pbk
-#   F08 manage_routing 选项1 仅支持 SS — 改用全协议解析
-#   F09 硬编码临时文件 — 选项3/6 改用 make_safe_tmp
-#   F10 TUIC edit_node — 独立 uuid/password 修改
-#   F11 链式代理 local hop_type 遮蔽全局变量
-#   F12 apply_cert 80端口检测 — 统一用 ss 不依赖 lsof
-#   F13 OUT_JSON 空值保护 — 写入前 guard 检查
-#   F14 save_and_restart restart 失败状态 — 捕获并报错
-#   F15 _urldecode/_qs_get 函数提升到全局，避免重复定义
-#   F16 jq del 多索引 — 改用 map+index 方式，更安全
-#   F17 链式代理手动输入前清除上次残留的解析变量
 # ========================================================
 
 RED='\033[1;31m'
@@ -426,7 +408,9 @@ add_node() {
     local IP UUID LINK TAG
     IP=$(get_ip)
     UUID=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
-    gen_pass() { openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16; }
+    
+    # 修复：使用 hex 直接生成 16 位字符，避免 tr 过滤导致的长度不足和程序阻塞
+    gen_pass() { openssl rand -hex 8; } 
 
     case $choice in
         1) # VLESS + Reality
@@ -464,6 +448,14 @@ add_node() {
             read -p "密码 (回车随机生成): " PASS; PASS=${PASS:-$(gen_pass)}
             TAG="${p_type}-${PORT}"
 
+            echo -e "\n----------------------------------------"
+            # 安全修复：对于 TCP 协议增加自签名证书高危警告
+            if [[ "$p_type" == "trojan" || "$p_type" == "http" ]]; then
+                echo -e "${YELLOW}⚠️ 警告: [$p_type] 属于 TCP 协议！${PLAIN}"
+                echo -e "${YELLOW}在公网使用自签名证书极易被防火墙特征识别并秒封 IP！${PLAIN}"
+                echo -e "${YELLOW}👉 强烈建议优先选择 [2. 自动检测 ACME 证书]${PLAIN}"
+            fi
+            
             echo " 1. 自签名证书  2. 自动检测 ACME 证书 ($CERT_DIR)"
             read -p "证书类型: " c_choice
             if [[ "$c_choice" == "2" ]]; then
@@ -505,7 +497,6 @@ add_node() {
         4) # Shadowsocks 2022
             read -p "端口 (默认 8388): " PORT; PORT=${PORT:-8388}
             if ! check_port "$PORT"; then pause; return; fi
-            # 2022-blake3-aes-128-gcm 需要16字节密钥，openssl rand -base64 16 输出正好是标准base64(24字符含==)
             local PASS METHOD
             PASS=$(openssl rand -base64 16); METHOD="2022-blake3-aes-128-gcm"; TAG="ss-${PORT}"
             make_tmp
@@ -521,7 +512,11 @@ add_node() {
             [[ -z "$CERT_PATH" ]] && echo -e "${RED}✘ 证书不存在${PLAIN}" && pause && return
             read -p "端口 (默认 443): " PORT; PORT=${PORT:-443}
             if ! check_port "$PORT"; then pause; return; fi
-            read -p "WS 路径 (默认 /video): " WSPATH; WSPATH=${WSPATH:-"/video"}
+            
+            # 安全修复：使用 openssl 生成真随机 6 位路径
+            local rand_path="/$(openssl rand -hex 3)"
+            read -p "WS 路径 (默认 $rand_path): " WSPATH; WSPATH=${WSPATH:-"$rand_path"}
+            
             TAG="vless-ws-${PORT}"
             make_tmp
             jq --arg port "$PORT" --arg uuid "$UUID" --arg path "$WSPATH" \
@@ -547,12 +542,19 @@ add_node() {
                "$CONFIG_FILE" > "$_TMP_JSON"
             LINK="socks5://$USER:$PASS@$IP:$PORT#$TAG"
             ;;
+            
         9) # AnyTLS
             read -p "端口 (默认 443): " PORT; PORT=${PORT:-443}
             if ! check_port "$PORT"; then pause; return; fi
             read -p "密码 (回车随机生成): " PASS; PASS=${PASS:-$(gen_pass)}
             TAG="anytls-${PORT}"
 
+            echo -e "\n----------------------------------------"
+            # 安全修复：AnyTLS 自签警告
+            echo -e "${YELLOW}⚠️ 警告: [AnyTLS] 属于 TCP 协议！${PLAIN}"
+            echo -e "${YELLOW}在公网使用自签名证书极易被防火墙特征识别并秒封 IP！${PLAIN}"
+            echo -e "${YELLOW}👉 强烈建议优先选择 [2. 自动检测 ACME 证书]${PLAIN}"
+            
             echo " 1. 自签名证书  2. 自动检测 ACME 证书 ($CERT_DIR)"
             read -p "证书类型: " c_choice
             if [[ "$c_choice" == "2" ]]; then
@@ -568,8 +570,6 @@ add_node() {
             fi
 
             make_tmp
-            
-            # 严格遵循官方标准：保留服务端用于日志识别的 name，省略 padding_scheme 以触发内核默认填充
             jq --arg port "$PORT" --arg pass "$PASS" --arg tag "$TAG" \
                --arg sni "$SNI_NAME" --arg cert "$CERT_PATH" --arg key "$KEY_PATH" \
                '.inbounds += [{"type":"anytls","tag":$tag,"listen":"::","listen_port":($port|tonumber),
