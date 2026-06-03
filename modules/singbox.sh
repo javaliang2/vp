@@ -620,7 +620,6 @@ manage_configs() {
     if [[ "$TYPE" == "vless" ]]; then
         local SID; SID=$(echo "$CONF" | jq -r '.tls.reality.short_id[0] // ""')
         local WSPATH; WSPATH=$(echo "$CONF" | jq -r '.transport.path // ""')
-        # 如果是 vless 协议，且没有 short_id (非Reality)，且有 transport 路径，说明是标准 WS-TLS 套 CDN 节点
         if [[ -z "$SID" && -n "$WSPATH" ]]; then
             IS_CDN_VLESS=true
         fi
@@ -643,9 +642,17 @@ manage_configs() {
             SNI=$(echo "$CONF" | jq -r '.tls.server_name // ""')
             WSPATH=$(echo "$CONF" | jq -r '.transport.path // ""')
             
+            # 核心调包点：拼接优选链接
+            local CF_LINK="vless://$UUID@$target_server:$PORT?encryption=none&security=tls&type=ws&host=$SNI&sni=$SNI&path=$WSPATH#${TAG}-CF优选入站"
+            
             echo -e "\n${GREEN}✔ 优选配置生成成功！${PLAIN}"
-            # 核心调包点：将连接目标改为 target_server，同时强制锁死 host 和 sni 为你的真实伪装域名
-            echo -e "${BLUE}vless://$UUID@$target_server:$PORT?encryption=none&security=tls&type=ws&host=$SNI&sni=$SNI&path=$WSPATH#${TAG}-CF优选入站${PLAIN}"
+            echo -e "${BLUE}${CF_LINK}${PLAIN}"
+            
+            # 修复核心：将生成的优选链接覆盖写入 .link 文件，使得一键订阅可以读取到
+            mkdir -p "$LINK_DIR"
+            echo "$CF_LINK" > "$LINK_DIR/${TAG}.link"
+            echo -e "${YELLOW}>> 提示：该优选链接已成功保存，您的一键订阅现已更新！ <<${PLAIN}"
+
             echo ""; pause; return
         fi
     fi
