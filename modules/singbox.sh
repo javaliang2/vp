@@ -140,18 +140,38 @@ init_config() {
 # ============================================================
 refresh_sub() {
     if [[ -d "/var/www/singbox-sub" ]]; then
-        # 读取缓存的复杂路径文件名，如果没有则默认兜底为 sub
         local sub_file="sub"
         [[ -f "/var/www/singbox-sub/.path_cache" ]] && sub_file=$(cat /var/www/singbox-sub/.path_cache)
 
-        # 清理旧的订阅文件，防止路径更改后残留被扫到
+        # 清理上一次生成的订阅旧文件
         find /var/www/singbox-sub -maxdepth 1 -type f -not -name ".*" -not -name "*.py" -delete 2>/dev/null
 
-        # 统计节点数量
+        # 检查有没有 .link 文件
         local count=$(ls -1 "$LINK_DIR"/*.link 2>/dev/null | wc -l)
         if [[ $count -gt 0 ]]; then
-            # 【优化】使用 awk 而不是 cat，强制确保每个节点链接后都有换行符，杜绝粘连导致解析失败
-            awk '{print}' "$LINK_DIR"/*.link | base64 -w 0 > "/var/www/singbox-sub/$sub_file"
+            
+            # 【核心纠错优化】：遍历所有缓存文件，校验其 Tag 是否在当前的 config.json 中
+            for f in "$LINK_DIR"/*.link; do
+                [ -e "$f" ] || continue
+                
+                # 从文件名提取出 Tag 名字 (例如把 /root/links/node1.link 变成 node1)
+                local filename=$(basename "$f")
+                local current_tag="${filename%.link}"
+                
+                # 去 config.json 里查询该 Tag 的节点是否存在
+                local tag_exists=$(jq -r ".inbounds[] | select(.tag==\"$current_tag\") | .tag" "$CONFIG_FILE" 2>/dev/null)
+                
+                if [[ -z "$tag_exists" ]]; then
+                    # 如果 json 里找不到这个 Tag，说明是已删除的“僵尸节点”，直接在硬盘上抹除它
+                    rm -f "$f"
+                    continue
+                fi
+                
+                # 如果通过校验，才输出内容用于生成订阅
+                cat "$f" | tr -d '\r\n'
+                echo ""
+            done | awk NF | base64 -w 0 > "/var/www/singbox-sub/$sub_file"
+            
         else
             echo "" > "/var/www/singbox-sub/$sub_file"
         fi
