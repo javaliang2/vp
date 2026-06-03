@@ -147,10 +147,11 @@ refresh_sub() {
         # 清理旧的订阅文件，防止路径更改后残留被扫到
         find /var/www/singbox-sub -maxdepth 1 -type f -not -name ".*" -not -name "*.py" -delete 2>/dev/null
 
-        # 将所有的 .link 文件合并并进行 Base64 编码
+        # 统计节点数量
         local count=$(ls -1 "$LINK_DIR"/*.link 2>/dev/null | wc -l)
         if [[ $count -gt 0 ]]; then
-            cat "$LINK_DIR"/*.link | base64 -w 0 > "/var/www/singbox-sub/$sub_file"
+            # 【优化】使用 awk 而不是 cat，强制确保每个节点链接后都有换行符，杜绝粘连导致解析失败
+            awk '{print}' "$LINK_DIR"/*.link | base64 -w 0 > "/var/www/singbox-sub/$sub_file"
         else
             echo "" > "/var/www/singbox-sub/$sub_file"
         fi
@@ -1807,9 +1808,8 @@ manage_subscription() {
                     pause; continue
                 fi
 
-                # 【优化：记忆上一次的协议选择】
                 local LAST_PROTO; [[ -f "/etc/sing-box/.sub_proto" ]] && LAST_PROTO=$(cat /etc/sing-box/.sub_proto)
-                LAST_PROTO=${LAST_PROTO:-2} # 默认安全 HTTPS
+                LAST_PROTO=${LAST_PROTO:-2}
                 
                 echo "1. 普通 HTTP (明文，易被墙)   2. 安全 HTTPS (防嗅探，需已有证书)"
                 read -p "请选择订阅协议 [当前/默认 ${LAST_PROTO}]: " sub_proto
@@ -1819,11 +1819,18 @@ manage_subscription() {
                 local SUB_PORT EXEC_CMD SUB_URL
                 mkdir -p /var/www/singbox-sub
 
-                # 生成随机复杂路径，防止爬虫恶意扫描
-                local SUB_PATH="sub_$(openssl rand -hex 8)"
-                echo "$SUB_PATH" > /var/www/singbox-sub/.path_cache
+                # 【修复核心：固定订阅路径】
+                # 检查是否已经存在路径缓存。如果存在，就复用老路径；如果不存在，再生成随机新路径。
+                local SUB_PATH
+                if [[ -f "/var/www/singbox-sub/.path_cache" ]]; then
+                    SUB_PATH=$(cat /var/www/singbox-sub/.path_cache)
+                    echo -e "${GREEN}检测到已有订阅链接，沿用原路径: ${SUB_PATH}${PLAIN}"
+                else
+                    SUB_PATH="sub_$(openssl rand -hex 8)"
+                    echo "$SUB_PATH" > /var/www/singbox-sub/.path_cache
+                    echo -e "${YELLOW}首次生成订阅，已创建安全路径: ${SUB_PATH}${PLAIN}"
+                fi
 
-                # 【优化：记忆上一次的端口选择，不随关闭服务而擦除】
                 local LAST_PORT; [[ -f "/etc/sing-box/.sub_port" ]] && LAST_PORT=$(cat /etc/sing-box/.sub_port)
 
                 if [[ "$sub_proto" == "2" ]]; then
@@ -1834,12 +1841,11 @@ manage_subscription() {
                         pause; continue
                     fi
 
-                    LAST_PORT=${LAST_PORT:-8443} # 如果没有历史缓存，HTTPS 默认 8443
+                    LAST_PORT=${LAST_PORT:-8443}
                     read -p "请输入 HTTPS 订阅服务端口 (当前/默认 ${LAST_PORT}): " SUB_PORT
                     SUB_PORT=${SUB_PORT:-$LAST_PORT}
                     echo "$SUB_PORT" > /etc/sing-box/.sub_port
 
-                    # 动态生成原生 Python HTTPS 服务器脚本
                     cat > /var/www/singbox-sub/https_server.py <<EOF
 import http.server, ssl
 server_address = ('0.0.0.0', $SUB_PORT)
@@ -1854,7 +1860,7 @@ EOF
                     EXEC_CMD="/usr/bin/python3 /var/www/singbox-sub/https_server.py"
                     SUB_URL="https://$sub_domain:$SUB_PORT/$SUB_PATH"
                 else
-                    LAST_PORT=${LAST_PORT:-8080} # 如果没有历史缓存，HTTP 默认 8080
+                    LAST_PORT=${LAST_PORT:-8080}
                     read -p "请输入 HTTP 订阅服务端口 (当前/默认 ${LAST_PORT}): " SUB_PORT
                     SUB_PORT=${SUB_PORT:-$LAST_PORT}
                     echo "$SUB_PORT" > /etc/sing-box/.sub_port
@@ -1865,10 +1871,10 @@ EOF
 
                 if ! check_port "$SUB_PORT"; then pause; continue; fi
 
-                echo -e "${CYAN}生成最新订阅文件...${PLAIN}"
+                echo -e "${CYAN}生成/刷新订阅文件...${PLAIN}"
                 refresh_sub
 
-                # 创建 systemd 守护进程以保持后台常驻
+                # 重启服务而不是仅在首次启动
                 cat > /etc/systemd/system/singbox-sub.service <<EOF
 [Unit]
 Description=Sing-box Subscription Server
@@ -1885,12 +1891,13 @@ User=root
 WantedBy=multi-user.target
 EOF
                 systemctl daemon-reload
-                systemctl enable --now singbox-sub >/dev/null 2>&1
+                # 【修复核心：强制重启服务】确保 Python Server 挂掉时能重新拉起，并读取最新配置
+                systemctl restart singbox-sub >/dev/null 2>&1
+                systemctl enable singbox-sub >/dev/null 2>&1
 
-                echo -e "${GREEN}✔ 订阅服务开启成功！${PLAIN}"
+                echo -e "${GREEN}✔ 订阅服务开启/刷新成功！${PLAIN}"
                 echo -e "请在客户端导入以下专属订阅链接 (路径已随机加密):"
                 echo -e "${BLUE}$SUB_URL${PLAIN}"
-                echo -e "${YELLOW}警告: 请妥善保管此链接，泄露将导致节点全盘暴露！${PLAIN}"
                 
                 echo "$SUB_URL" > /var/www/singbox-sub/.url_cache
                 pause ;;
