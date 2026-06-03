@@ -402,7 +402,7 @@ add_node() {
     echo " 8. Trojan"
     echo " 9. AnyTLS"
     echo " 0. 返回"
-    read -p "请选择 [0-8]: " choice
+    read -p "请选择 [0-9]: " choice
     [[ "$choice" == "0" || -z "$choice" ]] && return
 
     local IP UUID LINK TAG
