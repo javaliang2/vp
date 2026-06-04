@@ -1460,7 +1460,8 @@ deploy_alist() {
 
     header "部署 AList → $DIR (端口 $HOST_PORT)"
     mkdir -p "$DIR/data"
-    echo "HOST_PORT=${HOST_PORT}" > "$DIR/.env"
+
+    # 移除多余的 .env 写入，直接由脚本在下方 Heredoc 中渲染
 
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
@@ -1477,7 +1478,8 @@ services:
       - "127.0.0.1:${HOST_PORT}:5244"
     networks: [${NET}]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5244/ping"]
+      # 替换为 alpine 自带的 wget，并检查主页状态
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:5244/"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -1494,6 +1496,8 @@ YAML
     sleep 5
     local cid init_pw
     cid=$(cd "$DIR" && docker compose ps -q alist 2>/dev/null | head -1)
+    
+    # 提示：只有第一次全新部署时日志才会有密码；若容器重启，日志里就不会再出现了
     init_pw=$(docker logs "$cid" 2>&1 | grep -oP '(?<=password: )[^\s]+' | tail -1 || true)
 
     log "AList 已启动 → http://127.0.0.1:${HOST_PORT}"
@@ -1502,9 +1506,9 @@ YAML
         echo "ALIST_INIT_PASSWORD=${init_pw}" >> "$DIR/.env"
         log "凭据已保存至 $DIR/.env"
     else
-        warn "无法自动获取初始密码，请手动执行以下命令查看或重置："
-        warn "  docker exec -it ${cid:-<容器ID>} ./alist admin"
-        warn "  重置密码: docker exec -it ${cid:-<容器ID>} ./alist admin set <新密码>"
+        warn "无法自动获取初始密码（可能非首次部署），如需重置请执行："
+        warn "  随机新密码: docker exec -it ${cid:-<容器ID>} ./alist admin random"
+        warn "  指定新密码: docker exec -it ${cid:-<容器ID>} ./alist admin set <新密码>"
     fi
 }
 
