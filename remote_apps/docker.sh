@@ -1474,6 +1474,7 @@ services:
       - UMASK=022
     volumes:
       - ./data:/opt/alist/data
+      - /root/tgdown/downloads:media  #冒号左边为实际路径 右边为容器映射路径
     ports:
       - "127.0.0.1:${HOST_PORT}:5244"
     networks: [${NET}]
