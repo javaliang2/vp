@@ -1,4 +1,34 @@
 #!/bin/bash
+# ============================================================
+#  Docker + Docker Compose 安装 & 热门应用一键部署脚本
+#  支持：WordPress / Nextcloud / Gitea / Uptime Kuma /
+#        Portainer / phpMyAdmin / Redis Commander / MinIO /
+#        Lsky Pro / EasyImage / AList
+#  支持多实例：通过 --deploy APP --instance NAME 或交互菜单指定
+#  用法：sudo bash setup-docker-apps.sh [选项]
+# ------------------------------------------------------------
+#  修复记录（原版）：
+#  [1] set -euo pipefail：补加 -e，命令失败立即退出
+#  [2] net_name()：修复原函数两行输出 bug
+#  [3] find_free_port：改用 find 替代 glob
+#  [4] Portainer HTTPS 端口：改用 find_free_port 动态分配
+#  [5] Gitea SSH 端口：改用 find_free_port
+#  [6] backup_app：停止失败时显式警告
+#  [7] print_summary：从 .env 读取实际端口
+#  [8] check_system：改为检测 apt-get
+#  [9] randpw：改用 dd 替代 head -c
+#  ──────────────────────────────────────────────────────────
+#  新增功能：
+#  [10] backup_app：支持推送到远程服务器（rsync+SSH+自动公钥）
+#                   本地/远程各自保留最近 10 份，自动轮转清理
+#  [11] restore_app：从本地 tar.gz 备份文件完整还原实例
+#                    支持覆盖保护（先备份现有 → 再覆盖 / 直接覆盖 / 取消）
+#  [12] _restore_from_local：交互式选择本地备份文件还原
+#  [13] _restore_from_remote：从远程服务器列出并拉取备份后还原
+#  [14] menu_restore_app（菜单项 16）：还原交互菜单
+#  [15] CLI --restore / --restore --remote：命令行还原入口
+#  [16] 备份目录统一改为 /var/backups/docker-apps
+# ============================================================
 
 set -euo pipefail
 
@@ -1060,11 +1090,16 @@ uninstall_app() {
 net_name() { echo "$(basename "$1" | tr -cd 'a-zA-Z0-9_' | tr '[:upper:]' '[:lower:]')_net"; }
 
 deploy_wordpress() {
-    local DIR="${1:-$BASE_DIR/wordpress}" HOST_PORT="${2:-${APP_DEFAULT_PORT[wordpress]}}"
-    local NET; NET=$(net_name "$DIR")
+    local DIR="${1:-$BASE_DIR/wordpress}"
+    local HOST_PORT="${2:-${APP_DEFAULT_PORT[wordpress]}}"
+    local NET
+    NET=$(net_name "$DIR")
+
     header "部署 WordPress → $DIR (端口 $HOST_PORT)"
     mkdir -p "$DIR"/{data,db,redis,uploads}
-    local DB_ROOT_PW DB_PW; DB_ROOT_PW=$(randpw); DB_PW=$(randpw)
+
+    local DB_ROOT_PW DB_PW
+    DB_ROOT_PW=$(randpw); DB_PW=$(randpw)
     cat > "$DIR/.env" <<EOF
 WORDPRESS_DB_ROOT_PASSWORD=${DB_ROOT_PW}
 WORDPRESS_DB_PASSWORD=${DB_PW}
@@ -1072,6 +1107,7 @@ WORDPRESS_DB_NAME=wordpress
 WORDPRESS_DB_USER=wpuser
 HOST_PORT=${HOST_PORT}
 EOF
+
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   db:
@@ -1082,34 +1118,45 @@ services:
       MARIADB_DATABASE: \${WORDPRESS_DB_NAME}
       MARIADB_USER: \${WORDPRESS_DB_USER}
       MARIADB_PASSWORD: \${WORDPRESS_DB_PASSWORD}
-    volumes: [./db:/var/lib/mysql]
+    volumes:
+      - ./db:/var/lib/mysql
     networks: [${NET}]
     healthcheck:
-      test: ["CMD","healthcheck.sh","--connect","--innodb_initialized"]
-      interval: 10s; timeout: 5s; retries: 5
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
     command: redis-server --save 60 1 --loglevel warning
-    volumes: [./redis:/data]
+    volumes:
+      - ./redis:/data
     networks: [${NET}]
+
   wordpress:
     image: wordpress:php8.3-fpm-alpine
     restart: unless-stopped
     depends_on:
-      db: {condition: service_healthy}
+      db:
+        condition: service_healthy
     environment:
       WORDPRESS_DB_HOST: db:3306
       WORDPRESS_DB_NAME: \${WORDPRESS_DB_NAME}
       WORDPRESS_DB_USER: \${WORDPRESS_DB_USER}
       WORDPRESS_DB_PASSWORD: \${WORDPRESS_DB_PASSWORD}
       WORDPRESS_CONFIG_EXTRA: |
-        define('WP_REDIS_HOST','redis');define('WP_REDIS_PORT',6379);
-        define('WP_CACHE',true);define('WP_MEMORY_LIMIT','512M');
+        define('WP_REDIS_HOST', 'redis');
+        define('WP_REDIS_PORT', 6379);
+        define('WP_CACHE', true);
+        define('WP_MEMORY_LIMIT', '512M');
+        define('WP_MAX_MEMORY_LIMIT', '1024M');
     volumes:
       - ./data:/var/www/html
       - ./uploads/php-uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
     networks: [${NET}]
+
   nginx:
     image: nginx:alpine
     restart: unless-stopped
@@ -1118,48 +1165,67 @@ services:
       - ./data:/var/www/html:ro
       - ./uploads/nginx-wp.conf:/etc/nginx/conf.d/default.conf:ro
     networks: [${NET}]
-    ports: ["127.0.0.1:${HOST_PORT}:80"]
+    ports:
+      - "127.0.0.1:${HOST_PORT}:80"
+
 networks:
-  ${NET}: {driver: bridge}
+  ${NET}:
+    driver: bridge
 YAML
+
     cat > "$DIR/uploads/php-uploads.ini" <<'INI'
-upload_max_filesize=2048M
-post_max_size=2048M
-memory_limit=1024M
-max_execution_time=600
-max_input_time=600
-max_input_vars=10000
+upload_max_filesize = 2048M
+post_max_size       = 2048M
+memory_limit        = 1024M
+max_execution_time  = 600
+max_input_time      = 600
+max_input_vars      = 10000
 INI
+
     cat > "$DIR/uploads/nginx-wp.conf" <<'NGINX'
 server {
-    listen 80; root /var/www/html; index index.php index.html;
+    listen 80;
+    root /var/www/html;
+    index index.php index.html;
     client_max_body_size 2048M;
     location / { try_files $uri $uri/ /index.php?$args; }
     location ~ \.php$ {
-        fastcgi_pass wordpress:9000; fastcgi_index index.php;
-        include fastcgi_params;
+        fastcgi_pass  wordpress:9000;
+        fastcgi_index index.php;
+        include       fastcgi_params;
         fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
         fastcgi_read_timeout 600;
     }
-    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff2)$ { expires max; log_not_found off; }
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff2)$ {
+        expires max;
+        log_not_found off;
+    }
 }
 NGINX
+
     run_compose "$DIR" "WordPress"
-    log "WordPress 已启动 → http://127.0.0.1:${HOST_PORT}  凭据: $DIR/.env"
+    log "WordPress 已启动 → http://127.0.0.1:${HOST_PORT}"
+    log "凭据已保存至 $DIR/.env"
 }
 
 deploy_nextcloud() {
-    local DIR="${1:-$BASE_DIR/nextcloud}" HOST_PORT="${2:-${APP_DEFAULT_PORT[nextcloud]}}"
-    local NET; NET=$(net_name "$DIR")
+    local DIR="${1:-$BASE_DIR/nextcloud}"
+    local HOST_PORT="${2:-${APP_DEFAULT_PORT[nextcloud]}}"
+    local NET
+    NET=$(net_name "$DIR")
+
     header "部署 Nextcloud → $DIR (端口 $HOST_PORT)"
     mkdir -p "$DIR"/{data,db,redis,config,apps}
-    local DB_ROOT_PW DB_PW ADMIN_PW; DB_ROOT_PW=$(randpw); DB_PW=$(randpw); ADMIN_PW=$(randpw 20)
+
+    local DB_ROOT_PW DB_PW ADMIN_PW
+    DB_ROOT_PW=$(randpw); DB_PW=$(randpw); ADMIN_PW=$(randpw 20)
     cat > "$DIR/.env" <<EOF
 MYSQL_ROOT_PASSWORD=${DB_ROOT_PW}
 MYSQL_PASSWORD=${DB_PW}
 NEXTCLOUD_ADMIN_PASSWORD=${ADMIN_PW}
 HOST_PORT=${HOST_PORT}
 EOF
+
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   db:
@@ -1170,30 +1236,42 @@ services:
       MARIADB_DATABASE: nextcloud
       MARIADB_USER: nextcloud
       MARIADB_PASSWORD: \${MYSQL_PASSWORD}
-    volumes: [./db:/var/lib/mysql]
+    volumes:
+      - ./db:/var/lib/mysql
     networks: [${NET}]
     healthcheck:
-      test: ["CMD","healthcheck.sh","--connect","--innodb_initialized"]
-      interval: 10s; timeout: 5s; retries: 5
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
     networks: [${NET}]
+
   nextcloud:
     image: nextcloud:production-fpm-alpine
     restart: unless-stopped
     depends_on:
-      db: {condition: service_healthy}
+      db:
+        condition: service_healthy
     environment:
-      MYSQL_HOST: db; MYSQL_DATABASE: nextcloud; MYSQL_USER: nextcloud
-      MYSQL_PASSWORD: \${MYSQL_PASSWORD}; REDIS_HOST: redis
-      NEXTCLOUD_ADMIN_USER: admin; NEXTCLOUD_ADMIN_PASSWORD: \${NEXTCLOUD_ADMIN_PASSWORD}
-      PHP_UPLOAD_LIMIT: 2048M; PHP_MEMORY_LIMIT: 1024M
+      MYSQL_HOST: db
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: \${MYSQL_PASSWORD}
+      REDIS_HOST: redis
+      NEXTCLOUD_ADMIN_USER: admin
+      NEXTCLOUD_ADMIN_PASSWORD: \${NEXTCLOUD_ADMIN_PASSWORD}
+      PHP_UPLOAD_LIMIT: 2048M
+      PHP_MEMORY_LIMIT: 1024M
     volumes:
       - ./data:/var/www/html/data
       - ./config:/var/www/html/config
       - ./apps:/var/www/html/custom_apps
     networks: [${NET}]
+
   nginx:
     image: nginx:alpine
     restart: unless-stopped
@@ -1203,72 +1281,110 @@ services:
       - ./config:/var/www/html/config:ro
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
     networks: [${NET}]
-    ports: ["127.0.0.1:${HOST_PORT}:80"]
+    ports:
+      - "127.0.0.1:${HOST_PORT}:80"
+
   cron:
     image: nextcloud:production-fpm-alpine
     restart: unless-stopped
     depends_on: [nextcloud]
-    volumes: [./data:/var/www/html/data, ./config:/var/www/html/config]
+    volumes:
+      - ./data:/var/www/html/data
+      - ./config:/var/www/html/config
     entrypoint: /cron.sh
     networks: [${NET}]
+
 networks:
-  ${NET}: {driver: bridge}
+  ${NET}:
+    driver: bridge
 YAML
+
     cat > "$DIR/nginx.conf" <<'NGINX'
 upstream php-handler { server nextcloud:9000; }
 server {
-    listen 80; root /var/www/html; client_max_body_size 2048M;
+    listen 80;
+    root /var/www/html;
+    client_max_body_size 2048M;
+    add_header Strict-Transport-Security "max-age=15768000" always;
     location = /robots.txt { allow all; log_not_found off; access_log off; }
+    location ^~ /.well-known { return 301 /index.php$uri; }
     location / { rewrite ^ /index.php; }
     location ~ ^\/(?:build|tests|config|lib|3rdparty|templates|data)\/ { deny all; }
+    location ~ ^\/(?:\.|autotest|occ|issue|indie|db_|console) { deny all; }
     location ~ ^\/(?:index|remote|public|cron|core\/ajax\/update|status|ocs\/v[12]|updater\/.+|oc[ms]-provider\/.+)\.php(?:$|\/) {
         fastcgi_split_path_info ^(.+?\.php)(\/.*|)$;
-        fastcgi_pass php-handler; fastcgi_index index.php; include fastcgi_params;
+        fastcgi_pass php-handler;
+        fastcgi_index index.php;
+        include fastcgi_params;
         fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-        fastcgi_param PATH_INFO $fastcgi_path_info; fastcgi_read_timeout 600;
+        fastcgi_param PATH_INFO $fastcgi_path_info;
+        fastcgi_read_timeout 600;
     }
+    location ~ ^\/(?:updater|oc[ms]-provider)(?:$|\/) { try_files $uri/ =404; index index.php; }
     location ~* \.(?:css|js|woff2|svg|gif|map)$ { try_files $uri /index.php$request_uri; expires 6M; }
+    location ~* \.(?:png|html|ttf|ico|jpg|jpeg|bcmap|mp4|webm)$ { try_files $uri /index.php$request_uri; }
 }
 NGINX
+
     run_compose "$DIR" "Nextcloud"
-    log "Nextcloud 已启动 → http://127.0.0.1:${HOST_PORT}  管理员密码: ${ADMIN_PW}"
+    log "Nextcloud 已启动 → http://127.0.0.1:${HOST_PORT}"
+    log "管理员账号: admin  密码: ${ADMIN_PW}"
 }
 
 deploy_gitea() {
-    local DIR="${1:-$BASE_DIR/gitea}" HOST_PORT="${2:-${APP_DEFAULT_PORT[gitea]}}"
-    local HOST_SSH_PORT; HOST_SSH_PORT=$(find_free_port $((HOST_PORT + 10)))
-    local NET; NET=$(net_name "$DIR")
+    local DIR="${1:-$BASE_DIR/gitea}"
+    local HOST_PORT="${2:-${APP_DEFAULT_PORT[gitea]}}"
+    local HOST_SSH_PORT
+    HOST_SSH_PORT=$(find_free_port $((HOST_PORT + 10)))
+    local NET
+    NET=$(net_name "$DIR")
+
     header "部署 Gitea → $DIR (端口 $HOST_PORT)"
     mkdir -p "$DIR"/{data,db}
+
     local DB_PW; DB_PW=$(randpw)
     cat > "$DIR/.env" <<EOF
 POSTGRES_PASSWORD=${DB_PW}
 HOST_PORT=${HOST_PORT}
 HOST_SSH_PORT=${HOST_SSH_PORT}
 EOF
+
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: gitea; POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}; POSTGRES_DB: gitea
-    volumes: [./db:/var/lib/postgresql/data]
+      POSTGRES_USER: gitea
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
+      POSTGRES_DB: gitea
+    volumes:
+      - ./db:/var/lib/postgresql/data
     networks: [${NET}]
     healthcheck:
-      test: ["CMD-SHELL","pg_isready -U gitea"]
-      interval: 10s; timeout: 5s; retries: 5
+      test: ["CMD-SHELL", "pg_isready -U gitea"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   gitea:
     image: gitea/gitea:latest
     restart: unless-stopped
     depends_on:
-      db: {condition: service_healthy}
+      db:
+        condition: service_healthy
     environment:
-      USER_UID: 1000; USER_GID: 1000
-      GITEA__database__DB_TYPE: postgres; GITEA__database__HOST: db:5432
-      GITEA__database__NAME: gitea; GITEA__database__USER: gitea
+      USER_UID: 1000
+      USER_GID: 1000
+      GITEA__database__DB_TYPE: postgres
+      GITEA__database__HOST: db:5432
+      GITEA__database__NAME: gitea
+      GITEA__database__USER: gitea
       GITEA__database__PASSWD: \${POSTGRES_PASSWORD}
-      GITEA__server__DOMAIN: localhost; GITEA__server__ROOT_URL: http://localhost/
+      GITEA__server__DOMAIN: localhost
+      GITEA__server__ROOT_URL: http://localhost/
+      GITEA__attachment__MAX_SIZE: 2048
+      GITEA__picture__MAX_ORIGINAL_FILE_SIZE: 4096
     volumes:
       - ./data:/data
       - /etc/timezone:/etc/timezone:ro
@@ -1277,38 +1393,52 @@ services:
       - "127.0.0.1:${HOST_PORT}:3000"
       - "127.0.0.1:${HOST_SSH_PORT}:22"
     networks: [${NET}]
+
 networks:
-  ${NET}: {driver: bridge}
+  ${NET}:
+    driver: bridge
 YAML
+
     run_compose "$DIR" "Gitea"
     log "Gitea 已启动 → http://127.0.0.1:${HOST_PORT}  SSH: 127.0.0.1:${HOST_SSH_PORT}"
 }
 
 deploy_uptime_kuma() {
-    local DIR="${1:-$BASE_DIR/uptime-kuma}" HOST_PORT="${2:-${APP_DEFAULT_PORT[uptime-kuma]}}"
+    local DIR="${1:-$BASE_DIR/uptime-kuma}"
+    local HOST_PORT="${2:-${APP_DEFAULT_PORT[uptime-kuma]}}"
+
     header "部署 Uptime Kuma → $DIR (端口 $HOST_PORT)"
-    mkdir -p "$DIR/data"; echo "HOST_PORT=${HOST_PORT}" > "$DIR/.env"
+    mkdir -p "$DIR/data"
+    echo "HOST_PORT=${HOST_PORT}" > "$DIR/.env"
+
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   uptime-kuma:
     image: louislam/uptime-kuma:latest
     restart: unless-stopped
-    volumes: [./data:/app/data]
-    ports: ["127.0.0.1:${HOST_PORT}:3001"]
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "127.0.0.1:${HOST_PORT}:3001"
 YAML
+
     run_compose "$DIR" "Uptime Kuma"
     log "Uptime Kuma 已启动 → http://127.0.0.1:${HOST_PORT}"
 }
 
 deploy_portainer() {
-    local DIR="${1:-$BASE_DIR/portainer}" HOST_PORT="${2:-${APP_DEFAULT_PORT[portainer]}}"
-    local HOST_HTTPS_PORT; HOST_HTTPS_PORT=$(find_free_port $((HOST_PORT + 1)))
+    local DIR="${1:-$BASE_DIR/portainer}"
+    local HOST_PORT="${2:-${APP_DEFAULT_PORT[portainer]}}"
+    local HOST_HTTPS_PORT
+    HOST_HTTPS_PORT=$(find_free_port $((HOST_PORT + 1)))
+
     header "部署 Portainer CE → $DIR (端口 $HOST_PORT)"
     mkdir -p "$DIR/data"
     cat > "$DIR/.env" <<EOF
 HOST_PORT=${HOST_PORT}
 HOST_HTTPS_PORT=${HOST_HTTPS_PORT}
 EOF
+
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   portainer:
@@ -1321,32 +1451,46 @@ services:
       - "127.0.0.1:${HOST_HTTPS_PORT}:9443"
       - "127.0.0.1:${HOST_PORT}:9000"
 YAML
+
     run_compose "$DIR" "Portainer"
     log "Portainer 已启动 → http://127.0.0.1:${HOST_PORT}  HTTPS: https://127.0.0.1:${HOST_HTTPS_PORT}"
 }
 
 deploy_phpmyadmin() {
-    local DIR="${1:-$BASE_DIR/phpmyadmin}" HOST_PORT="${2:-${APP_DEFAULT_PORT[phpmyadmin]}}"
+    local DIR="${1:-$BASE_DIR/phpmyadmin}"
+    local HOST_PORT="${2:-${APP_DEFAULT_PORT[phpmyadmin]}}"
+
     header "部署 phpMyAdmin → $DIR (端口 $HOST_PORT)"
-    mkdir -p "$DIR"; echo "HOST_PORT=${HOST_PORT}" > "$DIR/.env"
+    mkdir -p "$DIR"
+    echo "HOST_PORT=${HOST_PORT}" > "$DIR/.env"
+
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   phpmyadmin:
     image: phpmyadmin:latest
     restart: unless-stopped
     environment:
-      PMA_ARBITRARY: 1; UPLOAD_LIMIT: 2048M
-      MEMORY_LIMIT: 1024M; MAX_EXECUTION_TIME: 600
-    ports: ["127.0.0.1:${HOST_PORT}:80"]
+      PMA_ARBITRARY: 1
+      PMA_ABSOLUTE_URI: "http://localhost/pma/"
+      UPLOAD_LIMIT: 2048M
+      MEMORY_LIMIT: 1024M
+      MAX_EXECUTION_TIME: 600
+    ports:
+      - "127.0.0.1:${HOST_PORT}:80"
 YAML
+
     run_compose "$DIR" "phpMyAdmin"
     log "phpMyAdmin 已启动 → http://127.0.0.1:${HOST_PORT}"
 }
 
 deploy_redis_commander() {
-    local DIR="${1:-$BASE_DIR/redis-commander}" HOST_PORT="${2:-${APP_DEFAULT_PORT[redis-commander]}}"
+    local DIR="${1:-$BASE_DIR/redis-commander}"
+    local HOST_PORT="${2:-${APP_DEFAULT_PORT[redis-commander]}}"
+
     header "部署 Redis Commander → $DIR (端口 $HOST_PORT)"
-    mkdir -p "$DIR"; echo "HOST_PORT=${HOST_PORT}" > "$DIR/.env"
+    mkdir -p "$DIR"
+    echo "HOST_PORT=${HOST_PORT}" > "$DIR/.env"
+
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   redis-commander:
@@ -1354,19 +1498,26 @@ services:
     restart: unless-stopped
     environment:
       REDIS_HOSTS: "local:host.docker.internal:6379"
-    ports: ["127.0.0.1:${HOST_PORT}:8081"]
-    extra_hosts: ["host.docker.internal:host-gateway"]
+    ports:
+      - "127.0.0.1:${HOST_PORT}:8081"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 YAML
+
     run_compose "$DIR" "Redis Commander"
     log "Redis Commander 已启动 → http://127.0.0.1:${HOST_PORT}"
 }
 
 deploy_minio() {
-    local DIR="${1:-$BASE_DIR/minio}" HOST_PORT="${2:-${APP_DEFAULT_PORT[minio]}}"
+    local DIR="${1:-$BASE_DIR/minio}"
+    local HOST_PORT="${2:-${APP_DEFAULT_PORT[minio]}}"
     local API_PORT=$((HOST_PORT + 1))
-    local NET; NET=$(net_name "$DIR")
+    local NET
+    NET=$(net_name "$DIR")
+
     header "部署 MinIO → $DIR (控制台 $HOST_PORT, API $API_PORT)"
     mkdir -p "$DIR/data"
+
     local SECRET_KEY; SECRET_KEY=$(randpw 32)
     cat > "$DIR/.env" <<EOF
 MINIO_ROOT_USER=admin
@@ -1374,6 +1525,7 @@ MINIO_ROOT_PASSWORD=${SECRET_KEY}
 HOST_PORT=${HOST_PORT}
 API_PORT=${API_PORT}
 EOF
+
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   minio:
@@ -1383,29 +1535,45 @@ services:
     environment:
       MINIO_ROOT_USER: \${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: \${MINIO_ROOT_PASSWORD}
-    volumes: [./data:/data]
+    volumes:
+      - ./data:/data
     ports:
       - "127.0.0.1:${API_PORT}:9000"
       - "127.0.0.1:${HOST_PORT}:9001"
     networks: [${NET}]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
 networks:
-  ${NET}: {driver: bridge}
+  ${NET}:
+    driver: bridge
 YAML
+
     run_compose "$DIR" "MinIO"
-    log "MinIO 控制台: http://127.0.0.1:${HOST_PORT}  Access Key: admin  Secret: ${SECRET_KEY}"
+    log "MinIO 控制台: http://127.0.0.1:${HOST_PORT}  API: http://127.0.0.1:${API_PORT}"
+    log "Access Key: admin  Secret Key: ${SECRET_KEY}"
 }
 
 deploy_lskypro() {
-    local DIR="${1:-$BASE_DIR/lskypro}" HOST_PORT="${2:-${APP_DEFAULT_PORT[lskypro]}}"
-    local NET; NET=$(net_name "$DIR")
-    header "部署 Lsky Pro → $DIR (端口 $HOST_PORT)"
+    local DIR="${1:-$BASE_DIR/lskypro}"
+    local HOST_PORT="${2:-${APP_DEFAULT_PORT[lskypro]}}"
+    local NET
+    NET=$(net_name "$DIR")
+
+    header "部署 Lsky Pro 图床 → $DIR (端口 $HOST_PORT)"
     mkdir -p "$DIR"/{uploads,db}
-    local DB_ROOT_PW DB_PW; DB_ROOT_PW=$(randpw); DB_PW=$(randpw)
+
+    local DB_ROOT_PW DB_PW
+    DB_ROOT_PW=$(randpw); DB_PW=$(randpw)
     cat > "$DIR/.env" <<EOF
 MARIADB_ROOT_PASSWORD=${DB_ROOT_PW}
 MARIADB_PASSWORD=${DB_PW}
 HOST_PORT=${HOST_PORT}
 EOF
+
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   lskypro-db:
@@ -1413,84 +1581,140 @@ services:
     restart: unless-stopped
     environment:
       MARIADB_ROOT_PASSWORD: \${MARIADB_ROOT_PASSWORD}
-      MARIADB_DATABASE: lskypro; MARIADB_USER: lskypro
+      MARIADB_DATABASE: lskypro
+      MARIADB_USER: lskypro
       MARIADB_PASSWORD: \${MARIADB_PASSWORD}
-    volumes: [./db:/var/lib/mysql]
+    volumes:
+      - ./db:/var/lib/mysql
     networks: [${NET}]
     healthcheck:
-      test: ["CMD","healthcheck.sh","--connect","--innodb_initialized"]
-      interval: 10s; timeout: 5s; retries: 5
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   lskypro:
+    # 官方镜像 lskypro/lsky-pro 已停止维护，使用社区维护镜像
     image: bestzwei/lskypro:latest
     restart: unless-stopped
     environment:
-      DB_CONNECTION: mysql; DB_HOST: lskypro-db; DB_PORT: 3306
-      DB_DATABASE: lskypro; DB_USERNAME: lskypro
+      DB_CONNECTION: mysql
+      DB_HOST: lskypro-db
+      DB_PORT: 3306
+      DB_DATABASE: lskypro
+      DB_USERNAME: lskypro
       DB_PASSWORD: \${MARIADB_PASSWORD}
-    volumes: [./uploads:/var/www/html/storage/app/uploads]
-    ports: ["127.0.0.1:${HOST_PORT}:80"]
+    volumes:
+      - ./uploads:/var/www/html/storage/app/uploads
+    ports:
+      - "127.0.0.1:${HOST_PORT}:80"
     depends_on:
-      lskypro-db: {condition: service_healthy}
+      lskypro-db:
+        condition: service_healthy
     networks: [${NET}]
+
 networks:
-  ${NET}: {driver: bridge}
+  ${NET}:
+    driver: bridge
 YAML
+
     run_compose "$DIR" "Lsky Pro"
-    log "Lsky Pro 已启动 → http://127.0.0.1:${HOST_PORT}  数据库密码: $DIR/.env"
+    log "Lsky Pro 已启动 → http://127.0.0.1:${HOST_PORT}"
+    warn "首次访问需完成 Web 安装向导（数据库主机填 lskypro-db）"
+    log "数据库: lskypro  用户: lskypro  密码见 $DIR/.env"
 }
 
 deploy_easyimage() {
-    local DIR="${1:-$BASE_DIR/easyimage}" HOST_PORT="${2:-${APP_DEFAULT_PORT[easyimage]}}"
-    local NET; NET=$(net_name "$DIR")
-    header "部署 EasyImage → $DIR (端口 $HOST_PORT)"
-    mkdir -p "$DIR"/{data,config}; echo "HOST_PORT=${HOST_PORT}" > "$DIR/.env"
+    local DIR="${1:-$BASE_DIR/easyimage}"
+    local HOST_PORT="${2:-${APP_DEFAULT_PORT[easyimage]}}"
+    local NET
+    NET=$(net_name "$DIR")
+
+    header "部署 EasyImage 图床 → $DIR (端口 $HOST_PORT)"
+    mkdir -p "$DIR"/{data,config}
+    echo "HOST_PORT=${HOST_PORT}" > "$DIR/.env"
+
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   easyimage:
     image: ddsderek/easyimage:latest
     restart: unless-stopped
     environment:
-      TZ: Asia/Shanghai; PUID: 1000; PGID: 1000
-    volumes: [./data:/app/web/i, ./config:/app/web/config]
-    ports: ["127.0.0.1:${HOST_PORT}:80"]
+      TZ: Asia/Shanghai
+      PUID: 1000
+      PGID: 1000
+    volumes:
+      - ./data:/app/web/i
+      - ./config:/app/web/config
+    ports:
+      - "127.0.0.1:${HOST_PORT}:80"
     networks: [${NET}]
+
 networks:
-  ${NET}: {driver: bridge}
+  ${NET}:
+    driver: bridge
 YAML
+
     run_compose "$DIR" "EasyImage"
     log "EasyImage 已启动 → http://127.0.0.1:${HOST_PORT}"
 }
 
 deploy_alist() {
-    local DIR="${1:-$BASE_DIR/alist}" HOST_PORT="${2:-${APP_DEFAULT_PORT[alist]}}"
-    local NET; NET=$(net_name "$DIR")
+    local DIR="${1:-$BASE_DIR/alist}"
+    local HOST_PORT="${2:-${APP_DEFAULT_PORT[alist]}}"
+    local NET
+    NET=$(net_name "$DIR")
+
     header "部署 AList → $DIR (端口 $HOST_PORT)"
-    mkdir -p "$DIR/data"; echo "HOST_PORT=${HOST_PORT}" > "$DIR/.env"
+    mkdir -p "$DIR/data"
+    echo "HOST_PORT=${HOST_PORT}" > "$DIR/.env"
+
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   alist:
     image: xhofe/alist:latest
     restart: unless-stopped
-    environment: [PUID=0, PGID=0, UMASK=022]
-    volumes: [./data:/opt/alist/data]
-    ports: ["127.0.0.1:${HOST_PORT}:5244"]
+    environment:
+      - PUID=0
+      - PGID=0
+      - UMASK=022
+    volumes:
+      - ./data:/opt/alist/data
+    ports:
+      - "127.0.0.1:${HOST_PORT}:5244"
     networks: [${NET}]
     healthcheck:
-      test: ["CMD","wget","--spider","-q","http://localhost:5244/"]
-      interval: 30s; timeout: 10s; retries: 3
+      # 替换为 alpine 自带的 wget，并检查主页状态
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:5244/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
 networks:
-  ${NET}: {driver: bridge}
+  ${NET}:
+    driver: bridge
 YAML
+
     run_compose "$DIR" "AList"
+
+    # 等待初始化后尝试从日志提取初始密码
+    info "等待 AList 初始化（约 5 秒）..."
     sleep 5
-    local cid; cid=$(cd "$DIR" && docker compose ps -q alist 2>/dev/null | head -1)
-    local init_pw; init_pw=$(docker logs "$cid" 2>&1 | grep -oP '(?<=password: )[^\s]+' | tail -1 || true)
+    local cid init_pw
+    cid=$(cd "$DIR" && docker compose ps -q alist 2>/dev/null | head -1)
+
+    # 提示：只有第一次全新部署时日志才会有密码；若容器重启，日志里就不会再出现了
+    init_pw=$(docker logs "$cid" 2>&1 | grep -oP '(?<=password: )[^\s]+' | tail -1 || true)
+
     log "AList 已启动 → http://127.0.0.1:${HOST_PORT}"
     if [[ -n "${init_pw:-}" ]]; then
         log "初始管理员密码: ${init_pw}"
         echo "ALIST_INIT_PASSWORD=${init_pw}" >> "$DIR/.env"
+        log "凭据已保存至 $DIR/.env"
     else
-        warn "无法自动获取密码，请执行: docker exec -it ${cid:-<ID>} ./alist admin random"
+        warn "无法自动获取初始密码（可能非首次部署），如需重置请执行："
+        warn "  随机新密码: docker exec -it ${cid:-<容器ID>} ./alist admin random"
+        warn "  指定新密码: docker exec -it ${cid:-<容器ID>} ./alist admin set <新密码>"
     fi
 }
 
@@ -1498,25 +1722,31 @@ YAML
 # 10) 容器详情
 # ============================================================
 menu_container_info() {
-    echo ""; echo -e "${CYAN}${BOLD}── 容器详情 ──${NC}"
+    echo ""
+    echo -e "${CYAN}${BOLD}── 容器详情 ──${NC}"
     local -a deployed_dirs=() deployed_labels=()
     for app in "${ALL_APPS[@]}"; do
         while IFS= read -r dir; do
-            deployed_dirs+=("$dir"); deployed_labels+=("$app  [$(inst_label "$dir" "$app")]")
+            deployed_dirs+=("$dir")
+            deployed_labels+=("$app  [$(inst_label "$dir" "$app")]")
         done < <(list_instances "$app")
     done
-    [[ ${#deployed_dirs[@]} -eq 0 ]] && warn "没有已部署的应用" && return
+    if [[ ${#deployed_dirs[@]} -eq 0 ]]; then warn "没有已部署的应用"; return; fi
+
     local i=1
     for lbl in "${deployed_labels[@]}"; do printf "  %2d) %s\n" "$i" "$lbl"; ((i++)); done
-    echo ""; read -rp "请输入编号（0 返回）: " input
+    echo ""
+    read -rp "请输入编号（0 返回）: " input
     [[ "$input" == "0" ]] && return
     local idx=$((input - 1))
     [[ $idx -lt 0 || $idx -ge ${#deployed_dirs[@]} ]] && warn "编号无效" && return
 
     local dir="${deployed_dirs[$idx]}"
     header "容器详情：$(basename "$dir")"
-    local cids; mapfile -t cids < <(cd "$dir" && docker compose ps -q 2>/dev/null)
-    [[ ${#cids[@]} -eq 0 ]] && warn "该实例无运行容器" && return
+
+    local cids
+    mapfile -t cids < <(cd "$dir" && docker compose ps -q 2>/dev/null)
+    if [[ ${#cids[@]} -eq 0 ]]; then warn "该实例无运行中的容器"; return; fi
 
     for cid in "${cids[@]}"; do
         local name image status health created started ip restart_policy pid
@@ -1529,17 +1759,40 @@ menu_container_info() {
         ip=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$cid")
         restart_policy=$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$cid")
         pid=$(docker inspect --format '{{.State.Pid}}' "$cid")
-        echo ""; echo -e "  ${BOLD}▸ 容器:${NC} $name"
-        printf "    %-14s %s\n" "镜像:" "$image"
-        printf "    %-14s %s\n" "状态:" "$status"
-        printf "    %-14s %s\n" "健康检查:" "$health"
-        printf "    %-14s %s\n" "创建:" "$created"
-        printf "    %-14s %s\n" "启动:" "$started"
-        printf "    %-14s %s\n" "IP:" "${ip:-无}"
-        printf "    %-14s %s\n" "重启策略:" "$restart_policy"
-        printf "    %-14s %s\n" "PID:" "$pid"
-        local ports; ports=$(docker inspect --format '{{range $p,$b := .NetworkSettings.Ports}}{{if $b}}{{(index $b 0).HostIp}}:{{(index $b 0).HostPort}}->{{$p}} {{end}}{{end}}' "$cid")
-        printf "    %-14s %s\n" "端口:" "${ports:-无}"
+
+        echo ""
+        echo -e "  ${BOLD}▸ 容器:${NC} $name"
+        printf "    %-14s %s\n" "镜像:"        "$image"
+        printf "    %-14s %s\n" "状态:"        "$status"
+        printf "    %-14s %s\n" "健康检查:"    "$health"
+        printf "    %-14s %s\n" "创建时间:"    "$created"
+        printf "    %-14s %s\n" "启动时间:"    "$started"
+        printf "    %-14s %s\n" "容器 IP:"     "${ip:-无}"
+        printf "    %-14s %s\n" "重启策略:"    "$restart_policy"
+        printf "    %-14s %s\n" "主进程 PID:"  "$pid"
+
+        # 端口映射
+        local ports
+        ports=$(docker inspect --format '{{range $p,$b := .NetworkSettings.Ports}}{{if $b}}{{(index $b 0).HostIp}}:{{(index $b 0).HostPort}}->{{$p}} {{end}}{{end}}' "$cid")
+        printf "    %-14s %s\n" "端口映射:" "${ports:-无}"
+
+        # 挂载卷
+        local mounts
+        mounts=$(docker inspect --format '{{range .Mounts}}{{.Source}}→{{.Destination}} {{end}}' "$cid")
+        if [[ -n "$mounts" ]]; then
+            echo "    卷挂载:"
+            for m in $mounts; do
+                echo "      $m"
+            done
+        fi
+
+        # 镜像构建信息
+        local img_id img_size img_created
+        img_id=$(docker image inspect "$image" --format '{{.Id}}' 2>/dev/null | cut -c8-19 || echo "未知")
+        img_size=$(docker image inspect "$image" --format '{{.Size}}' 2>/dev/null | \
+            awk '{if($1>=1073741824) printf "%.1f GB",($1/1073741824); else if($1>=1048576) printf "%.1f MB",($1/1048576); else printf "%d KB",($1/1024)}' || echo "未知")
+        img_created=$(docker image inspect "$image" --format '{{.Created}}' 2>/dev/null | cut -c1-10 || echo "未知")
+        printf "    %-14s %s  (%s, %s)\n" "镜像信息:" "$img_id" "$img_size" "$img_created"
     done
     echo ""
 }
@@ -1660,37 +1913,291 @@ _migrate_local() {
 }
 
 _migrate_remote() {
-    local -a deployed_dirs=() deployed_labels=()
+    local -a deployed_dirs=() deployed_labels=() deployed_apps=()
     for app in "${ALL_APPS[@]}"; do
         while IFS= read -r dir; do
-            deployed_dirs+=("$dir"); deployed_labels+=("$app  [$(inst_label "$dir" "$app")]")
+            deployed_dirs+=("$dir")
+            deployed_labels+=("$app  [$(inst_label "$dir" "$app")]")
+            deployed_apps+=("$app")
         done < <(list_instances "$app")
     done
-    [[ ${#deployed_dirs[@]} -eq 0 ]] && warn "没有已部署的应用" && return
+    if [[ ${#deployed_dirs[@]} -eq 0 ]]; then warn "没有已部署的应用"; return; fi
+
     local i=1
     for lbl in "${deployed_labels[@]}"; do printf "  %2d) %s\n" "$i" "$lbl"; ((i++)); done
-    echo ""; read -rp "请输入编号（0 返回）: " input
+    echo ""
+    read -rp "请输入要迁移的实例编号（0 返回）: " input
     [[ "$input" == "0" ]] && return
     local idx=$((input - 1))
     [[ $idx -lt 0 || $idx -ge ${#deployed_dirs[@]} ]] && warn "编号无效" && return
     local src_dir="${deployed_dirs[$idx]}"
-    read -rp "目标服务器（user@host）: " remote_host; [[ -z "$remote_host" ]] && return
+    local app_type="${deployed_apps[$idx]}"
+
+    echo ""
+    read -rp "目标服务器（user@host，如 root@192.168.1.100）: " remote_host
+    [[ -z "$remote_host" ]] && warn "不能为空" && return
     read -rp "目标路径 [默认 /opt/docker-apps/$(basename "$src_dir")]: " remote_path
-    remote_path="${remote_path:-/opt/docker-apps/$(basename "$src_dir")}"
-    read -rp "SSH 端口 [默认 22]: " ssh_port; ssh_port="${ssh_port:-22}"
+    [[ -z "$remote_path" ]] && remote_path="/opt/docker-apps/$(basename "$src_dir")"
+    read -rp "SSH 端口 [默认 22]: " ssh_port
+    ssh_port="${ssh_port:-22}"
+
+    # ── 检测该应用含有哪些数据库 ────────────────────────────────
+    local has_mariadb=0 has_postgres=0 has_redis=0
+    grep -q 'image: mariadb'    "$src_dir/docker-compose.yml" 2>/dev/null && has_mariadb=1
+    grep -q 'image: mysql'      "$src_dir/docker-compose.yml" 2>/dev/null && has_mariadb=1
+    grep -q 'image: postgres'   "$src_dir/docker-compose.yml" 2>/dev/null && has_postgres=1
+    grep -q 'image: redis'      "$src_dir/docker-compose.yml" 2>/dev/null && has_redis=1
+
+    echo ""
+    echo -e "${CYAN}${BOLD}── 迁移内容预览：$(basename "$src_dir") ──${NC}"
+    echo ""
+    echo -e "  应用类型  : $app_type"
+    echo -e "  源目录    : $src_dir"
+    echo -e "  目标       : ${remote_host}:${remote_path}"
+    echo ""
+    echo -e "  将执行以下步骤："
+    echo -e "    [1] SSH 连通性检查"
+    echo -e "    [2] 确认目标机已安装 Docker"
+    echo -e "    [3] 停止本地服务（保证数据一致性）"
+    [[ $has_mariadb -eq 1 ]] && \
+        echo -e "    [4] ${YELLOW}mysqldump 导出数据库${NC}（逻辑备份，跨机安全）"
+    [[ $has_postgres -eq 1 ]] && \
+        echo -e "    [4] ${YELLOW}pg_dumpall 导出数据库${NC}（逻辑备份，跨机安全）"
+    echo -e "    [5] rsync 同步文件（配置 / 上传文件 / 静态资源）"
+    [[ $has_mariadb -eq 1 || $has_postgres -eq 1 ]] && \
+        echo -e "        ${YELLOW}跳过原始数据库文件目录（db/）—— 使用 SQL 导入替代${NC}"
+    echo -e "    [6] 目标机拉取镜像并启动服务"
+    [[ $has_mariadb -eq 1 || $has_postgres -eq 1 ]] && \
+        echo -e "    [7] 等待数据库就绪后导入 SQL"
+    echo ""
+    read -rp "确认执行？[y/N]: " confirm
+    [[ "${confirm,,}" != "y" ]] && { info "已取消"; return; }
+
+    header "远程迁移：$(basename "$src_dir") → ${remote_host}:${remote_path}"
+
+    # ── 步骤 1：确保密钥已就位 ──────────────────────────────────
+    info "[1/7] 检查并配置 SSH 密钥登录..."
+    ensure_ssh_key "$remote_host" "$ssh_port" \
+        || error "SSH 密钥配置失败，迁移中止"
+
     local SSH_OPTS="-p ${ssh_port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-    ensure_ssh_key "$remote_host" "$ssh_port" || error "SSH 配置失败"
-    (cd "$src_dir" && docker compose stop 2>/dev/null) || warn "停止失败，继续..."
-    ssh $SSH_OPTS "$remote_host" "mkdir -p '$remote_path'"
-    if rsync -az --info=progress2 -e "ssh ${SSH_OPTS}" "$src_dir/" "${remote_host}:${remote_path}/"; then
-        log "文件同步完成"
-        ssh $SSH_OPTS "$remote_host" "cd '$remote_path' && docker compose pull && docker compose up -d" \
-            && log "目标机服务已启动" || warn "目标机启动失败"
+
+    # ── 步骤 2：检查目标机 Docker ────────────────────────────────
+    info "[2/7] 检查目标机 Docker..."
+    if ! ssh $SSH_OPTS "$remote_host" "command -v docker &>/dev/null"; then
+        warn "目标机未安装 Docker"
+        read -rp "  是否尝试自动在目标机安装 Docker？[y/N]: " inst_docker
+        if [[ "${inst_docker,,}" == "y" ]]; then
+            ssh $SSH_OPTS "$remote_host" \
+                "curl -fsSL https://get.docker.com | sh && systemctl enable --now docker" \
+                || error "目标机 Docker 安装失败，请手动安装后重试"
+            log "目标机 Docker 安装完成"
+        else
+            error "目标机无 Docker，迁移中止"
+        fi
     else
-        warn "rsync 失败"; (cd "$src_dir" && docker compose start 2>/dev/null) || true
+        local remote_docker_ver
+        remote_docker_ver=$(ssh $SSH_OPTS "$remote_host" \
+            "docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown")
+        log "目标机 Docker 版本：$remote_docker_ver"
     fi
-    read -rp "是否恢复本地实例？[y/N]: " resume
-    [[ "${resume,,}" == "y" ]] && (cd "$src_dir" && docker compose start 2>/dev/null) || true
+
+    # ── 步骤 3：停止本地服务 ─────────────────────────────────────
+    info "[3/7] 停止本地服务（确保数据一致性）..."
+    if ! (cd "$src_dir" && docker compose stop 2>/dev/null); then
+        warn "停止失败，数据可能不一致，继续..."
+    else
+        log "本地服务已停止"
+    fi
+
+    # ── 步骤 4：数据库逻辑导出 ──────────────────────────────────
+    local sql_dump_file="" pg_dump_file=""
+
+    if [[ $has_mariadb -eq 1 ]]; then
+        info "[4/7] mysqldump 导出数据库..."
+        local db_root_pw db_name
+        db_root_pw=$(grep -oP '(?<=ROOT_PASSWORD=).+' "$src_dir/.env" 2>/dev/null | head -1 || true)
+        local db_cid
+        db_cid=$(cd "$src_dir" && docker compose ps -q db lskypro-db nextcloud-db wordpress-db 2>/dev/null \
+            | head -1 || docker compose ps -q 2>/dev/null \
+            | xargs -I{} docker inspect --format '{{.Name}} {{.Config.Image}}' {} \
+            | grep mariadb | awk '{print $1}' | sed 's|^/||' | head -1)
+
+        if [[ -z "$db_cid" ]]; then
+            db_cid=$(docker ps --format '{{.Names}} {{.Image}}' \
+                | grep mariadb | grep "$(basename "$src_dir")" | awk '{print $1}' | head -1)
+        fi
+
+        if [[ -n "$db_cid" ]]; then
+            sql_dump_file="/tmp/$(basename "$src_dir")_db_$(date +%Y%m%d_%H%M%S).sql.gz"
+            if [[ -n "$db_root_pw" ]]; then
+                docker exec "$db_cid" \
+                    mysqldump -uroot -p"${db_root_pw}" --all-databases \
+                    --single-transaction --quick --triggers --routines --events \
+                    2>/dev/null | gzip > "$sql_dump_file"
+            else
+                docker exec "$db_cid" \
+                    mysqldump -uroot --all-databases \
+                    --single-transaction --quick --triggers --routines --events \
+                    2>/dev/null | gzip > "$sql_dump_file"
+            fi
+            local dump_size
+            dump_size=$(du -h "$sql_dump_file" | cut -f1)
+            log "数据库导出完成：$sql_dump_file（$dump_size）"
+        else
+            warn "未找到 MariaDB 容器，跳过数据库逻辑导出（将由 rsync 直接同步数据文件）"
+            warn "注意：直接同步 MariaDB 数据文件到跨版本主机可能导致数据损坏"
+        fi
+
+    elif [[ $has_postgres -eq 1 ]]; then
+        info "[4/7] pg_dumpall 导出 PostgreSQL..."
+        local pg_cid
+        pg_cid=$(cd "$src_dir" && docker compose ps -q db postgres gitea-db 2>/dev/null | head -1 || true)
+        if [[ -n "$pg_cid" ]]; then
+            pg_dump_file="/tmp/$(basename "$src_dir")_pgdb_$(date +%Y%m%d_%H%M%S).sql.gz"
+            docker exec "$pg_cid" pg_dumpall -U postgres 2>/dev/null \
+                | gzip > "$pg_dump_file"
+            local dump_size
+            dump_size=$(du -h "$pg_dump_file" | cut -f1)
+            log "PostgreSQL 导出完成：$pg_dump_file（$dump_size）"
+        else
+            warn "未找到 PostgreSQL 容器，跳过逻辑导出"
+        fi
+    else
+        info "[4/7] 无数据库服务，跳过"
+    fi
+
+    # ── 步骤 5：rsync 文件同步 ───────────────────────────────────
+    info "[5/7] rsync 同步文件..."
+    ssh $SSH_OPTS "$remote_host" "mkdir -p '$remote_path'" \
+        || error "远程目录创建失败"
+
+    local rsync_excludes=()
+    if [[ -n "$sql_dump_file" || -n "$pg_dump_file" ]]; then
+        rsync_excludes+=(
+            "--exclude=db/"
+            "--exclude=postgres/"
+            "--exclude=pgdata/"
+            "--exclude=database/"
+        )
+        info "  已排除数据库原始数据目录（将用 SQL 导入）"
+    fi
+
+    if rsync -az --info=progress2 -e "ssh ${SSH_OPTS}" \
+        "${rsync_excludes[@]}" \
+        "$src_dir/" "${remote_host}:${remote_path}/"; then
+        log "文件同步完成"
+    else
+        warn "rsync 失败，正在恢复本地服务..."
+        (cd "$src_dir" && docker compose start 2>/dev/null) || true
+        return
+    fi
+
+    if [[ -n "$sql_dump_file" ]]; then
+        info "  传输 SQL dump 到远程..."
+        rsync -az -e "ssh ${SSH_OPTS}" \
+            "$sql_dump_file" "${remote_host}:${remote_path}/_db_import.sql.gz" \
+            && log "  SQL dump 已传输"
+    fi
+    if [[ -n "$pg_dump_file" ]]; then
+        info "  传输 PostgreSQL dump 到远程..."
+        rsync -az -e "ssh ${SSH_OPTS}" \
+            "$pg_dump_file" "${remote_host}:${remote_path}/_pgdb_import.sql.gz" \
+            && log "  PostgreSQL dump 已传输"
+    fi
+
+    # ── 步骤 6：目标机拉取镜像并启动 ────────────────────────────
+    info "[6/7] 目标机启动服务..."
+    if ! ssh $SSH_OPTS "$remote_host" \
+        "cd '$remote_path' && docker compose pull && docker compose up -d 2>&1"; then
+        warn "目标机启动失败，请登录排查："
+        warn "  ssh ${SSH_OPTS} $remote_host 'cd $remote_path && docker compose logs'"
+        return
+    fi
+    log "目标机服务已启动"
+
+    # ── 步骤 7：数据库导入 ───────────────────────────────────────
+    if [[ -n "$sql_dump_file" ]]; then
+        info "[7/7] 等待目标机 MariaDB 就绪后导入..."
+        local retry=0
+        while [[ $retry -lt 20 ]]; do
+            if ssh $SSH_OPTS "$remote_host" \
+                "cd '$remote_path' && docker compose exec -T db \
+                 mysqladmin ping -uroot --silent 2>/dev/null"; then
+                break
+            fi
+            ((retry++)); sleep 3
+            info "  等待数据库（${retry}/20）..."
+        done
+
+        local db_root_pw
+        db_root_pw=$(grep -oP '(?<=ROOT_PASSWORD=).+' "$src_dir/.env" 2>/dev/null | head -1 || true)
+
+        if ssh $SSH_OPTS "$remote_host" \
+            "cd '$remote_path' && zcat _db_import.sql.gz \
+             | docker compose exec -T db \
+               mysql -uroot ${db_root_pw:+-p\"${db_root_pw}\"} 2>&1"; then
+            log "数据库导入成功"
+            ssh $SSH_OPTS "$remote_host" "rm -f '${remote_path}/_db_import.sql.gz'" || true
+        else
+            warn "数据库自动导入失败，SQL 文件保留在：${remote_host}:${remote_path}/_db_import.sql.gz"
+            warn "请手动执行导入："
+            warn "  ssh ${SSH_OPTS} $remote_host"
+            warn "  cd $remote_path"
+            warn "  zcat _db_import.sql.gz | docker compose exec -T db mysql -uroot -p'<密码>'"
+        fi
+
+    elif [[ -n "$pg_dump_file" ]]; then
+        info "[7/7] 等待目标机 PostgreSQL 就绪后导入..."
+        local retry=0
+        while [[ $retry -lt 20 ]]; do
+            if ssh $SSH_OPTS "$remote_host" \
+                "cd '$remote_path' && docker compose exec -T db pg_isready -U postgres &>/dev/null"; then
+                break
+            fi
+            ((retry++)); sleep 3
+            info "  等待数据库（${retry}/20）..."
+        done
+
+        if ssh $SSH_OPTS "$remote_host" \
+            "cd '$remote_path' && zcat _pgdb_import.sql.gz \
+             | docker compose exec -T db psql -U postgres 2>&1"; then
+            log "PostgreSQL 导入成功"
+            ssh $SSH_OPTS "$remote_host" "rm -f '${remote_path}/_pgdb_import.sql.gz'" || true
+        else
+            warn "PostgreSQL 自动导入失败，dump 文件保留在：${remote_host}:${remote_path}/_pgdb_import.sql.gz"
+        fi
+    else
+        info "[7/7] 无数据库导入步骤，跳过"
+    fi
+
+    # ── 完成汇总 ─────────────────────────────────────────────────
+    echo ""
+    echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════╗"
+    echo -e "║                    迁移完成 — 操作汇总                      ║"
+    echo -e "╠══════════════════════════════════════════════════════════════╣"
+    printf  "║  %-60s║\n" "应用: $(basename "$src_dir") ($app_type)"
+    printf  "║  %-60s║\n" "目标: ${remote_host}:${remote_path}"
+    [[ -n "$sql_dump_file"  ]] && printf "║  %-60s║\n" "DB:   mysqldump 逻辑导出 + 远程导入"
+    [[ -n "$pg_dump_file"   ]] && printf "║  %-60s║\n" "DB:   pg_dumpall 逻辑导出 + 远程导入"
+    echo -e "╠══════════════════════════════════════════════════════════════╣"
+    echo -e "║  验证步骤：                                                  ║"
+    echo -e "║  1. 登录目标机，访问应用确认功能正常                        ║"
+    echo -e "║  2. 检查用户数据、上传文件、数据库内容                      ║"
+    echo -e "║  3. 确认无误后删除本地旧实例：                              ║"
+    printf  "║     cd %-54s║\n" "$src_dir"
+    echo -e "║     docker compose down -v && cd .. && rm -rf $(basename "$src_dir")   ║"
+    echo -e "╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    read -rp "是否恢复本地实例继续运行？[y/N]: " resume_local
+    if [[ "${resume_local,,}" == "y" ]]; then
+        (cd "$src_dir" && docker compose start 2>/dev/null) \
+            && log "本地实例已恢复运行" \
+            || warn "本地实例恢复失败，请手动：cd $src_dir && docker compose up -d"
+    else
+        info "本地实例保持停止状态"
+    fi
 }
 
 # ============================================================
