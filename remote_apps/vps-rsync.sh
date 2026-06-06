@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ====================================================
-#  VPS 文件/目录交互式发送工具 (rsync + 自动密钥管理)
-#  流程：检测密钥 → 没有则用密码推公钥 → rsync 走密钥
+#  文件/目录交互式迁移工具 (支持本机及跨机)
+#  - 跨机：rsync + 自动密钥管理 (无密钥自动用密码推公钥)
+#  - 本机：调用 rsync 保持权限并显示进度
 # ====================================================
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[0;33m'
@@ -13,11 +14,11 @@ err()  { echo -e "${RED}✘ ${NC}$*"; exit 1; }
 info() { echo -e "${CYAN}i ${NC}$*"; }
 
 echo -e "${CYAN}${BOLD}=============================================${NC}"
-echo -e "${CYAN}${BOLD}       VPS 跨机文件/目录推送工具 (rsync)${NC}"
+echo -e "${CYAN}${BOLD}       文件/目录交互式迁移工具 (rsync)${NC}"
 echo -e "${CYAN}${BOLD}=============================================${NC}"
 echo ""
 
-# ── 环境检查 ────────────────────────────────────────────────
+# ── 环境检查 (基础包) ──────────────────────────────────────
 SUDO=""
 [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 
@@ -35,12 +36,61 @@ install_pkg() {
     fi
 }
 
-command -v rsync   &>/dev/null || install_pkg rsync
-command -v ssh     &>/dev/null || install_pkg openssh-client
-log "环境检查通过"
+command -v rsync &>/dev/null || install_pkg rsync
+
+# ── 选择操作模式 ────────────────────────────────────────────
+echo "请选择迁移模式："
+echo "  1) 跨机传输 (推送到远程 VPS)"
+echo "  2) 本机迁移 (本机目录到目录)"
+read -rp "请输入选项 [默认 1]: " OP_MODE
+OP_MODE=${OP_MODE:-1}
 echo ""
 
-# ── 收集参数 ────────────────────────────────────────────────
+# ==========================================================
+#  模式 2：本机迁移
+# ==========================================================
+if [ "$OP_MODE" = "2" ]; then
+    info "已选择：本机迁移"
+    echo ""
+    
+    read -rp "本地源路径（文件或目录，必填）: " LOCAL_PATH
+    [ -z "$LOCAL_PATH" ] || [ ! -e "$LOCAL_PATH" ] && err "源路径为空或不存在"
+
+    read -rp "本地目标路径（必填）: " DEST_PATH
+    [ -z "$DEST_PATH" ] && err "目标路径不能为空"
+    
+    # 确保目标路径的父目录存在
+    mkdir -p "$DEST_PATH" 2>/dev/null
+
+    echo ""
+    echo -e "${GREEN}${BOLD}🚀 开始本机迁移${NC}"
+    info "  源：$LOCAL_PATH"
+    info "  目标：$DEST_PATH"
+    echo ""
+
+    rsync -avzP "${LOCAL_PATH}" "${DEST_PATH}"
+    RSYNC_EXIT=$?
+
+    echo ""
+    echo -e "${CYAN}${BOLD}=============================================${NC}"
+    if [ "${RSYNC_EXIT}" -eq 0 ]; then
+        log "本机迁移成功完成！"
+    else
+        err "迁移失败（退出码：${RSYNC_EXIT}），请检查权限或磁盘空间。"
+    fi
+    echo -e "${CYAN}${BOLD}=============================================${NC}"
+    exit "${RSYNC_EXIT}"
+fi
+
+# ==========================================================
+#  模式 1：跨机传输 (原有逻辑)
+# ==========================================================
+info "已选择：跨机传输 (推送到远程 VPS)"
+command -v ssh &>/dev/null || install_pkg openssh-client
+log "跨机环境检查通过"
+echo ""
+
+# ── 收集参数 ──
 read -rp "本地路径（文件或目录，必填）: " LOCAL_PATH
 [ -z "$LOCAL_PATH" ] || [ ! -e "$LOCAL_PATH" ] && err "路径为空或不存在"
 
@@ -58,7 +108,7 @@ read -rp "远程保存路径（必填，如 /root/）: " REMOTE_PATH
 
 echo ""
 
-# ── 密钥检测与自动推送 ──────────────────────────────────────
+# ── 密钥检测与自动推送 ──
 SSH_OPTS="-p ${REMOTE_PORT} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 KEY_OK=0
 
@@ -143,9 +193,9 @@ if [ "$KEY_OK" -eq 0 ]; then
     fi
 fi
 
-# ── 执行 rsync 传输（全程走密钥，不再需要密码）──────────────
+# ── 执行 rsync 传输 ──
 echo ""
-echo -e "${GREEN}${BOLD}🚀 开始推送${NC}"
+echo -e "${GREEN}${BOLD}🚀 开始跨机推送${NC}"
 info "  本地：$LOCAL_PATH"
 info "  目标：${REMOTE_USER}@${REMOTE_IP}:${REMOTE_PATH}  (端口 ${REMOTE_PORT})"
 echo ""
@@ -159,7 +209,7 @@ RSYNC_EXIT=$?
 echo ""
 echo -e "${CYAN}${BOLD}=============================================${NC}"
 if [ "${RSYNC_EXIT}" -eq 0 ]; then
-    log "传输成功完成！"
+    log "跨机传输成功完成！"
     echo ""
     info "下次推送到同一台机器直接运行脚本即可，无需再输密码"
     info "如需关闭目标机的密码登录（推荐）："
