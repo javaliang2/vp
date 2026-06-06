@@ -33,6 +33,95 @@ header() { echo -e "\n${CYAN}${BOLD}━━━ $* ━━━${NC}\n"; }
 BASE_DIR="/opt/docker-apps"
 mkdir -p "$BASE_DIR"
 
+# ============================================================
+# SSH 密钥检测与自动推送（供迁移等需要 SSH 的功能复用）
+# 用法：ensure_ssh_key <user@host> <port>
+# 返回：0 = 密钥已就位可免密登录；非0 = 失败
+# ============================================================
+ensure_ssh_key() {
+    local remote_host="$1"
+    local ssh_port="${2:-22}"
+    local ssh_opts="-p ${ssh_port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+
+    # ── 1. 先测试密钥是否已经可用 ───────────────────────────
+    if ssh $ssh_opts -o BatchMode=yes "$remote_host" "echo ok" &>/dev/null; then
+        log "密钥登录已可用：$remote_host"
+        return 0
+    fi
+
+    info "未检测到可用密钥，将用密码完成一次性公钥推送"
+    echo ""
+
+    # ── 2. 找或生成本机公钥 ─────────────────────────────────
+    local pubkey_file=""
+    for f in ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub ~/.ssh/id_ecdsa.pub; do
+        [[ -f "$f" ]] && pubkey_file="$f" && break
+    done
+
+    if [[ -z "$pubkey_file" ]]; then
+        info "本机无 SSH 密钥，自动生成 ed25519 密钥对..."
+        ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 \
+            -C "docker-migrate-$(hostname)-$(date +%Y%m%d)" \
+            || { warn "密钥生成失败"; return 1; }
+        pubkey_file=~/.ssh/id_ed25519.pub
+        log "密钥已生成：$pubkey_file"
+    else
+        info "使用现有公钥：$pubkey_file"
+    fi
+
+    local pubkey_content
+    pubkey_content=$(cat "$pubkey_file")
+
+    # ── 3. 需要 sshpass 来做一次性密码推送 ──────────────────
+    if ! command -v sshpass &>/dev/null; then
+        warn "需要安装 sshpass 来完成一次性密码推送..."
+        if command -v apt-get &>/dev/null; then
+            apt-get install -y -qq sshpass \
+                || { warn "sshpass 安装失败，请手动安装后重试"; return 1; }
+        else
+            warn "请手动安装 sshpass 后重试"; return 1
+        fi
+    fi
+
+    read -s -rp "输入 ${remote_host} 的密码（仅此一次）: " remote_pass
+    echo ""
+    echo ""
+
+    # ── 4. 推送公钥 ─────────────────────────────────────────
+    info "推送公钥到目标机..."
+    export SSHPASS="${remote_pass}"
+    if sshpass -e ssh $ssh_opts "$remote_host" \
+        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
+         echo '${pubkey_content}' >> ~/.ssh/authorized_keys && \
+         sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys && \
+         chmod 600 ~/.ssh/authorized_keys"; then
+        log "公钥推送成功"
+    else
+        unset SSHPASS
+        warn "公钥推送失败（密码错误或目标机未开放密码登录）"
+        return 1
+    fi
+    unset SSHPASS
+
+    # ── 5. 验证密钥是否生效 ──────────────────────────────────
+    info "验证密钥登录..."
+    if ssh $ssh_opts -o BatchMode=yes "$remote_host" "echo ok" &>/dev/null; then
+        log "密钥登录验证通过 ✓"
+        echo ""
+        info "下次连接此主机无需再输密码"
+        info "如需关闭目标机密码登录（推荐），可执行："
+        info "  ssh ${remote_host} \"sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config && systemctl restart sshd\""
+        echo ""
+        return 0
+    else
+        warn "密钥验证失败，请在目标机确认："
+        warn "  /etc/ssh/sshd_config 中 PubkeyAuthentication yes"
+        warn "  AuthorizedKeysFile .ssh/authorized_keys"
+        warn "  执行 systemctl restart sshd 后重试"
+        return 1
+    fi
+}
+
 [[ $EUID -ne 0 ]] && error "请使用 root 或 sudo 运行此脚本"
 
 ALL_APPS=(
@@ -1884,21 +1973,21 @@ _migrate_remote() {
 
     header "远程迁移：$(basename "$src_dir") → ${remote_host}:${remote_path}"
 
-    # ── 步骤 1：SSH 连通性检查 ───────────────────────────────────
-    info "[1/7] 检查 SSH 连通性..."
-    if ! ssh -p "$ssh_port" -o ConnectTimeout=10 -o BatchMode=yes \
-            "$remote_host" "echo ok" &>/dev/null; then
-        error "无法通过 SSH 连接 ${remote_host}:${ssh_port}，请检查网络/密钥配置后重试"
-    fi
-    log "SSH 连通正常"
+    # ── 步骤 1：确保密钥已就位（没有则自动用密码推送公钥）──
+    info "[1/7] 检查并配置 SSH 密钥登录..."
+    ensure_ssh_key "$remote_host" "$ssh_port" \
+        || error "SSH 密钥配置失败，迁移中止"
+
+    # 后续所有 ssh/rsync 统一使用此选项（密钥已就位，不再需要密码）
+    local SSH_OPTS="-p ${ssh_port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
     # ── 步骤 2：检查目标机 Docker ────────────────────────────────
     info "[2/7] 检查目标机 Docker..."
-    if ! ssh -p "$ssh_port" "$remote_host" "command -v docker &>/dev/null"; then
+    if ! ssh $SSH_OPTS "$remote_host" "command -v docker &>/dev/null"; then
         warn "目标机未安装 Docker"
         read -rp "  是否尝试自动在目标机安装 Docker？[y/N]: " inst_docker
         if [[ "${inst_docker,,}" == "y" ]]; then
-            ssh -p "$ssh_port" "$remote_host" \
+            ssh $SSH_OPTS "$remote_host" \
                 "curl -fsSL https://get.docker.com | sh && systemctl enable --now docker" \
                 || error "目标机 Docker 安装失败，请手动安装后重试"
             log "目标机 Docker 安装完成"
@@ -1907,7 +1996,7 @@ _migrate_remote() {
         fi
     else
         local remote_docker_ver
-        remote_docker_ver=$(ssh -p "$ssh_port" "$remote_host" \
+        remote_docker_ver=$(ssh $SSH_OPTS "$remote_host" \
             "docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown")
         log "目标机 Docker 版本：$remote_docker_ver"
     fi
@@ -1983,7 +2072,7 @@ _migrate_remote() {
 
     # ── 步骤 5：rsync 文件同步（排除数据库原始数据目录）────────
     info "[5/7] rsync 同步文件..."
-    ssh -p "$ssh_port" "$remote_host" "mkdir -p '$remote_path'" \
+    ssh $SSH_OPTS "$remote_host" "mkdir -p '$remote_path'" \
         || error "远程目录创建失败"
 
     # 构建排除规则：若已做逻辑导出，则排除原始 DB 数据目录
@@ -1999,7 +2088,7 @@ _migrate_remote() {
         info "  已排除数据库原始数据目录（将用 SQL 导入）"
     fi
 
-    if rsync -az --info=progress2 -e "ssh -p $ssh_port" \
+    if rsync -az --info=progress2 -e "ssh ${SSH_OPTS}" \
         "${rsync_excludes[@]}" \
         "$src_dir/" "${remote_host}:${remote_path}/"; then
         log "文件同步完成"
@@ -2012,23 +2101,23 @@ _migrate_remote() {
     # 如有 SQL dump，也传到远程
     if [[ -n "$sql_dump_file" ]]; then
         info "  传输 SQL dump 到远程..."
-        rsync -az -e "ssh -p $ssh_port" \
+        rsync -az -e "ssh ${SSH_OPTS}" \
             "$sql_dump_file" "${remote_host}:${remote_path}/_db_import.sql.gz" \
             && log "  SQL dump 已传输"
     fi
     if [[ -n "$pg_dump_file" ]]; then
         info "  传输 PostgreSQL dump 到远程..."
-        rsync -az -e "ssh -p $ssh_port" \
+        rsync -az -e "ssh ${SSH_OPTS}" \
             "$pg_dump_file" "${remote_host}:${remote_path}/_pgdb_import.sql.gz" \
             && log "  PostgreSQL dump 已传输"
     fi
 
     # ── 步骤 6：目标机拉取镜像并启动 ───────────────────────────
     info "[6/7] 目标机启动服务（让 Docker 自行拉取镜像）..."
-    if ! ssh -p "$ssh_port" "$remote_host" \
+    if ! ssh $SSH_OPTS "$remote_host" \
         "cd '$remote_path' && docker compose pull && docker compose up -d 2>&1"; then
         warn "目标机启动失败，请登录排查："
-        warn "  ssh -p $ssh_port $remote_host 'cd $remote_path && docker compose logs'"
+        warn "  ssh ${SSH_OPTS} $remote_host 'cd $remote_path && docker compose logs'"
         return
     fi
     log "目标机服务已启动"
@@ -2038,7 +2127,7 @@ _migrate_remote() {
         info "[7/7] 等待目标机 MariaDB 就绪后导入..."
         local retry=0
         while [[ $retry -lt 20 ]]; do
-            if ssh -p "$ssh_port" "$remote_host" \
+            if ssh $SSH_OPTS "$remote_host" \
                 "cd '$remote_path' && docker compose exec -T db \
                  mysqladmin ping -uroot --silent 2>/dev/null"; then
                 break
@@ -2050,16 +2139,16 @@ _migrate_remote() {
         local db_root_pw
         db_root_pw=$(grep -oP '(?<=ROOT_PASSWORD=).+' "$src_dir/.env" 2>/dev/null | head -1 || true)
 
-        if ssh -p "$ssh_port" "$remote_host" \
+        if ssh $SSH_OPTS "$remote_host" \
             "cd '$remote_path' && zcat _db_import.sql.gz \
              | docker compose exec -T db \
                mysql -uroot ${db_root_pw:+-p\"${db_root_pw}\"} 2>&1"; then
             log "数据库导入成功"
-            ssh -p "$ssh_port" "$remote_host" "rm -f '${remote_path}/_db_import.sql.gz'" || true
+            ssh $SSH_OPTS "$remote_host" "rm -f '${remote_path}/_db_import.sql.gz'" || true
         else
             warn "数据库自动导入失败，SQL 文件保留在：${remote_host}:${remote_path}/_db_import.sql.gz"
             warn "请手动执行导入："
-            warn "  ssh -p $ssh_port $remote_host"
+            warn "  ssh ${SSH_OPTS} $remote_host"
             warn "  cd $remote_path"
             warn "  zcat _db_import.sql.gz | docker compose exec -T db mysql -uroot -p'<密码>'"
         fi
@@ -2068,7 +2157,7 @@ _migrate_remote() {
         info "[7/7] 等待目标机 PostgreSQL 就绪后导入..."
         local retry=0
         while [[ $retry -lt 20 ]]; do
-            if ssh -p "$ssh_port" "$remote_host" \
+            if ssh $SSH_OPTS "$remote_host" \
                 "cd '$remote_path' && docker compose exec -T db pg_isready -U postgres &>/dev/null"; then
                 break
             fi
@@ -2076,11 +2165,11 @@ _migrate_remote() {
             info "  等待数据库（${retry}/20）..."
         done
 
-        if ssh -p "$ssh_port" "$remote_host" \
+        if ssh $SSH_OPTS "$remote_host" \
             "cd '$remote_path' && zcat _pgdb_import.sql.gz \
              | docker compose exec -T db psql -U postgres 2>&1"; then
             log "PostgreSQL 导入成功"
-            ssh -p "$ssh_port" "$remote_host" "rm -f '${remote_path}/_pgdb_import.sql.gz'" || true
+            ssh $SSH_OPTS "$remote_host" "rm -f '${remote_path}/_pgdb_import.sql.gz'" || true
         else
             warn "PostgreSQL 自动导入失败，dump 文件保留在：${remote_host}:${remote_path}/_pgdb_import.sql.gz"
         fi
