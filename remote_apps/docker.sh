@@ -133,23 +133,36 @@ interactive_menu() {
         echo -e "║  7) 更新应用镜像                                              ║"
         echo -e "║  8) 更新应用组件（PHP/DB/Redis 等）                          ║"
         echo -e "║  9) 部署额外实例（同一应用多开）                             ║"
+        echo -e "╠══════════════════════════════════════════════════════════════╣"
+        echo -e "║  10) 容器详情（镜像/IP/卷/端口/健康）                        ║"
+        echo -e "║  11) 资源监控（CPU/内存/网络）                                ║"
+        echo -e "║  12) 查看应用日志                                             ║"
+        echo -e "║  13) 应用迁移（本地路径 / 远程服务器）                       ║"
+        echo -e "║  14) 启动 / 停止 / 重启实例                                  ║"
+        echo -e "║  15) 清理 Docker 资源                                         ║"
         echo -e "║  0) 退出                                                      ║"
         echo -e "╚══════════════════════════════════════════════════════════════╝${NC}"
         echo ""
-        read -rp "请选择操作 [0-9]: " choice
+        read -rp "请选择操作 [0-15]: " choice
 
         case "$choice" in
-            1) check_system; install_docker ;;
-            2) ensure_docker; menu_select_apps ;;
-            3) check_system; ensure_docker; deploy_all_apps ;;
-            4) menu_uninstall_app ;;
-            5) menu_backup_app ;;
-            6) list_apps ;;
-            7) menu_update_images ;;
-            8) menu_update_components ;;
-            9) ensure_docker; menu_deploy_extra_instance ;;
-            0) echo "再见！"; exit 0 ;;
-            *) warn "无效选项，请输入 0-9" ;;
+            1)  check_system; install_docker ;;
+            2)  ensure_docker; menu_select_apps ;;
+            3)  check_system; ensure_docker; deploy_all_apps ;;
+            4)  menu_uninstall_app ;;
+            5)  menu_backup_app ;;
+            6)  list_apps ;;
+            7)  menu_update_images ;;
+            8)  menu_update_components ;;
+            9)  ensure_docker; menu_deploy_extra_instance ;;
+            10) menu_container_info ;;
+            11) menu_resource_monitor ;;
+            12) menu_view_logs ;;
+            13) menu_migrate_app ;;
+            14) menu_start_stop_restart ;;
+            15) menu_cleanup_docker ;;
+            0)  echo "再见！"; exit 0 ;;
+            *)  warn "无效选项，请输入 0-15" ;;
         esac
     done
 }
@@ -688,6 +701,13 @@ usage() {
   --update-all             更新全部已部署实例镜像
   --list                   列出所有可管理的应用及状态
   --all                    部署全部应用（非交互，适合自动化）
+  --info DIR               查看指定实例的容器详情
+  --logs DIR               查看指定实例最近 100 行日志
+  --stats                  查看全部容器资源快照（CPU/内存/网络）
+  --cleanup                清理悬空镜像 + 已停止容器 + 未使用卷
+  --start DIR              启动指定实例
+  --stop DIR               停止指定实例
+  --restart DIR            重启指定实例
   --help                   显示此帮助
 
 可部署的应用:
@@ -702,6 +722,11 @@ usage() {
   sudo bash $0 --update /opt/docker-apps/alist    # 更新默认实例
   sudo bash $0 --update-all                       # 更新全部实例
   sudo bash $0 --list                             # 查看应用状态
+  sudo bash $0 --info /opt/docker-apps/gitea      # 查看容器详情
+  sudo bash $0 --logs /opt/docker-apps/wordpress  # 查看应用日志
+  sudo bash $0 --stats                            # 查看资源占用
+  sudo bash $0 --restart /opt/docker-apps/alist   # 重启实例
+  sudo bash $0 --cleanup                          # 清理 Docker 资源
 EOF
     exit 0
 }
@@ -1513,6 +1538,712 @@ YAML
     fi
 }
 
+# ============================================================
+# 10) 容器详情
+# ============================================================
+menu_container_info() {
+    echo ""
+    echo -e "${CYAN}${BOLD}── 容器详情 ──${NC}"
+    local -a deployed_dirs=() deployed_labels=()
+    for app in "${ALL_APPS[@]}"; do
+        while IFS= read -r dir; do
+            deployed_dirs+=("$dir")
+            deployed_labels+=("$app  [$(inst_label "$dir" "$app")]")
+        done < <(list_instances "$app")
+    done
+    if [[ ${#deployed_dirs[@]} -eq 0 ]]; then warn "没有已部署的应用"; return; fi
+
+    local i=1
+    for lbl in "${deployed_labels[@]}"; do printf "  %2d) %s\n" "$i" "$lbl"; ((i++)); done
+    echo ""
+    read -rp "请输入编号（0 返回）: " input
+    [[ "$input" == "0" ]] && return
+    local idx=$((input - 1))
+    [[ $idx -lt 0 || $idx -ge ${#deployed_dirs[@]} ]] && warn "编号无效" && return
+
+    local dir="${deployed_dirs[$idx]}"
+    header "容器详情：$(basename "$dir")"
+
+    # 获取所有容器 ID
+    local cids
+    mapfile -t cids < <(cd "$dir" && docker compose ps -q 2>/dev/null)
+    if [[ ${#cids[@]} -eq 0 ]]; then warn "该实例无运行中的容器"; return; fi
+
+    for cid in "${cids[@]}"; do
+        local name image status created
+        name=$(docker inspect --format '{{.Name}}' "$cid" | sed 's|^/||')
+        image=$(docker inspect --format '{{.Config.Image}}' "$cid")
+        status=$(docker inspect --format '{{.State.Status}}' "$cid")
+        health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}无健康检查{{end}}' "$cid")
+        created=$(docker inspect --format '{{.Created}}' "$cid" | cut -c1-19 | tr 'T' ' ')
+        started=$(docker inspect --format '{{.State.StartedAt}}' "$cid" | cut -c1-19 | tr 'T' ' ')
+        ip=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$cid")
+        restart_policy=$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$cid")
+        pid=$(docker inspect --format '{{.State.Pid}}' "$cid")
+
+        echo ""
+        echo -e "  ${BOLD}▸ 容器:${NC} $name"
+        printf "    %-14s %s\n" "镜像:"        "$image"
+        printf "    %-14s %s\n" "状态:"        "$status"
+        printf "    %-14s %s\n" "健康检查:"    "$health"
+        printf "    %-14s %s\n" "创建时间:"    "$created"
+        printf "    %-14s %s\n" "启动时间:"    "$started"
+        printf "    %-14s %s\n" "容器 IP:"     "${ip:-无}"
+        printf "    %-14s %s\n" "重启策略:"    "$restart_policy"
+        printf "    %-14s %s\n" "主进程 PID:"  "$pid"
+
+        # 端口映射
+        local ports
+        ports=$(docker inspect --format '{{range $p,$b := .NetworkSettings.Ports}}{{if $b}}{{(index $b 0).HostIp}}:{{(index $b 0).HostPort}}->{{$p}} {{end}}{{end}}' "$cid")
+        printf "    %-14s %s\n" "端口映射:" "${ports:-无}"
+
+        # 挂载卷
+        local mounts
+        mounts=$(docker inspect --format '{{range .Mounts}}{{.Source}}→{{.Destination}} {{end}}' "$cid")
+        if [[ -n "$mounts" ]]; then
+            echo "    卷挂载:"
+            for m in $mounts; do
+                echo "      $m"
+            done
+        fi
+
+        # 镜像构建信息
+        local img_id img_size img_created
+        img_id=$(docker image inspect "$image" --format '{{.Id}}' 2>/dev/null | cut -c8-19 || echo "未知")
+        img_size=$(docker image inspect "$image" --format '{{.Size}}' 2>/dev/null | \
+            awk '{if($1>=1073741824) printf "%.1f GB",($1/1073741824); else if($1>=1048576) printf "%.1f MB",($1/1048576); else printf "%d KB",($1/1024)}' || echo "未知")
+        img_created=$(docker image inspect "$image" --format '{{.Created}}' 2>/dev/null | cut -c1-10 || echo "未知")
+        printf "    %-14s %s  (%s, %s)\n" "镜像信息:" "$img_id" "$img_size" "$img_created"
+    done
+    echo ""
+}
+
+# ============================================================
+# 11) 资源监控
+# ============================================================
+menu_resource_monitor() {
+    echo ""
+    echo -e "${CYAN}${BOLD}── 资源监控 ──${NC}"
+    echo ""
+    echo -e "  1) 查看全部容器资源快照（一次性）"
+    echo -e "  2) 实时监控指定实例（每 3 秒刷新，Ctrl+C 退出）"
+    echo -e "  3) 查看 Docker 磁盘使用总览"
+    echo -e "  0) 返回"
+    echo ""
+    read -rp "请选择 [0-3]: " choice
+
+    case "$choice" in
+        1)
+            header "全部容器资源快照"
+            echo ""
+            # 表头
+            printf "  %-30s %-10s %-18s %-18s %-18s\n" \
+                "容器名" "状态" "CPU%" "内存使用" "网络 I/O"
+            echo "  $(printf '─%.0s' {1..90})"
+            docker stats --no-stream --format \
+                '{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}\t{{.BlockIO}}' \
+                2>/dev/null | sort | while IFS=$'\t' read -r name cpu mem net blk; do
+                printf "  %-30s %-10s %-18s %-18s %-18s\n" \
+                    "${name:0:29}" "${cpu}" "${mem:0:17}" "${net:0:17}" "${blk:0:17}"
+            done
+            echo ""
+            ;;
+        2)
+            local -a deployed_dirs=() deployed_labels=()
+            for app in "${ALL_APPS[@]}"; do
+                while IFS= read -r dir; do
+                    deployed_dirs+=("$dir")
+                    deployed_labels+=("$app  [$(inst_label "$dir" "$app")]")
+                done < <(list_instances "$app")
+            done
+            if [[ ${#deployed_dirs[@]} -eq 0 ]]; then warn "没有已部署的应用"; return; fi
+            local i=1
+            for lbl in "${deployed_labels[@]}"; do printf "  %2d) %s\n" "$i" "$lbl"; ((i++)); done
+            echo ""
+            read -rp "请输入编号（0 返回）: " input
+            [[ "$input" == "0" ]] && return
+            local idx=$((input - 1))
+            [[ $idx -lt 0 || $idx -ge ${#deployed_dirs[@]} ]] && warn "编号无效" && return
+            local dir="${deployed_dirs[$idx]}"
+            local cids_str
+            cids_str=$(cd "$dir" && docker compose ps -q 2>/dev/null | tr '\n' ' ')
+            if [[ -z "$cids_str" ]]; then warn "该实例无运行容器"; return; fi
+            info "按 Ctrl+C 退出实时监控..."
+            # shellcheck disable=SC2086
+            docker stats --format \
+                'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}' \
+                $cids_str
+            ;;
+        3)
+            header "Docker 磁盘使用总览"
+            docker system df -v 2>/dev/null || docker system df
+            echo ""
+            ;;
+        0) return ;;
+        *) warn "无效输入" ;;
+    esac
+}
+
+# ============================================================
+# 12) 查看应用日志
+# ============================================================
+menu_view_logs() {
+    echo ""
+    echo -e "${CYAN}${BOLD}── 查看应用日志 ──${NC}"
+    local -a deployed_dirs=() deployed_labels=()
+    for app in "${ALL_APPS[@]}"; do
+        while IFS= read -r dir; do
+            deployed_dirs+=("$dir")
+            deployed_labels+=("$app  [$(inst_label "$dir" "$app")]")
+        done < <(list_instances "$app")
+    done
+    if [[ ${#deployed_dirs[@]} -eq 0 ]]; then warn "没有已部署的应用"; return; fi
+
+    local i=1
+    for lbl in "${deployed_labels[@]}"; do printf "  %2d) %s\n" "$i" "$lbl"; ((i++)); done
+    echo ""
+    read -rp "请输入编号（0 返回）: " input
+    [[ "$input" == "0" ]] && return
+    local idx=$((input - 1))
+    [[ $idx -lt 0 || $idx -ge ${#deployed_dirs[@]} ]] && warn "编号无效" && return
+
+    local dir="${deployed_dirs[$idx]}"
+    echo ""
+    echo -e "  1) 查看最近 100 行日志"
+    echo -e "  2) 实时跟踪日志（Ctrl+C 退出）"
+    echo -e "  3) 查看最近 500 行并导出到 /tmp"
+    echo ""
+    read -rp "请选择 [1-3]: " log_choice
+
+    case "$log_choice" in
+        1)
+            cd "$dir" && docker compose logs --tail=100 --timestamps 2>/dev/null
+            cd - > /dev/null
+            ;;
+        2)
+            info "按 Ctrl+C 退出日志跟踪..."
+            cd "$dir" && docker compose logs -f --timestamps 2>/dev/null
+            cd - > /dev/null
+            ;;
+        3)
+            local out_file="/tmp/$(basename "$dir")_logs_$(date +%Y%m%d_%H%M%S).log"
+            cd "$dir" && docker compose logs --tail=500 --timestamps > "$out_file" 2>&1
+            cd - > /dev/null
+            log "日志已导出到 $out_file（$(wc -l < "$out_file") 行）"
+            ;;
+        *) warn "无效输入" ;;
+    esac
+}
+
+# ============================================================
+# 13) 应用迁移
+# ============================================================
+menu_migrate_app() {
+    echo ""
+    echo -e "${CYAN}${BOLD}── 应用迁移 ──${NC}"
+    echo ""
+    echo -e "  1) 迁移到本地新路径"
+    echo -e "  2) 迁移到远程服务器（rsync + SSH）"
+    echo -e "  0) 返回"
+    echo ""
+    read -rp "请选择 [0-2]: " choice
+
+    case "$choice" in
+        1) _migrate_local ;;
+        2) _migrate_remote ;;
+        0) return ;;
+        *) warn "无效输入" ;;
+    esac
+}
+
+_migrate_local() {
+    local -a deployed_dirs=() deployed_labels=()
+    for app in "${ALL_APPS[@]}"; do
+        while IFS= read -r dir; do
+            deployed_dirs+=("$dir")
+            deployed_labels+=("$app  [$(inst_label "$dir" "$app")]")
+        done < <(list_instances "$app")
+    done
+    if [[ ${#deployed_dirs[@]} -eq 0 ]]; then warn "没有已部署的应用"; return; fi
+
+    local i=1
+    for lbl in "${deployed_labels[@]}"; do printf "  %2d) %s\n" "$i" "$lbl"; ((i++)); done
+    echo ""
+    read -rp "请输入要迁移的实例编号（0 返回）: " input
+    [[ "$input" == "0" ]] && return
+    local idx=$((input - 1))
+    [[ $idx -lt 0 || $idx -ge ${#deployed_dirs[@]} ]] && warn "编号无效" && return
+    local src_dir="${deployed_dirs[$idx]}"
+
+    echo ""
+    read -rp "请输入目标路径（如 /data/docker-apps/$(basename "$src_dir")）: " dst_dir
+    [[ -z "$dst_dir" ]] && warn "目标路径不能为空" && return
+    [[ -d "$dst_dir" ]] && warn "目标路径已存在，请选择新路径" && return
+
+    echo ""
+    warn "迁移步骤：停止容器 → 复制数据 → 在新目录启动 → 提示删除旧目录"
+    read -rp "确认迁移 $(basename "$src_dir") → $dst_dir ？[y/N]: " confirm
+    [[ "${confirm,,}" != "y" ]] && { info "已取消"; return; }
+
+    header "迁移：$(basename "$src_dir") → $dst_dir"
+
+    # 1. 停止
+    info "停止服务..."
+    (cd "$src_dir" && docker compose stop 2>/dev/null) || warn "停止失败，继续复制..."
+
+    # 2. 复制
+    info "复制数据（rsync）..."
+    mkdir -p "$(dirname "$dst_dir")"
+    if rsync -a --info=progress2 "$src_dir/" "$dst_dir/"; then
+        log "数据复制完成"
+    else
+        warn "rsync 失败，尝试 cp..."
+        cp -a "$src_dir" "$dst_dir" || { error "复制失败，迁移中止"; }
+    fi
+
+    # 3. 启动新路径
+    info "在新路径启动服务..."
+    if (cd "$dst_dir" && docker compose up -d); then
+        log "服务已在 $dst_dir 启动成功"
+        echo ""
+        warn "旧目录 $src_dir 仍保留，确认新实例运行正常后可手动删除："
+        warn "  rm -rf $src_dir"
+        echo ""
+        read -rp "现在自动删除旧目录？[y/N]: " del_confirm
+        if [[ "${del_confirm,,}" == "y" ]]; then
+            (cd "$src_dir" && docker compose down 2>/dev/null) || true
+            rm -rf "$src_dir"
+            log "旧目录已删除"
+        fi
+    else
+        warn "新路径启动失败，正在恢复旧实例..."
+        (cd "$src_dir" && docker compose start 2>/dev/null) || warn "旧实例恢复失败，请手动检查"
+    fi
+}
+
+_migrate_remote() {
+    local -a deployed_dirs=() deployed_labels=() deployed_apps=()
+    for app in "${ALL_APPS[@]}"; do
+        while IFS= read -r dir; do
+            deployed_dirs+=("$dir")
+            deployed_labels+=("$app  [$(inst_label "$dir" "$app")]")
+            deployed_apps+=("$app")
+        done < <(list_instances "$app")
+    done
+    if [[ ${#deployed_dirs[@]} -eq 0 ]]; then warn "没有已部署的应用"; return; fi
+
+    local i=1
+    for lbl in "${deployed_labels[@]}"; do printf "  %2d) %s\n" "$i" "$lbl"; ((i++)); done
+    echo ""
+    read -rp "请输入要迁移的实例编号（0 返回）: " input
+    [[ "$input" == "0" ]] && return
+    local idx=$((input - 1))
+    [[ $idx -lt 0 || $idx -ge ${#deployed_dirs[@]} ]] && warn "编号无效" && return
+    local src_dir="${deployed_dirs[$idx]}"
+    local app_type="${deployed_apps[$idx]}"
+
+    echo ""
+    read -rp "目标服务器（user@host，如 root@192.168.1.100）: " remote_host
+    [[ -z "$remote_host" ]] && warn "不能为空" && return
+    read -rp "目标路径 [默认 /opt/docker-apps/$(basename "$src_dir")]: " remote_path
+    [[ -z "$remote_path" ]] && remote_path="/opt/docker-apps/$(basename "$src_dir")"
+    read -rp "SSH 端口 [默认 22]: " ssh_port
+    ssh_port="${ssh_port:-22}"
+
+    # ── 检测该应用含有哪些数据库 ────────────────────────────────
+    local has_mariadb=0 has_postgres=0 has_redis=0
+    grep -q 'image: mariadb'    "$src_dir/docker-compose.yml" 2>/dev/null && has_mariadb=1
+    grep -q 'image: mysql'      "$src_dir/docker-compose.yml" 2>/dev/null && has_mariadb=1
+    grep -q 'image: postgres'   "$src_dir/docker-compose.yml" 2>/dev/null && has_postgres=1
+    grep -q 'image: redis'      "$src_dir/docker-compose.yml" 2>/dev/null && has_redis=1
+
+    echo ""
+    echo -e "${CYAN}${BOLD}── 迁移内容预览：$(basename "$src_dir") ──${NC}"
+    echo ""
+    echo -e "  应用类型  : $app_type"
+    echo -e "  源目录    : $src_dir"
+    echo -e "  目标       : ${remote_host}:${remote_path}"
+    echo ""
+    echo -e "  将执行以下步骤："
+    echo -e "    [1] SSH 连通性检查"
+    echo -e "    [2] 确认目标机已安装 Docker"
+    echo -e "    [3] 停止本地服务（保证数据一致性）"
+    [[ $has_mariadb -eq 1 ]] && \
+        echo -e "    [4] ${YELLOW}mysqldump 导出数据库${NC}（逻辑备份，跨机安全）"
+    [[ $has_postgres -eq 1 ]] && \
+        echo -e "    [4] ${YELLOW}pg_dumpall 导出数据库${NC}（逻辑备份，跨机安全）"
+    echo -e "    [5] rsync 同步文件（配置 / 上传文件 / 静态资源）"
+    [[ $has_mariadb -eq 1 || $has_postgres -eq 1 ]] && \
+        echo -e "        ${YELLOW}跳过原始数据库文件目录（db/）—— 使用 SQL 导入替代${NC}"
+    echo -e "    [6] 目标机拉取镜像并启动服务"
+    [[ $has_mariadb -eq 1 || $has_postgres -eq 1 ]] && \
+        echo -e "    [7] 等待数据库就绪后导入 SQL"
+    echo ""
+    read -rp "确认执行？[y/N]: " confirm
+    [[ "${confirm,,}" != "y" ]] && { info "已取消"; return; }
+
+    header "远程迁移：$(basename "$src_dir") → ${remote_host}:${remote_path}"
+
+    # ── 步骤 1：SSH 连通性检查 ───────────────────────────────────
+    info "[1/7] 检查 SSH 连通性..."
+    if ! ssh -p "$ssh_port" -o ConnectTimeout=10 -o BatchMode=yes \
+            "$remote_host" "echo ok" &>/dev/null; then
+        error "无法通过 SSH 连接 ${remote_host}:${ssh_port}，请检查网络/密钥配置后重试"
+    fi
+    log "SSH 连通正常"
+
+    # ── 步骤 2：检查目标机 Docker ────────────────────────────────
+    info "[2/7] 检查目标机 Docker..."
+    if ! ssh -p "$ssh_port" "$remote_host" "command -v docker &>/dev/null"; then
+        warn "目标机未安装 Docker"
+        read -rp "  是否尝试自动在目标机安装 Docker？[y/N]: " inst_docker
+        if [[ "${inst_docker,,}" == "y" ]]; then
+            ssh -p "$ssh_port" "$remote_host" \
+                "curl -fsSL https://get.docker.com | sh && systemctl enable --now docker" \
+                || error "目标机 Docker 安装失败，请手动安装后重试"
+            log "目标机 Docker 安装完成"
+        else
+            error "目标机无 Docker，迁移中止"
+        fi
+    else
+        local remote_docker_ver
+        remote_docker_ver=$(ssh -p "$ssh_port" "$remote_host" \
+            "docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown")
+        log "目标机 Docker 版本：$remote_docker_ver"
+    fi
+
+    # ── 步骤 3：停止本地服务 ─────────────────────────────────────
+    info "[3/7] 停止本地服务（确保数据一致性）..."
+    if ! (cd "$src_dir" && docker compose stop 2>/dev/null); then
+        warn "停止失败，数据可能不一致，继续..."
+    else
+        log "本地服务已停止"
+    fi
+
+    # ── 步骤 4：数据库逻辑导出 ──────────────────────────────────
+    local sql_dump_file="" pg_dump_file=""
+
+    if [[ $has_mariadb -eq 1 ]]; then
+        info "[4/7] mysqldump 导出数据库..."
+        # 从 .env 读取凭据
+        local db_root_pw db_name
+        db_root_pw=$(grep -oP '(?<=ROOT_PASSWORD=).+' "$src_dir/.env" 2>/dev/null | head -1 || true)
+        # 找容器名（mariadb 服务）
+        local db_cid
+        db_cid=$(cd "$src_dir" && docker compose ps -q db lskypro-db nextcloud-db wordpress-db 2>/dev/null \
+            | head -1 || docker compose ps -q 2>/dev/null \
+            | xargs -I{} docker inspect --format '{{.Name}} {{.Config.Image}}' {} \
+            | grep mariadb | awk '{print $1}' | sed 's|^/||' | head -1)
+
+        if [[ -z "$db_cid" ]]; then
+            # 最后尝试：找任意带 mariadb 镜像的运行容器
+            db_cid=$(docker ps --format '{{.Names}} {{.Image}}' \
+                | grep mariadb | grep "$(basename "$src_dir")" | awk '{print $1}' | head -1)
+        fi
+
+        if [[ -n "$db_cid" ]]; then
+            sql_dump_file="/tmp/$(basename "$src_dir")_db_$(date +%Y%m%d_%H%M%S).sql.gz"
+            if [[ -n "$db_root_pw" ]]; then
+                docker exec "$db_cid" \
+                    mysqldump -uroot -p"${db_root_pw}" --all-databases \
+                    --single-transaction --quick --triggers --routines --events \
+                    2>/dev/null | gzip > "$sql_dump_file"
+            else
+                # 无密码时尝试无 -p
+                docker exec "$db_cid" \
+                    mysqldump -uroot --all-databases \
+                    --single-transaction --quick --triggers --routines --events \
+                    2>/dev/null | gzip > "$sql_dump_file"
+            fi
+            local dump_size
+            dump_size=$(du -h "$sql_dump_file" | cut -f1)
+            log "数据库导出完成：$sql_dump_file（$dump_size）"
+        else
+            warn "未找到 MariaDB 容器，跳过数据库逻辑导出（将由 rsync 直接同步数据文件）"
+            warn "注意：直接同步 MariaDB 数据文件到跨版本主机可能导致数据损坏"
+        fi
+
+    elif [[ $has_postgres -eq 1 ]]; then
+        info "[4/7] pg_dumpall 导出 PostgreSQL..."
+        local pg_cid
+        pg_cid=$(cd "$src_dir" && docker compose ps -q db postgres gitea-db 2>/dev/null | head -1 || true)
+        if [[ -n "$pg_cid" ]]; then
+            pg_dump_file="/tmp/$(basename "$src_dir")_pgdb_$(date +%Y%m%d_%H%M%S).sql.gz"
+            docker exec "$pg_cid" pg_dumpall -U postgres 2>/dev/null \
+                | gzip > "$pg_dump_file"
+            local dump_size
+            dump_size=$(du -h "$pg_dump_file" | cut -f1)
+            log "PostgreSQL 导出完成：$pg_dump_file（$dump_size）"
+        else
+            warn "未找到 PostgreSQL 容器，跳过逻辑导出"
+        fi
+    else
+        info "[4/7] 无数据库服务，跳过"
+    fi
+
+    # ── 步骤 5：rsync 文件同步（排除数据库原始数据目录）────────
+    info "[5/7] rsync 同步文件..."
+    ssh -p "$ssh_port" "$remote_host" "mkdir -p '$remote_path'" \
+        || error "远程目录创建失败"
+
+    # 构建排除规则：若已做逻辑导出，则排除原始 DB 数据目录
+    local rsync_excludes=()
+    if [[ -n "$sql_dump_file" || -n "$pg_dump_file" ]]; then
+        # 常见数据库数据目录名
+        rsync_excludes+=(
+            "--exclude=db/"
+            "--exclude=postgres/"
+            "--exclude=pgdata/"
+            "--exclude=database/"
+        )
+        info "  已排除数据库原始数据目录（将用 SQL 导入）"
+    fi
+
+    if rsync -az --info=progress2 -e "ssh -p $ssh_port" \
+        "${rsync_excludes[@]}" \
+        "$src_dir/" "${remote_host}:${remote_path}/"; then
+        log "文件同步完成"
+    else
+        warn "rsync 失败，正在恢复本地服务..."
+        (cd "$src_dir" && docker compose start 2>/dev/null) || true
+        return
+    fi
+
+    # 如有 SQL dump，也传到远程
+    if [[ -n "$sql_dump_file" ]]; then
+        info "  传输 SQL dump 到远程..."
+        rsync -az -e "ssh -p $ssh_port" \
+            "$sql_dump_file" "${remote_host}:${remote_path}/_db_import.sql.gz" \
+            && log "  SQL dump 已传输"
+    fi
+    if [[ -n "$pg_dump_file" ]]; then
+        info "  传输 PostgreSQL dump 到远程..."
+        rsync -az -e "ssh -p $ssh_port" \
+            "$pg_dump_file" "${remote_host}:${remote_path}/_pgdb_import.sql.gz" \
+            && log "  PostgreSQL dump 已传输"
+    fi
+
+    # ── 步骤 6：目标机拉取镜像并启动 ───────────────────────────
+    info "[6/7] 目标机启动服务（让 Docker 自行拉取镜像）..."
+    if ! ssh -p "$ssh_port" "$remote_host" \
+        "cd '$remote_path' && docker compose pull && docker compose up -d 2>&1"; then
+        warn "目标机启动失败，请登录排查："
+        warn "  ssh -p $ssh_port $remote_host 'cd $remote_path && docker compose logs'"
+        return
+    fi
+    log "目标机服务已启动"
+
+    # ── 步骤 7：数据库导入 ──────────────────────────────────────
+    if [[ -n "$sql_dump_file" ]]; then
+        info "[7/7] 等待目标机 MariaDB 就绪后导入..."
+        local retry=0
+        while [[ $retry -lt 20 ]]; do
+            if ssh -p "$ssh_port" "$remote_host" \
+                "cd '$remote_path' && docker compose exec -T db \
+                 mysqladmin ping -uroot --silent 2>/dev/null"; then
+                break
+            fi
+            ((retry++)); sleep 3
+            info "  等待数据库（${retry}/20）..."
+        done
+
+        local db_root_pw
+        db_root_pw=$(grep -oP '(?<=ROOT_PASSWORD=).+' "$src_dir/.env" 2>/dev/null | head -1 || true)
+
+        if ssh -p "$ssh_port" "$remote_host" \
+            "cd '$remote_path' && zcat _db_import.sql.gz \
+             | docker compose exec -T db \
+               mysql -uroot ${db_root_pw:+-p\"${db_root_pw}\"} 2>&1"; then
+            log "数据库导入成功"
+            ssh -p "$ssh_port" "$remote_host" "rm -f '${remote_path}/_db_import.sql.gz'" || true
+        else
+            warn "数据库自动导入失败，SQL 文件保留在：${remote_host}:${remote_path}/_db_import.sql.gz"
+            warn "请手动执行导入："
+            warn "  ssh -p $ssh_port $remote_host"
+            warn "  cd $remote_path"
+            warn "  zcat _db_import.sql.gz | docker compose exec -T db mysql -uroot -p'<密码>'"
+        fi
+
+    elif [[ -n "$pg_dump_file" ]]; then
+        info "[7/7] 等待目标机 PostgreSQL 就绪后导入..."
+        local retry=0
+        while [[ $retry -lt 20 ]]; do
+            if ssh -p "$ssh_port" "$remote_host" \
+                "cd '$remote_path' && docker compose exec -T db pg_isready -U postgres &>/dev/null"; then
+                break
+            fi
+            ((retry++)); sleep 3
+            info "  等待数据库（${retry}/20）..."
+        done
+
+        if ssh -p "$ssh_port" "$remote_host" \
+            "cd '$remote_path' && zcat _pgdb_import.sql.gz \
+             | docker compose exec -T db psql -U postgres 2>&1"; then
+            log "PostgreSQL 导入成功"
+            ssh -p "$ssh_port" "$remote_host" "rm -f '${remote_path}/_pgdb_import.sql.gz'" || true
+        else
+            warn "PostgreSQL 自动导入失败，dump 文件保留在：${remote_host}:${remote_path}/_pgdb_import.sql.gz"
+        fi
+    else
+        info "[7/7] 无数据库导入步骤，跳过"
+    fi
+
+    # ── 完成汇总 ────────────────────────────────────────────────
+    echo ""
+    echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════╗"
+    echo -e "║                    迁移完成 — 操作汇总                      ║"
+    echo -e "╠══════════════════════════════════════════════════════════════╣"
+    printf  "║  %-60s║\n" "应用: $(basename "$src_dir") ($app_type)"
+    printf  "║  %-60s║\n" "目标: ${remote_host}:${remote_path}"
+    [[ -n "$sql_dump_file"  ]] && printf "║  %-60s║\n" "DB:   mysqldump 逻辑导出 + 远程导入"
+    [[ -n "$pg_dump_file"   ]] && printf "║  %-60s║\n" "DB:   pg_dumpall 逻辑导出 + 远程导入"
+    echo -e "╠══════════════════════════════════════════════════════════════╣"
+    echo -e "║  验证步骤：                                                  ║"
+    echo -e "║  1. 登录目标机，访问应用确认功能正常                        ║"
+    echo -e "║  2. 检查用户数据、上传文件、数据库内容                      ║"
+    echo -e "║  3. 确认无误后删除本地旧实例：                              ║"
+    printf  "║     cd %-54s║\n" "$src_dir"
+    echo -e "║     docker compose down -v && cd .. && rm -rf $(basename "$src_dir")   ║"
+    echo -e "╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    # 恢复本地服务（迁移期间一直保持停止状态，现在视需要决定）
+    echo ""
+    read -rp "是否恢复本地实例继续运行（迁移期间已停止）？[y/N]: " resume_local
+    if [[ "${resume_local,,}" == "y" ]]; then
+        (cd "$src_dir" && docker compose start 2>/dev/null) \
+            && log "本地实例已恢复运行" \
+            || warn "本地实例恢复失败，请手动：cd $src_dir && docker compose up -d"
+    else
+        info "本地实例保持停止状态"
+    fi
+}
+
+# ============================================================
+# 14) 启动 / 停止 / 重启实例
+# ============================================================
+menu_start_stop_restart() {
+    echo ""
+    echo -e "${CYAN}${BOLD}── 启动 / 停止 / 重启实例 ──${NC}"
+    local -a deployed_dirs=() deployed_labels=()
+    for app in "${ALL_APPS[@]}"; do
+        while IFS= read -r dir; do
+            deployed_dirs+=("$dir")
+            deployed_labels+=("$app  [$(inst_label "$dir" "$app")]")
+        done < <(list_instances "$app")
+    done
+    if [[ ${#deployed_dirs[@]} -eq 0 ]]; then warn "没有已部署的应用"; return; fi
+
+    local i=1
+    for lbl in "${deployed_labels[@]}"; do printf "  %2d) %s\n" "$i" "$lbl"; ((i++)); done
+    echo ""
+    read -rp "请输入实例编号（0 返回）: " input
+    [[ "$input" == "0" ]] && return
+    local idx=$((input - 1))
+    [[ $idx -lt 0 || $idx -ge ${#deployed_dirs[@]} ]] && warn "编号无效" && return
+    local dir="${deployed_dirs[$idx]}"
+
+    echo ""
+    echo -e "  1) 启动"
+    echo -e "  2) 停止"
+    echo -e "  3) 重启"
+    echo -e "  4) 强制重建并启动（docker compose up -d --force-recreate）"
+    echo ""
+    read -rp "请选择 [1-4]: " op
+
+    case "$op" in
+        1)
+            if (cd "$dir" && docker compose start 2>/dev/null || docker compose up -d); then
+                log "$(basename "$dir") 已启动"
+            else warn "启动失败"; fi
+            ;;
+        2)
+            if (cd "$dir" && docker compose stop); then
+                log "$(basename "$dir") 已停止"
+            else warn "停止失败"; fi
+            ;;
+        3)
+            if (cd "$dir" && docker compose restart); then
+                log "$(basename "$dir") 已重启"
+            else warn "重启失败"; fi
+            ;;
+        4)
+            if (cd "$dir" && docker compose up -d --force-recreate --remove-orphans); then
+                log "$(basename "$dir") 已强制重建并启动"
+            else warn "重建失败"; fi
+            ;;
+        *) warn "无效输入" ;;
+    esac
+}
+
+# ============================================================
+# 15) 清理 Docker 资源
+# ============================================================
+menu_cleanup_docker() {
+    echo ""
+    echo -e "${CYAN}${BOLD}── 清理 Docker 资源 ──${NC}"
+    echo ""
+
+    # 先统计可清理量
+    local dangling_imgs stopped_conts unused_vols unused_nets buildcache_size
+    dangling_imgs=$(docker images -f "dangling=true" -q 2>/dev/null | wc -l)
+    stopped_conts=$(docker ps -a -f "status=exited" -q 2>/dev/null | wc -l)
+    unused_vols=$(docker volume ls -f "dangling=true" -q 2>/dev/null | wc -l)
+    unused_nets=$(docker network ls -q --filter "type=custom" 2>/dev/null | wc -l)
+    buildcache_size=$(docker buildx du --verbose 2>/dev/null | tail -1 | grep -oP '[\d.]+\s*[KMGT]B' || echo "未知")
+
+    echo -e "  当前可清理资源："
+    printf "    悬空镜像 (dangling): %s 个\n" "$dangling_imgs"
+    printf "    已停止容器:          %s 个\n" "$stopped_conts"
+    printf "    未使用卷:            %s 个\n" "$unused_vols"
+    printf "    Build 缓存:          %s\n"   "$buildcache_size"
+    echo ""
+    echo -e "  1) 仅清理悬空镜像"
+    echo -e "  2) 清理悬空镜像 + 已停止容器"
+    echo -e "  3) 清理悬空镜像 + 已停止容器 + 未使用卷"
+    echo -e "  4) 全量清理（docker system prune -a --volumes，⚠️ 会删除所有未使用镜像）"
+    echo -e "  0) 返回"
+    echo ""
+    read -rp "请选择 [0-4]: " choice
+
+    case "$choice" in
+        1)
+            docker image prune -f
+            log "悬空镜像清理完成"
+            ;;
+        2)
+            docker image prune -f
+            docker container prune -f
+            log "悬空镜像 + 已停止容器清理完成"
+            ;;
+        3)
+            docker image prune -f
+            docker container prune -f
+            docker volume prune -f
+            log "悬空镜像 + 已停止容器 + 未使用卷清理完成"
+            ;;
+        4)
+            echo ""
+            warn "⚠️  此操作将删除所有未被容器引用的镜像、网络、卷，已停止容器也将被删除！"
+            warn "    正在运行的应用容器不受影响，但其镜像也会被删除（下次启动将重新拉取）"
+            read -rp "确认执行全量清理？[y/N]: " confirm
+            if [[ "${confirm,,}" == "y" ]]; then
+                docker system prune -a --volumes -f
+                log "全量清理完成"
+            else
+                info "已取消"
+            fi
+            ;;
+        0) return ;;
+        *) warn "无效输入" ;;
+    esac
+
+    echo ""
+    info "清理后磁盘使用："
+    docker system df
+    echo ""
+}
+
 print_summary() {
     local apps=("$@")
     echo ""
@@ -1602,6 +2333,59 @@ main() {
                 ;;
             --list)   list_apps; exit 0 ;;
             --all)    check_system; ensure_docker; deploy_all_apps; exit 0 ;;
+            --info)
+                [[ -z "${2:-}" ]] && error "请指定实例目录"
+                # 直接调用详情逻辑（非交互，传入目录）
+                ensure_docker
+                dir="$2"
+                [[ ! -d "$dir" ]] && error "目录 $dir 不存在"
+                mapfile -t cids < <(cd "$dir" && docker compose ps -q 2>/dev/null)
+                [[ ${#cids[@]} -eq 0 ]] && warn "该实例无运行容器" && exit 0
+                header "容器详情：$(basename "$dir")"
+                for cid in "${cids[@]}"; do
+                    docker inspect --format '
+容器: {{.Name}}
+镜像: {{.Config.Image}}
+状态: {{.State.Status}}
+启动: {{.State.StartedAt}}
+IP:   {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}
+' "$cid" | sed 's|^/||'
+                done
+                exit 0
+                ;;
+            --logs)
+                [[ -z "${2:-}" ]] && error "请指定实例目录"
+                ensure_docker
+                cd "$2" && docker compose logs --tail=100 --timestamps
+                exit 0
+                ;;
+            --stats)
+                ensure_docker
+                docker stats --no-stream --format \
+                    'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}\t{{.BlockIO}}'
+                exit 0
+                ;;
+            --cleanup)
+                ensure_docker
+                docker image prune -f
+                docker container prune -f
+                docker volume prune -f
+                log "清理完成"
+                docker system df
+                exit 0
+                ;;
+            --stop)
+                [[ -z "${2:-}" ]] && error "请指定实例目录"
+                ensure_docker; cd "$2" && docker compose stop; exit 0
+                ;;
+            --start)
+                [[ -z "${2:-}" ]] && error "请指定实例目录"
+                ensure_docker; cd "$2" && docker compose up -d; exit 0
+                ;;
+            --restart)
+                [[ -z "${2:-}" ]] && error "请指定实例目录"
+                ensure_docker; cd "$2" && docker compose restart; exit 0
+                ;;
             --help|-h) usage ;;
             *)        error "未知选项: $1，使用 --help 查看帮助" ;;
         esac
