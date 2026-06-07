@@ -1680,6 +1680,7 @@ services:
       - UMASK=022
     volumes:
       - ./data:/opt/alist/data
+      - /root/tg_downloader/bots/downloader/downloads:/media
     ports:
       - "127.0.0.1:${HOST_PORT}:5244"
     networks: [${NET}]
