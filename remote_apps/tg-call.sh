@@ -143,13 +143,13 @@ REQEOF
     # ── bot.py ──
     cat > bot.py << 'BOTEOF'
 """
-Telegram 客服中转机器人 v2
+Telegram 客服中转机器人 v2 (修复版)
 ══════════════════════════════════════════════════════
 功能：
   • 任何用户发消息 → 自动转发给主人（卡片式布局）
   • 主人回复转发消息 → 自动转回给原用户
-  • 全媒体支持：文字/图片/视频/语音/音频/文件/贴纸/
-                视频留言/位置/联系人
+  • 全媒体支持：文字/图片/GIF/视频/语音/音频/文件/
+                贴纸/视频留言/位置/联系人
   • 屏蔽拉黑：主人可拉黑用户，用户收到提示
   • 会话管理：/end /endall /sessions /r
   • 操作按钮：每条消息附快捷按钮（切换回复/拉黑）
@@ -159,6 +159,7 @@ Telegram 客服中转机器人 v2
 import logging
 import sqlite3
 import hashlib
+from contextlib import closing
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, constants
 )
@@ -187,158 +188,168 @@ def get_db():
     return conn
 
 def init_db():
-    with get_db() as db:
-        db.executescript("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            user_id     INTEGER PRIMARY KEY,
-            username    TEXT,
-            first_name  TEXT,
-            status      TEXT    DEFAULT 'active',
-            started_at  TEXT    DEFAULT (datetime('now','localtime')),
-            last_msg_at TEXT    DEFAULT (datetime('now','localtime')),
-            ended_at    TEXT,
-            msg_count   INTEGER DEFAULT 0
-        );
+    with closing(get_db()) as db:
+        with db:
+            db.executescript("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                user_id     INTEGER PRIMARY KEY,
+                username    TEXT,
+                first_name  TEXT,
+                status      TEXT    DEFAULT 'active',
+                started_at  TEXT    DEFAULT (datetime('now','localtime')),
+                last_msg_at TEXT    DEFAULT (datetime('now','localtime')),
+                ended_at    TEXT,
+                msg_count   INTEGER DEFAULT 0
+            );
 
-        CREATE TABLE IF NOT EXISTS reply_target (
-            id      INTEGER PRIMARY KEY CHECK (id=1),
-            user_id INTEGER
-        );
+            CREATE TABLE IF NOT EXISTS reply_target (
+                id      INTEGER PRIMARY KEY CHECK (id=1),
+                user_id INTEGER
+            );
 
-        CREATE TABLE IF NOT EXISTS msg_map (
-            owner_msg_id INTEGER PRIMARY KEY,
-            user_id      INTEGER NOT NULL,
-            created_at   TEXT DEFAULT (datetime('now','localtime'))
-        );
+            CREATE TABLE IF NOT EXISTS msg_map (
+                owner_msg_id INTEGER PRIMARY KEY,
+                user_id      INTEGER NOT NULL,
+                created_at   TEXT DEFAULT (datetime('now','localtime'))
+            );
 
-        CREATE TABLE IF NOT EXISTS blocklist (
-            user_id    INTEGER PRIMARY KEY,
-            blocked_at TEXT DEFAULT (datetime('now','localtime')),
-            reason     TEXT
-        );
-        """)
+            CREATE TABLE IF NOT EXISTS blocklist (
+                user_id    INTEGER PRIMARY KEY,
+                blocked_at TEXT DEFAULT (datetime('now','localtime')),
+                reason     TEXT
+            );
+            """)
 
 # ══════════════════════════════════════════════════════
-#  数据库操作
+#  数据库操作 (引入 contextlib.closing 确保连接释放)
 # ══════════════════════════════════════════════════════
 
 def upsert_session(user):
-    with get_db() as db:
-        db.execute("""
-            INSERT INTO sessions (user_id, username, first_name, status)
-            VALUES (?,?,?,'active')
-            ON CONFLICT(user_id) DO UPDATE SET
-                username    = excluded.username,
-                first_name  = excluded.first_name,
-                status      = 'active',
-                started_at  = CASE WHEN status != 'active'
-                              THEN datetime('now','localtime') ELSE started_at END,
-                ended_at    = NULL
-        """, (user.id, user.username, user.first_name))
+    with closing(get_db()) as db:
+        with db:
+            db.execute("""
+                INSERT INTO sessions (user_id, username, first_name, status)
+                VALUES (?,?,?,'active')
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username    = excluded.username,
+                    first_name  = excluded.first_name,
+                    status      = 'active',
+                    started_at  = CASE WHEN status != 'active'
+                                  THEN datetime('now','localtime') ELSE started_at END,
+                    ended_at    = NULL
+            """, (user.id, user.username, user.first_name))
 
 def touch_session(user_id: int):
-    with get_db() as db:
-        db.execute("""
-            UPDATE sessions
-            SET last_msg_at = datetime('now','localtime'),
-                msg_count   = msg_count + 1
-            WHERE user_id = ?
-        """, (user_id,))
+    with closing(get_db()) as db:
+        with db:
+            db.execute("""
+                UPDATE sessions
+                SET last_msg_at = datetime('now','localtime'),
+                    msg_count   = msg_count + 1
+                WHERE user_id = ?
+            """, (user_id,))
 
 def open_session_for(user_id: int):
     """主人主动联系时重开会话（不更新 username/first_name）"""
-    with get_db() as db:
-        db.execute("""
-            INSERT INTO sessions (user_id, status) VALUES (?,'active')
-            ON CONFLICT(user_id) DO UPDATE SET
-                status     = 'active',
-                started_at = CASE WHEN status != 'active'
-                             THEN datetime('now','localtime') ELSE started_at END,
-                ended_at   = NULL
-        """, (user_id,))
+    with closing(get_db()) as db:
+        with db:
+            db.execute("""
+                INSERT INTO sessions (user_id, status) VALUES (?,'active')
+                ON CONFLICT(user_id) DO UPDATE SET
+                    status     = 'active',
+                    started_at = CASE WHEN status != 'active'
+                                 THEN datetime('now','localtime') ELSE started_at END,
+                    ended_at   = NULL
+            """, (user_id,))
 
 def close_session(user_id: int):
-    with get_db() as db:
-        db.execute("""
-            UPDATE sessions SET status='closed',
-            ended_at=datetime('now','localtime') WHERE user_id=?
-        """, (user_id,))
+    with closing(get_db()) as db:
+        with db:
+            db.execute("""
+                UPDATE sessions SET status='closed',
+                ended_at=datetime('now','localtime') WHERE user_id=?
+            """, (user_id,))
 
 def is_active(user_id: int) -> bool:
-    with get_db() as db:
+    with closing(get_db()) as db:
         row = db.execute(
             "SELECT status FROM sessions WHERE user_id=?", (user_id,)
         ).fetchone()
         return row is not None and row["status"] == "active"
 
 def get_session_info(user_id: int):
-    with get_db() as db:
+    with closing(get_db()) as db:
         return db.execute(
             "SELECT * FROM sessions WHERE user_id=?", (user_id,)
         ).fetchone()
 
 def get_active_sessions():
-    with get_db() as db:
+    with closing(get_db()) as db:
         return db.execute(
             "SELECT * FROM sessions WHERE status='active' ORDER BY last_msg_at DESC"
         ).fetchall()
 
 def set_reply_target(user_id: int):
-    with get_db() as db:
-        db.execute("""
-            INSERT INTO reply_target (id, user_id) VALUES (1,?)
-            ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id
-        """, (user_id,))
+    with closing(get_db()) as db:
+        with db:
+            db.execute("""
+                INSERT INTO reply_target (id, user_id) VALUES (1,?)
+                ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id
+            """, (user_id,))
 
 def get_reply_target():
-    with get_db() as db:
+    with closing(get_db()) as db:
         row = db.execute("SELECT user_id FROM reply_target WHERE id=1").fetchone()
         return row["user_id"] if row else None
 
 def clear_reply_target():
-    with get_db() as db:
-        db.execute("DELETE FROM reply_target WHERE id=1")
+    with closing(get_db()) as db:
+        with db:
+            db.execute("DELETE FROM reply_target WHERE id=1")
 
 def save_msg_map(owner_msg_id: int, user_id: int):
-    with get_db() as db:
-        db.execute(
-            "INSERT OR REPLACE INTO msg_map (owner_msg_id, user_id) VALUES (?,?)",
-            (owner_msg_id, user_id),
-        )
+    with closing(get_db()) as db:
+        with db:
+            db.execute(
+                "INSERT OR REPLACE INTO msg_map (owner_msg_id, user_id) VALUES (?,?)",
+                (owner_msg_id, user_id),
+            )
 
 def lookup_user(owner_msg_id: int):
-    with get_db() as db:
+    with closing(get_db()) as db:
         row = db.execute(
             "SELECT user_id FROM msg_map WHERE owner_msg_id=?", (owner_msg_id,)
         ).fetchone()
         return row["user_id"] if row else None
 
 def block_user(user_id: int, reason: str = ""):
-    with get_db() as db:
-        db.execute(
-            "INSERT OR REPLACE INTO blocklist (user_id, reason) VALUES (?,?)",
-            (user_id, reason),
-        )
-        db.execute(
-            "UPDATE sessions SET status='blocked' WHERE user_id=?", (user_id,)
-        )
+    with closing(get_db()) as db:
+        with db:
+            db.execute(
+                "INSERT OR REPLACE INTO blocklist (user_id, reason) VALUES (?,?)",
+                (user_id, reason),
+            )
+            db.execute(
+                "UPDATE sessions SET status='blocked' WHERE user_id=?", (user_id,)
+            )
 
 def unblock_user(user_id: int):
-    with get_db() as db:
-        db.execute("DELETE FROM blocklist WHERE user_id=?", (user_id,))
-        db.execute(
-            "UPDATE sessions SET status='closed'"
-            " WHERE user_id=? AND status='blocked'", (user_id,)
-        )
+    with closing(get_db()) as db:
+        with db:
+            db.execute("DELETE FROM blocklist WHERE user_id=?", (user_id,))
+            db.execute(
+                "UPDATE sessions SET status='closed'"
+                " WHERE user_id=? AND status='blocked'", (user_id,)
+            )
 
 def is_blocked(user_id: int) -> bool:
-    with get_db() as db:
+    with closing(get_db()) as db:
         return db.execute(
             "SELECT 1 FROM blocklist WHERE user_id=?", (user_id,)
         ).fetchone() is not None
 
 def get_blocklist():
-    with get_db() as db:
+    with closing(get_db()) as db:
         return db.execute("""
             SELECT bl.user_id, bl.blocked_at, bl.reason,
                    s.first_name, s.username
@@ -346,6 +357,14 @@ def get_blocklist():
             LEFT JOIN sessions s ON bl.user_id = s.user_id
             ORDER BY bl.blocked_at DESC
         """).fetchall()
+
+def close_all_sessions():
+    with closing(get_db()) as db:
+        with db:
+            db.execute(
+                "UPDATE sessions SET status='closed',"
+                " ended_at=datetime('now','localtime') WHERE status='active'"
+            )
 
 # ══════════════════════════════════════════════════════
 #  辅助：名称 & 媒体类型
@@ -373,6 +392,7 @@ def display_name_from_row(row) -> str:
 def msg_type_icon(msg) -> str:
     if msg.text:        return "💬"
     if msg.photo:       return "🖼"
+    if msg.animation:   return "🎞"
     if msg.video:       return "🎬"
     if msg.voice:       return "🎤"
     if msg.audio:       return "🎵"
@@ -385,9 +405,9 @@ def msg_type_icon(msg) -> str:
 
 def msg_type_label(msg) -> str:
     labels = {
-        "text": "文字", "photo": "图片", "video": "视频",
-        "voice": "语音", "audio": "音频", "document": "文件",
-        "sticker": "贴纸", "video_note": "视频留言",
+        "text": "文字", "photo": "图片", "animation": "GIF/动画", 
+        "video": "视频", "voice": "语音", "audio": "音频", 
+        "document": "文件", "sticker": "贴纸", "video_note": "视频留言",
         "location": "位置", "contact": "联系人",
     }
     for attr, label in labels.items():
@@ -408,6 +428,9 @@ async def send_media(bot, chat_id: int, msg, extra_caption: str = ""):
         elif msg.photo:
             sent = await bot.send_photo(
                 chat_id=chat_id, photo=msg.photo[-1].file_id, caption=cap)
+        elif msg.animation:
+            sent = await bot.send_animation(
+                chat_id=chat_id, animation=msg.animation.file_id, caption=cap)
         elif msg.video:
             sent = await bot.send_video(
                 chat_id=chat_id, video=msg.video.file_id, caption=cap)
@@ -471,10 +494,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👋 你好，<b>{user.first_name}</b>！\n\n"
             "直接发消息给我，我会帮你转达。\n"
             "对方回复后，我也会发给你。\n\n"
-            "支持：文字、图片、视频、语音、文件等。\n\n"
+            "支持：文字、图片、GIF、视频、语音、文件等。\n\n"
             "/end — 结束对话   /help — 帮助"
         )
-
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -496,7 +518,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  <code>/unblock 用户ID</code>        解除拉黑\n"
             "  <code>/blocklist</code>             查看黑名单\n\n"
             "<b>📦 支持媒体类型：</b>\n"
-            "  文字 · 图片 · 视频 · 语音 · 音频\n"
+            "  文字 · 图片 · GIF · 视频 · 语音 · 音频\n"
             "  文件 · 贴纸 · 视频留言 · 位置 · 联系人"
         )
     else:
@@ -508,7 +530,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/end  — 结束当前对话\n"
             "/start — 重新开始"
         )
-
 
 async def cmd_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -554,17 +575,14 @@ async def cmd_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception: pass
 
-
 async def cmd_endall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("❌ 仅主人可用。"); return
+    
     rows = get_active_sessions()
-    with get_db() as db:
-        db.execute(
-            "UPDATE sessions SET status='closed',"
-            " ended_at=datetime('now','localtime') WHERE status='active'"
-        )
+    close_all_sessions()
     clear_reply_target()
+    
     for row in rows:
         try:
             await context.bot.send_message(
@@ -573,7 +591,6 @@ async def cmd_endall(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception: pass
     await update.message.reply_text(f"✅ 已结束全部 {len(rows)} 个活跃对话。")
-
 
 async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -598,7 +615,6 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "回复转发消息，或 /r 用户ID 切换目标",
     ]
     await update.message.reply_html("\n".join(lines))
-
 
 async def cmd_r(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -640,7 +656,6 @@ async def cmd_r(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"现在直接发消息即可发给 ta。"
     )
 
-
 async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("❌ 仅主人可用。"); return
@@ -671,7 +686,6 @@ async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + f"\n\n解除: /unblock {uid}"
     )
 
-
 async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("❌ 仅主人可用。"); return
@@ -695,7 +709,6 @@ async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         f"✅ 已解除用户 <code>{uid}</code> 的拉黑。"
     )
-
 
 async def cmd_blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -908,7 +921,8 @@ BOTEOF
 setup_venv() {
     step "创建 Python 虚拟环境"
     cd "$INSTALL_DIR"
-    $PYTHON_CMD -m venv venv >/dev/null 2>&1
+    # 移除静默并加入错误判断
+    $PYTHON_CMD -m venv venv || error "创建虚拟环境失败！请手动检查 python3-venv 是否已成功安装。"
     source venv/bin/activate
     pip install --upgrade pip -q
     pip install -r requirements.txt -q
@@ -1004,7 +1018,7 @@ print_summary() {
     echo -e "    ${CYAN}/blocklist${NC}               查看黑名单"
     echo ""
     echo -e "  ${BOLD}── 支持媒体类型 ────────────────────────────${NC}"
-    echo -e "    文字 · 图片 · 视频 · 语音 · 音频"
+    echo -e "    文字 · 图片 · GIF · 视频 · 语音 · 音频"
     echo -e "    文件 · 贴纸 · 视频留言 · 位置 · 联系人"
     echo ""
     echo -e "  ${BOLD}修改配置:${NC}"
@@ -1032,4 +1046,3 @@ main() {
 }
 
 main
-
