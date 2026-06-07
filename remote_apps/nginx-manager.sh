@@ -23,10 +23,9 @@ LOG_FILE="/var/log/nginx-gateway.log"
 # 颜色 & 日志工具
 # ──────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+# FIX [1]: 删除从未使用的 BLUE 变量，消除 ShellCheck SC2034 警告
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-# Fix: pipe to tee first, then redirect tee's stdout to stderr
-# 之前写法将 stdout 先重定向到 stderr，管道拿不到内容，日志文件始终为空
 _log() { echo -e "$*" | tee -a "$LOG_FILE" >&2; }
 info()    { _log "${CYAN}[信息]${NC}  $*"; }
 success() { _log "${GREEN}[成功]${NC}  $*"; }
@@ -52,9 +51,10 @@ init_dirs() {
     fi
 }
 
-# Fix: 去掉末尾斜杠，避免拼接路径时出现双斜杠
+# FIX [2]: normalize_url 增加空字符串守卫，避免生成无效的 "http://" 地址
 normalize_url() {
     local url="${1%/}"
+    [[ -z "$url" ]] && die "目标 URL 不能为空"
     [[ ! "$url" =~ ^https?:// ]] && url="http://$url"
     echo "$url"
 }
@@ -178,11 +178,11 @@ find_certs_advanced() {
             [[ -f "${dir}/${f}" ]] && KEY_PATH="${dir}/${f}" && break
         done
         if [[ -z "$CERT_PATH" ]]; then
-            CERT_PATH=$(grep -rl -m 1 "BEGIN CERTIFICATE" "$dir" 2>/dev/null \
+            CERT_PATH=$(grep -rl "BEGIN CERTIFICATE" "$dir" 2>/dev/null \
                         | grep -E '\.(pem|crt|cer)$' | head -n 1 || true)
         fi
         if [[ -z "$KEY_PATH" ]]; then
-            KEY_PATH=$(grep -rl -m 1 "PRIVATE KEY" "$dir" 2>/dev/null \
+            KEY_PATH=$(grep -rl "PRIVATE KEY" "$dir" 2>/dev/null \
                        | grep -E '\.(pem|key)$' | head -n 1 || true)
         fi
         [[ -n "$CERT_PATH" && -n "$KEY_PATH" ]] && return 0
@@ -347,23 +347,23 @@ ensure_openssl() { command -v openssl &>/dev/null || install_pkg openssl; }
 cert_issue_auto() {
     local domain="$1"
     [[ -z "$domain" ]] && die "错误: 未提供域名参数"
-    
+
     ensure_certbot
     local email
     read -rp "请输入邮箱（用于证书到期通知）: " email
     [[ -z "$email" ]] && die "邮箱不能为空"
-    
+
     info "申请 Let's Encrypt 证书: ${domain}..."
-    
+
     # 1. 优先尝试 Nginx 插件验证
     if certbot certonly --nginx -d "$domain" \
         --agree-tos --email "$email" --no-eff-email --non-interactive; then
         success "证书申请成功: ${LE_CERT_BASE}/${domain}/"
         return 0
     fi
-    
+
     warn "Nginx 插件申请失败，尝试回退到 Standalone 模式..."
-    
+
     # 2. 检查并释放 80 端口冲突
     local nginx_was_active=false
     if systemctl is-active --quiet nginx; then
@@ -371,11 +371,11 @@ cert_issue_auto() {
         info "检测到 Nginx 正在运行，正在暂时停止以释放 80 端口..."
         systemctl stop nginx 2>/dev/null || true
     fi
-    
+
     # 3. 运行 Standalone 模式并严格判断结果
     if certbot certonly --standalone -d "$domain" \
         --agree-tos --email "$email" --no-eff-email --non-interactive; then
-        
+
         if $nginx_was_active; then
             info "正在恢复 Nginx 服务..."
             systemctl start nginx 2>/dev/null || true
@@ -383,7 +383,6 @@ cert_issue_auto() {
         success "证书申请成功: ${LE_CERT_BASE}/${domain}/"
         return 0
     else
-        # 即使失败也必须尝试恢复 Nginx，保证已有站点不挂掉
         if $nginx_was_active; then
             info "申请失败，正在尝试恢复 Nginx 服务..."
             systemctl start nginx 2>/dev/null || true
@@ -464,12 +463,12 @@ cmd_cert_issue() {
                     info "检测到 Nginx 正在运行，正在暂时停止以释放 80 端口..."
                     systemctl stop nginx 2>/dev/null || true
                 fi
-                
+
                 if certbot certonly --standalone -d "$domain" \
                     --agree-tos --email "$email" --no-eff-email --non-interactive; then
                     success_flag=true
                 fi
-                
+
                 if $nginx_was_active; then
                     info "正在恢复 Nginx 服务..."
                     systemctl start nginx 2>/dev/null || true
@@ -479,7 +478,6 @@ cmd_cert_issue() {
         esac
     fi
 
-    # 最终状态卡点校验
     if $success_flag; then
         success "证书申请并生成成功！"
         success "证书路径: ${LE_CERT_BASE}/${domain}/"
@@ -537,13 +535,11 @@ cmd_cert_list() {
 
 cmd_cert_auto_renew() {
     require_root
-    
-    # 智能处理：如果系统已经通过 systemd 接管了 certbot 续期，则配置标准的 deploy hook 即可
+
     if systemctl list-timers 2>/dev/null | grep -q "certbot"; then
         info "检测到系统已自带 Certbot systemd 定时任务。"
         info "正在为您配置 Nginx 自动重载钩子 (Deploy Hook)..."
-        
-        # 创建 renewal-hooks 目录，每次自动续期成功后系统会自动触发此脚本
+
         mkdir -p /etc/letsencrypt/renewal-hooks/deploy
         cat > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh <<'EOF'
 #!/bin/bash
@@ -555,7 +551,12 @@ EOF
         return 0
     fi
 
-    # 如果系统没有自带定时器，则部署安全的自定义 Cron 任务
+    # FIX [3]: 确认 /etc/cron.d 目录存在
+    if [[ ! -d /etc/cron.d ]]; then
+        warn "/etc/cron.d 目录不存在，尝试创建..."
+        mkdir -p /etc/cron.d || die "无法创建 /etc/cron.d，请手动配置续期任务"
+    fi
+
     local cron_file="/etc/cron.d/nginx-gateway-certbot"
     echo "0 3 * * * root certbot renew --quiet --post-hook 'systemctl reload nginx'" > "$cron_file"
     chmod 644 "$cron_file"
@@ -941,7 +942,6 @@ site_create_stream_proxy() {
     read -rp "协议 [tcp/udp，默认 tcp]: " proto
     [[ -z "$proto" ]] && proto="tcp"
 
-    # Fix: stream 块须在顶层，写入专用 stream.d/ 而非 conf.d/
     local stream_dir="${NGINX_CONF_DIR}/stream.d"
     mkdir -p "$stream_dir"
     local stream_conf="${stream_dir}/stream-${listen_port}.conf"
@@ -963,16 +963,21 @@ stream {
 }
 EOF
 
+    # FIX [4]: 检查 nginx.conf 是否已包含 stream.d，给出更明确的操作引导
     warn "stream 块须在 nginx.conf 顶层 include，与 http {} 平级，请确认："
     warn "  include ${stream_dir}/*.conf;"
+    if grep -q "stream.d" "${NGINX_CONF_DIR}/nginx.conf" 2>/dev/null; then
+        success "检测到 nginx.conf 已包含 stream.d，正在重载..."
+        nginx_reload
+    else
+        warn "nginx.conf 尚未包含 stream.d，跳过自动重载。"
+        warn "请手动添加后执行: sudo nginx -t && sudo systemctl reload nginx"
+    fi
     success "流代理配置已写入: $stream_conf"
-    nginx_reload
 }
 
 # ══════════════════════════════════════════════════════════════════
 # 模式 F — 域名跳转（Redirect）
-# 支持：301 / 302 / 307 / 308
-# 支持：保留路径 / 整站固定 / 自定义 location 规则
 # ══════════════════════════════════════════════════════════════════
 site_create_redirect() {
     require_root
@@ -1008,7 +1013,6 @@ site_create_redirect() {
     local _path_choice=""
     read -rp "选择 [1-3，默认 1]: " _path_choice
 
-    # Fix: 提前声明，避免 HTTPS 块引用时未初始化
     local -a rules=()
     if [[ "${_path_choice:-1}" == "3" ]]; then
         echo ""
@@ -1037,7 +1041,6 @@ site_create_redirect() {
         resolve_ssl_cert "$src_domain"
     fi
 
-    # 提取为内部函数，消除 HTTP/HTTPS 两块的重复逻辑
     _redirect_return() {
         local c=$1
         case "${_path_choice:-1}" in
@@ -1096,7 +1099,6 @@ site_create_redirect() {
 
 # ══════════════════════════════════════════════════════════════════
 # 模式 G — 负载均衡（upstream）
-# 支持：round-robin / least_conn / ip_hash / random
 # ══════════════════════════════════════════════════════════════════
 site_create_loadbalance() {
     require_root
@@ -1147,9 +1149,18 @@ site_create_loadbalance() {
     _check_port_conflict "$_SSL_PORT"
     _ensure_upgrade_map
 
-    # Fix: 加短 hash 后缀，避免不同域名替换后同名冲突
+    # FIX [5]: 同时替换点号和连字符，确保 upstream 名称符合 nginx 标识符规范（不含连字符）
+    local domain_safe="${domain//-/_}"
+    domain_safe="${domain_safe//./_}"
     local upstream_name
-    upstream_name="${domain//./_}_$(printf '%s' "$domain" | md5sum | cut -c1-6)_upstream"
+    # FIX [6]: md5sum 跨平台兼容，回退到 cksum（POSIX 标准，所有系统均有）
+    local hash
+    if command -v md5sum &>/dev/null; then
+        hash=$(printf '%s' "$domain" | md5sum | cut -c1-6)
+    else
+        hash=$(printf '%s' "$domain" | cksum | tr -d ' \t\n' | tail -c6)
+    fi
+    upstream_name="${domain_safe}_${hash}_upstream"
 
     local conf_file="${SITES_AVAILABLE}/${domain}.conf"
     {
@@ -1259,7 +1270,6 @@ site_add_acl() {
             done
             [[ ${#ips[@]} -eq 0 ]] && die "至少输入一个 IP"
 
-            # Fix: geo 值改用 0/1 整数，语义清晰且不与 nginx 指令名冲突
             {
                 echo "# ACL — 生成时间: $(date)"
                 echo "geo \$ip_blocked {"
@@ -1294,9 +1304,15 @@ site_add_acl() {
             local username=""
             read -rp "用户名: " username
             [[ -z "$username" ]] && die "用户名不能为空"
-            htpasswd -c "$auth_file" "$username"
+            # FIX [7]: 文件已存在时不加 -c，避免覆盖已有用户
+            if [[ -f "$auth_file" ]]; then
+                info "密码文件已存在，追加用户 ${username}（已有用户不受影响）..."
+                htpasswd "$auth_file" "$username"
+            else
+                htpasswd -c "$auth_file" "$username"
+            fi
             chmod 640 "$auth_file"
-            success "密码文件已创建: $auth_file"
+            success "密码文件已更新: $auth_file"
 
             local -a snippet=()
             if [[ "${_acl_type}" == "4" ]]; then
@@ -1425,7 +1441,14 @@ config_restore() {
     done
     echo ""
     read -rp "选择备份序号 [1-${#backups[@]}]: " _idx
-    local chosen="${backups[$(( _idx - 1 ))]:-}"
+
+    # FIX [8]: 严格校验输入为有效正整数，防止非法索引（如非数字、负数、越界）
+    local count="${#backups[@]}"
+    if ! [[ "$_idx" =~ ^[0-9]+$ ]] || (( _idx < 1 || _idx > count )); then
+        die "无效序号 '$_idx'，请输入 1 到 ${count} 之间的数字"
+    fi
+
+    local chosen="${backups[$(( _idx - 1 ))]}"
     [[ -z "$chosen" || ! -f "$chosen" ]] && die "无效序号"
 
     confirm "将用 $(basename "$chosen") 覆盖当前配置？此操作不可撤销！" \
@@ -1459,7 +1482,6 @@ _site_activate() {
     local avail="${SITES_AVAILABLE}/${domain}.conf"
     local enabled="${SITES_DIR}/${domain}.conf"
 
-    # Fix: 仅在 default 文件确实存在时提示，静默删除，避免每次都输出
     if [[ -e "${SITES_DIR}/default" ]]; then
         rm -f "${SITES_DIR}/default"
         info "已移除默认站点 default"
@@ -1501,7 +1523,7 @@ site_delete() {
     confirm "确认删除站点 ${domain} 的配置？" || { info "已取消"; return; }
     rm -f "${SITES_DIR}/${domain}.conf" "${SITES_AVAILABLE}/${domain}.conf"
     if confirm "是否同时删除网站文件（${WEBROOT_BASE}/${domain}）？"; then
-        [[ -d "${WEBROOT_BASE}/${domain}" ]] && rm -rf "${WEBROOT_BASE}/${domain}"
+        [[ -d "${WEBROOT_BASE:?}/${domain:?}" ]] && rm -rf "${WEBROOT_BASE:?}/${domain:?}"
         info "网站文件已删除"
     fi
     nginx_reload
@@ -1511,20 +1533,24 @@ site_delete() {
 site_list() {
     init_dirs
     echo -e "\n${BOLD}╔══════════════════════════════════════════════════╗${NC}"
-    printf  "${BOLD}║  %-28s %-8s %-10s  ║${NC}\n" "域名/配置" "状态" "类型"
+    printf  "${BOLD}║${NC}  %-28s %-4s  %-14s  ${BOLD}║${NC}\n" "域名/配置" "状态" "类型"
     echo -e "${BOLD}╠══════════════════════════════════════════════════╣${NC}"
 
     local found=false
-    # Fix: stream 配置路径改为 stream.d/，正向代理从 SITES_AVAILABLE 扫描
     for conf in "${SITES_AVAILABLE}"/*.conf \
                 "${NGINX_CONF_DIR}"/stream.d/stream-*.conf; do
         [[ -f "$conf" ]] || continue
         found=true
         local name; name=$(basename "$conf" .conf)
-        local status="${RED}禁用${NC}"
-        [[ -L "${SITES_DIR}/${name}.conf" ]] && status="${GREEN}启用${NC}"
 
-        # Fix: 类型检测加守卫，防止后续条件覆盖已判定类型
+        # FIX [9]: 分离状态文本和颜色，避免 ANSI 转义码干扰 printf 列宽计算
+        local status_text status_color
+        if [[ -L "${SITES_DIR}/${name}.conf" ]]; then
+            status_text="启用"; status_color="$GREEN"
+        else
+            status_text="禁用"; status_color="$RED"
+        fi
+
         local type="静态文件"
         grep -q "upstream"    "$conf" 2>/dev/null && type="负载均衡"
         grep -q "sub_filter"  "$conf" 2>/dev/null && [[ "$type" == "静态文件" ]] && type="镜像聚合"
@@ -1536,8 +1562,8 @@ site_list() {
             && type="跳转重定向"
         grep -q "ssl_certificate" "$conf" 2>/dev/null && type+=" [SSL]"
 
-        printf "${BOLD}║${NC}  %-28s %-18b %-10s  ${BOLD}║${NC}\n" \
-            "$name" "$status" "$type"
+        printf "${BOLD}║${NC}  %-28s ${status_color}%-4s${NC}  %-14s  ${BOLD}║${NC}\n" \
+            "$name" "$status_text" "$type"
     done
     $found || echo "  暂无站点配置"
     echo -e "${BOLD}╚══════════════════════════════════════════════════╝${NC}\n"
@@ -1547,7 +1573,6 @@ site_info() {
     local domain="${1:-}"
     [[ -z "$domain" ]] && read -rp "域名: " domain
 
-    # Fix: 正向代理也在 SITES_AVAILABLE
     local conf="${SITES_AVAILABLE}/${domain}.conf"
     [[ ! -f "$conf" ]] && conf="${SITES_AVAILABLE}/forward-proxy-${domain}.conf"
     [[ ! -f "$conf" ]] && conf="${NGINX_CONF_DIR}/stream.d/stream-${domain}.conf"
@@ -1607,7 +1632,7 @@ ${BOLD}证书管理:${NC}
     -d <域名>  [--days <天数，默认3650>]
   cert renew  [域名]      手动续期（不填则续期全部）
   cert list               列出所有证书及到期时间
-  cert auto-renew         配置 cron 自动续期（每天凌晨 3:00）
+  cert auto-renew         配置 cron/systemd 自动续期
 
 ${BOLD}配置备份:${NC}
   backup create           备份 Nginx 所有配置到 ${BACKUP_DIR}/
@@ -1637,6 +1662,8 @@ HELP
 # 交互式主菜单
 # ──────────────────────────────────────────────────────────
 interactive_menu() {
+    # FIX [10]: 菜单入口提前校验 root 权限，避免用户深入操作后才报错
+    require_root
     while true; do
         clear
         echo -e "${BOLD}${GREEN}"
@@ -1647,7 +1674,6 @@ interactive_menu() {
         echo -e " ${CYAN}── 站点创建 ──${NC}"
         echo "  1) 静态文件托管（PHP / 自定义端口 / SSL）"
         echo "  2) 反向代理（内网服务，WebSocket 自适应）"
-        # Fix: 菜单描述与合并后的模式 C 保持一致
         echo "  3) 外部域名代理（透传 / 镜像两种子模式）"
         echo "  4) HTTP 正向代理（含 IP 白名单）"
         echo "  5) TCP/UDP 流代理（stream 模块）"
@@ -1670,7 +1696,7 @@ interactive_menu() {
         echo " 16) 生成自签名证书"
         echo " 17) 续期证书"
         echo " 18) 列出所有证书"
-        echo " 19) 配置自动续期 (cron)"
+        echo " 19) 配置自动续期 (cron/systemd)"
         echo ""
         echo -e " ${CYAN}── 配置备份 ──${NC}"
         echo " 20) 备份 Nginx 配置"
