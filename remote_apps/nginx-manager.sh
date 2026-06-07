@@ -346,16 +346,50 @@ ensure_openssl() { command -v openssl &>/dev/null || install_pkg openssl; }
 
 cert_issue_auto() {
     local domain="$1"
+    [[ -z "$domain" ]] && die "错误: 未提供域名参数"
+    
     ensure_certbot
     local email
     read -rp "请输入邮箱（用于证书到期通知）: " email
     [[ -z "$email" ]] && die "邮箱不能为空"
+    
     info "申请 Let's Encrypt 证书: ${domain}..."
-    certbot certonly --nginx -d "$domain" \
-        --agree-tos --email "$email" --no-eff-email --non-interactive \
-        || certbot certonly --standalone -d "$domain" \
-           --agree-tos --email "$email" --no-eff-email --non-interactive
-    success "证书申请成功: ${LE_CERT_BASE}/${domain}/"
+    
+    # 1. 优先尝试 Nginx 插件验证
+    if certbot certonly --nginx -d "$domain" \
+        --agree-tos --email "$email" --no-eff-email --non-interactive; then
+        success "证书申请成功: ${LE_CERT_BASE}/${domain}/"
+        return 0
+    fi
+    
+    warn "Nginx 插件申请失败，尝试回退到 Standalone 模式..."
+    
+    # 2. 检查并释放 80 端口冲突
+    local nginx_was_active=false
+    if systemctl is-active --quiet nginx; then
+        nginx_was_active=true
+        info "检测到 Nginx 正在运行，正在暂时停止以释放 80 端口..."
+        systemctl stop nginx 2>/dev/null || true
+    fi
+    
+    # 3. 运行 Standalone 模式并严格判断结果
+    if certbot certonly --standalone -d "$domain" \
+        --agree-tos --email "$email" --no-eff-email --non-interactive; then
+        
+        if $nginx_was_active; then
+            info "正在恢复 Nginx 服务..."
+            systemctl start nginx 2>/dev/null || true
+        fi
+        success "证书申请成功: ${LE_CERT_BASE}/${domain}/"
+        return 0
+    else
+        # 即使失败也必须尝试恢复 Nginx，保证已有站点不挂掉
+        if $nginx_was_active; then
+            info "申请失败，正在尝试恢复 Nginx 服务..."
+            systemctl start nginx 2>/dev/null || true
+        fi
+        die "证书申请彻底失败！请检查域名解析、防火墙 80 端口是否开放，或查看上方 Certbot 日志。"
+    fi
 }
 
 cert_self_signed_auto() {
@@ -396,26 +430,62 @@ cmd_cert_issue() {
     [[ -n "$email"  ]] || read -rp "邮箱: " email
     [[ -n "$domain" && -n "$email" ]] || die "域名和邮箱不能为空"
 
+    local success_flag=false
+
     if $wildcard; then
-        certbot certonly --manual --preferred-challenges dns \
+        echo ""
+        info "准备申请泛域名证书，将进入交互式 DNS 手动验证模式..."
+        warn "注意：请仔细阅读接下来的终端提示，前往您的 DNS 服务商添加对应的 TXT 解析记录。"
+        echo ""
+        if certbot certonly --manual --preferred-challenges dns \
             -d "${domain}" -d "*.${domain}" \
-            --agree-tos --email "$email" --no-eff-email
+            --agree-tos --email "$email" --no-eff-email; then
+            success_flag=true
+        fi
     else
         case $method in
             nginx)
-                certbot --nginx -d "$domain" --agree-tos --email "$email" \
-                    --no-eff-email --non-interactive ;;
+                if certbot certonly --nginx -d "$domain" --agree-tos --email "$email" \
+                    --no-eff-email --non-interactive; then
+                    success_flag=true
+                fi
+                ;;
             webroot)
                 local wr="/var/www/html"; mkdir -p "$wr"
-                certbot certonly --webroot -w "$wr" -d "$domain" \
-                    --agree-tos --email "$email" --no-eff-email --non-interactive ;;
+                if certbot certonly --webroot -w "$wr" -d "$domain" \
+                    --agree-tos --email "$email" --no-eff-email --non-interactive; then
+                    success_flag=true
+                fi
+                ;;
             standalone)
-                certbot certonly --standalone -d "$domain" \
-                    --agree-tos --email "$email" --no-eff-email --non-interactive ;;
+                local nginx_was_active=false
+                if systemctl is-active --quiet nginx; then
+                    nginx_was_active=true
+                    info "检测到 Nginx 正在运行，正在暂时停止以释放 80 端口..."
+                    systemctl stop nginx 2>/dev/null || true
+                fi
+                
+                if certbot certonly --standalone -d "$domain" \
+                    --agree-tos --email "$email" --no-eff-email --non-interactive; then
+                    success_flag=true
+                fi
+                
+                if $nginx_was_active; then
+                    info "正在恢复 Nginx 服务..."
+                    systemctl start nginx 2>/dev/null || true
+                fi
+                ;;
             *) die "未知验证方式: $method" ;;
         esac
     fi
-    success "证书路径: ${LE_CERT_BASE}/${domain}/"
+
+    # 最终状态卡点校验
+    if $success_flag; then
+        success "证书申请并生成成功！"
+        success "证书路径: ${LE_CERT_BASE}/${domain}/"
+    else
+        die "证书申请失败，未生成新证书。请查看上方 Certbot 错误日志进行排查。"
+    fi
 }
 
 cmd_cert_self_signed() {
@@ -467,10 +537,29 @@ cmd_cert_list() {
 
 cmd_cert_auto_renew() {
     require_root
+    
+    # 智能处理：如果系统已经通过 systemd 接管了 certbot 续期，则配置标准的 deploy hook 即可
+    if systemctl list-timers 2>/dev/null | grep -q "certbot"; then
+        info "检测到系统已自带 Certbot systemd 定时任务。"
+        info "正在为您配置 Nginx 自动重载钩子 (Deploy Hook)..."
+        
+        # 创建 renewal-hooks 目录，每次自动续期成功后系统会自动触发此脚本
+        mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+        cat > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh <<'EOF'
+#!/bin/bash
+# 证书自动续期成功后由系统定时器触发
+systemctl reload nginx
+EOF
+        chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+        success "系统 Timer 钩子配置成功！未来证书自动续期后，Nginx 将无缝重载。"
+        return 0
+    fi
+
+    # 如果系统没有自带定时器，则部署安全的自定义 Cron 任务
     local cron_file="/etc/cron.d/nginx-gateway-certbot"
     echo "0 3 * * * root certbot renew --quiet --post-hook 'systemctl reload nginx'" > "$cron_file"
     chmod 644 "$cron_file"
-    success "自动续期已配置（每天凌晨 3:00）: $cron_file"
+    success "Cron 自动续期任务已配置（每天凌晨 3:00 执行检查）: $cron_file"
 }
 
 # ══════════════════════════════════════════════════════════════════
