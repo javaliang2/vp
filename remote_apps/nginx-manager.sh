@@ -1646,12 +1646,62 @@ site_edit() {
 show_help() {
     cat <<HELP
 ${BOLD}nginx-gateway.sh — Nginx 全功能网关管理工具${NC}
-
+ 
 ${BOLD}用法:${NC}
   $0 <命令> [子命令] [选项]
   $0                      （无参数，进入交互式主菜单）
-
-...（帮助内容省略，与原脚本相同）
+ 
+${BOLD}站点创建:${NC}
+  site static             静态文件托管（可选 PHP / 自定义端口 / 多种 SSL 模式）
+  site proxy              反向代理（内网 IP:端口，WebSocket 自适应）
+  site mirror             外部域名代理（透传 / 镜像两种子模式）
+  site forward            HTTP 正向代理（含 IP 白名单）
+  site stream             TCP/UDP 流代理（需 stream 模块）
+  site redirect           域名跳转（301/302/307/308，多种路径策略）
+  site loadbalance        负载均衡（upstream 多节点，含健康检查）
+ 
+${BOLD}站点管理:${NC}
+  site enable  <域名>     启用站点
+  site disable <域名>     禁用站点
+  site delete  <域名>     删除站点（可选同时删除文件）
+  site list               列出所有站点及类型/状态
+  site info    <域名>     查看配置内容
+  site edit    <域名>     编辑配置文件
+ 
+${BOLD}安全增强:${NC}
+  site acl                为站点添加 IP 白/黑名单 或 Basic Auth 认证
+  site ratelimit          为站点添加限流（limit_req_zone，防刷接口）
+ 
+${BOLD}证书管理:${NC}
+  cert issue              申请 Let's Encrypt 证书
+    -d <域名> -e <邮箱>  [-m nginx|webroot|standalone]  [--wildcard]
+  cert self-signed        生成自签名证书
+    -d <域名>  [--days <天数，默认3650>]
+  cert renew  [域名]      手动续期（不填则续期全部）
+  cert list               列出所有证书及到期时间
+  cert auto-renew         配置 cron/systemd 自动续期
+ 
+${BOLD}配置备份:${NC}
+  backup create           备份 Nginx 所有配置到 ${BACKUP_DIR}/
+  backup restore          从备份还原配置（自动先备份当前）
+  backup list             列出所有备份文件
+ 
+${BOLD}Nginx 控制:${NC}
+  nginx install           安装 Nginx（自动检测包管理器）
+  nginx reload            检查语法并重载配置
+  nginx restart           重启 Nginx
+  nginx status            查看运行状态
+ 
+${BOLD}示例:${NC}
+  sudo $0                                           # 进入交互式菜单
+  sudo $0 site proxy                                # 创建反向代理
+  sudo $0 site mirror                               # 外部域名透传或镜像
+  sudo $0 site redirect                             # 创建跳转规则
+  sudo $0 site acl                                  # 添加 IP 访问控制
+  sudo $0 cert issue -d example.com -e me@a.com    # 申请 LE 证书
+  sudo $0 cert issue -d example.com -e me@a.com --wildcard
+  sudo $0 backup create                             # 备份配置
+ 
 HELP
 }
 
