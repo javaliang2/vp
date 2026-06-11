@@ -704,24 +704,26 @@ PHP
 site_create_proxy() {
     require_root
     init_dirs
-
     local domain="" backend=""
-
     safe_read -rp "域名或 server_name: " domain
     [[ -z "$domain" ]] && die "域名不能为空"
-
     safe_read -rp "后端目标地址（如 127.0.0.1:3000 或 http://10.0.0.5:8080）: " backend
     [[ -z "$backend" ]] && die "后端地址不能为空"
     backend=$(normalize_url "$backend")
-
     ask_ssl_params
     resolve_ssl_cert "$domain"
     _check_port_conflict "$_SSL_PORT"
     _ensure_upgrade_map
 
+    # ── 推断后端是否为 HTTPS ─────────────────────────────────────
+    local backend_is_https=false
+    [[ "$backend" == https://* ]] && backend_is_https=true
+
     local conf_file="${SITES_AVAILABLE}/${domain}.conf"
     {
-        [[ "$_SSL_301" == "yes" ]] && write_redirect_block "$domain" "$_SSL_PORT" "$_SSL_HTTP_PORT"
+        # 仅在 SSL 模式下才生成 301 重定向块
+        [[ "$_SSL_MODE" != "none" && "$_SSL_301" == "yes" ]] && \
+            write_redirect_block "$domain" "$_SSL_PORT" "$_SSL_HTTP_PORT"
 
         echo "server {"
         if [[ "$_SSL_MODE" != "none" ]]; then
@@ -731,14 +733,13 @@ site_create_proxy() {
             echo "    listen ${_SSL_PORT};"
             echo "    listen [::]:${_SSL_PORT};"
         fi
-
         cat <<CONF
     server_name ${domain};
     resolver    1.1.1.1 8.8.8.8 valid=300s;
-
     access_log /var/log/nginx/${domain}.access.log;
     error_log  /var/log/nginx/${domain}.error.log;
 
+    client_max_body_size 0;
 CONF
         [[ "$_SSL_MODE" != "none" ]] && ssl_block "$_SSL_CERT" "$_SSL_KEY" && echo ""
 
@@ -753,14 +754,24 @@ CONF
         proxy_set_header    X-Forwarded-For   \$proxy_add_x_forwarded_for;
         proxy_set_header    X-Forwarded-Proto \$scheme;
         proxy_cache_bypass  \$http_upgrade;
+CONF
+        # 仅后端为 HTTPS 时才加 proxy_ssl 指令
+        if [[ "$backend_is_https" == true ]]; then
+            cat <<CONF
         proxy_ssl_server_name on;
+        proxy_ssl_verify      off;
+CONF
+        fi
+
+        cat <<CONF
     }
 
-    location ~ /\. { deny all; }
+    # 允许 ACME webroot 验证，屏蔽其他隐藏路径
+    location ~ /\.well-known { allow all; }
+    location ~ /\.           { deny all; }
 }
 CONF
     } > "$conf_file"
-
     _site_activate "$domain"
 }
 
