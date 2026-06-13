@@ -1662,7 +1662,7 @@ YAML
 deploy_alist() {
     local DIR="${1:-$BASE_DIR/alist}"
     local HOST_PORT="${2:-${APP_DEFAULT_PORT[alist]}}"
-    local MEDIA_DIR="${3:-/root/tg_downloader/bots/downloader/downloads}"
+    local MEDIA_DIR="${3:-/root/tg_download/downloads}"
     local NET
     NET=$(net_name "$DIR")
 
