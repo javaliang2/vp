@@ -101,7 +101,14 @@ EOF
 harden_csp() {
     local conf="${CONF_D_DIR}/93-csp.conf"
     if confirm "启用 Content-Security-Policy？"; then
-        local policy="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline';"
+        warn "默认策略包含 'unsafe-inline'/'unsafe-eval'，会显著削弱 XSS 防护"
+        local policy
+        if confirm "使用更严格的策略（不含 unsafe-inline/unsafe-eval，可能导致依赖内联脚本/样式的站点异常）？"; then
+            policy="default-src 'self'; script-src 'self'; style-src 'self';"
+        else
+            policy="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline';"
+            warn "已选择宽松策略，建议后续根据站点实际需求收紧 script-src/style-src"
+        fi
         echo "add_header Content-Security-Policy \"${policy}\" always;" > "$conf"
         success "CSP 已配置 -> $conf"
     else
@@ -188,9 +195,18 @@ EOF
 harden_rate_limit() {
     if confirm "启用请求/连接限流？"; then
         local zone_conf="${CONF_D_DIR}/95-rate-limit.conf"
-        safe_read -r -p "单IP请求速率 (如 10r/s) [默认10r/s]: " rate
-        [[ -z "$rate" ]] && rate="10r/s"
-        local burst=$(( ${rate%%r/s} * 2 ))
+        local rate
+        while true; do
+            safe_read -r -p "单IP请求速率 (如 10r/s) [默认10r/s]: " rate
+            [[ -z "$rate" ]] && rate="10r/s"
+            # 仅支持整数 r/s 格式，确保后续算术运算安全
+            if [[ "$rate" =~ ^([1-9][0-9]*)r/s$ ]]; then
+                break
+            fi
+            warn "格式无效，请输入形如 10r/s 的整数速率（仅支持 r/s）"
+        done
+        local rate_num="${rate%%r/s}"
+        local burst=$(( rate_num * 2 ))
         cat > "$zone_conf" <<EOF
 limit_req_zone \$binary_remote_addr zone=req_limit:10m rate=${rate};
 limit_conn_zone \$binary_remote_addr zone=conn_limit:10m;
@@ -210,7 +226,7 @@ EOF
 # ── 自动注入 ──
 auto_include_snippets() {
     confirm "自动注入安全片段到所有 server 块？" || return
-    mapfile -t files < <(grep -rnIl '^\s*server\s*{' "${NGINX_CONF_DIR}" --include="*.conf" | grep -v snippets | grep -v "${CONF_D_DIR}/9[0-9]") || true
+    mapfile -t files < <(grep -rnIl '^\s*server\s*{' "${NGINX_CONF_DIR}" --include="*.conf" | grep -v "${SNIPPETS_DIR}/" | grep -vE "${CONF_D_DIR}/9[0-9]-") || true
     for f in "${files[@]}"; do
         cp "$f" "${f}.bak-$(date +%Y%m%d%H%M%S)"
         for snippet in secure-methods.conf secure-files.conf rate-limit.conf; do
@@ -244,11 +260,11 @@ install_fail2ban() {
 configure_fail2ban() {
     install_fail2ban
 
-    # 生成过滤器（匹配统一日志中的 403/405/503）
+    # 生成过滤器（仅匹配统一阻断日志中已被标记为 403/405/503 的请求，
+    # 避免对正常返回 200 的同名路径误判）
     cat > "${FAIL2BAN_FILTER}" <<'EOF'
 [Definition]
 failregex = ^<HOST> .* "(GET|POST|HEAD|PUT|DELETE|MKCOL|PROPFIND|OPTIONS).*" (403|405|503) .*$
-            ^<HOST> .* "(GET|POST|HEAD).*\.(git|env|bak|sql|log).*" .*$
 ignoreregex =
 EOF
 
@@ -289,8 +305,8 @@ apply_all_hardening() {
     # ★ fail2ban 联动
     configure_fail2ban
 
-    # 定义 blocked 变量并启用统一日志
-    cat >> "${CONF_D_DIR}/99-blocked-log.conf" <<'EOF'
+    # 定义 blocked 变量并启用统一日志（覆盖写入，避免重复执行时 map 重复定义）
+    cat > "${CONF_D_DIR}/99-blocked-log.conf" <<'EOF'
 # 为阻断日志定义条件变量（默认开启）
 map $status $blocked {
     default 0;
