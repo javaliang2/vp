@@ -1,267 +1,424 @@
 #!/bin/bash
 # ============================================================
-#  nginx-harden.sh — Nginx 自动化安全加固脚本
-#  功能：隐藏版本 / 安全响应头 / 请求方法限制 / 缓冲区防溢出 / 防爬虫
+#  nginx-harden.sh — Nginx 自动化安全加固脚本 v2.0
+#  功能：版本隐藏 / 安全头 / 方法限制 / 缓冲区防溢出 / 敏感文件防护
+#        自动备份回滚 / 自动注入 / CSP / 限流 / 命令行非交互
 #  系统：Ubuntu / Debian / CentOS / RHEL / Arch
 # ============================================================
 set -euo pipefail
-shopt -s extglob
+umask 022
 
-# ──────────────────────────────────────────────────────────
-# 全局配置
-# ──────────────────────────────────────────────────────────
+# ── 全局配置 ──
 NGINX_CONF_DIR="${NGINX_CONF_DIR:-/etc/nginx}"
 CONF_D_DIR="${NGINX_CONF_DIR}/conf.d"
 SNIPPETS_DIR="${NGINX_CONF_DIR}/snippets"
-BACKUP_DIR="${BACKUP_DIR:-/var/backups/nginx-harden}"
+BACKUP_DIR="/var/backups/nginx-harden"
 LOG_FILE="/var/log/nginx-harden.log"
+TIMESTAMP=$(date +'%Y-%m-%d %H:%M:%S')
+BACKUP_FILE="${BACKUP_DIR}/nginx-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
 
-# ──────────────────────────────────────────────────────────
-# 颜色 & 日志工具
-# ──────────────────────────────────────────────────────────
+# ── 颜色与日志 ──
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-_log() { echo -e "$*" | tee -a "$LOG_FILE" 1>&2; }
+_log() {
+    local msg="$*"
+    echo -e "${msg}" 1>&2
+    # 写入日志（去除颜色）
+    sed -r 's/\x1b\[[0-9;]*m//g' <<< "$msg" >> "$LOG_FILE" 2>/dev/null || true
+}
 info()    { _log "${CYAN}[信息]${NC}  $*"; }
 success() { _log "${GREEN}[成功]${NC}  $*"; }
 warn()    { _log "${YELLOW}[警告]${NC}  $*"; }
 error()   { _log "${RED}[错误]${NC}  $*"; }
 die()     { error "$*"; exit 1; }
 
-require_root() {
-    [[ $EUID -eq 0 ]] || die "请以 root 身份运行本脚本（sudo $0）"
-}
+require_root() { [[ $EUID -eq 0 ]] || die "请以 root 身份运行（sudo $0）"; }
 
-safe_read() {
-    set +e
-    read -r "$@"
-    local _rc=$?
-    set -e
-    return $_rc
-}
+safe_read() { read -r "$@" || true; }
 
 confirm() {
     local _ans
-    safe_read -rp "${YELLOW}$1 [y/N]${NC} " _ans
+    safe_read -r -p "${YELLOW}$1 [y/N]${NC} " _ans
     [[ ${_ans,,} == "y" ]]
 }
 
 init_env() {
     mkdir -p "$CONF_D_DIR" "$SNIPPETS_DIR" "$BACKUP_DIR" "$(dirname "$LOG_FILE")"
-    if ! command -v nginx &>/dev/null; then
-        die "未检测到 Nginx，请先安装 Nginx"
+    command -v nginx &>/dev/null || die "未检测到 Nginx，请先安装"
+    if ! nginx -T 2>/dev/null | grep -q 'include.*conf\.d/\*\.conf'; then
+        warn "主配置可能未包含 ${CONF_D_DIR}，请确认 nginx.conf 中存在 'include conf.d/*.conf;'"
+    fi
+    # 确保 nginx 版本支持 limit_req_zone 等（nginx 1.1.4+ 均支持）
+}
+
+# ── 备份与回滚 ──
+backup_configs() {
+    info "正在备份整个 Nginx 配置目录到 ${BACKUP_FILE} ..."
+    tar -czf "${BACKUP_FILE}" -C / etc/nginx 2>/dev/null || die "备份失败，请检查磁盘空间或权限"
+    success "配置已备份"
+}
+
+restore_backup() {
+    if [[ -f "${BACKUP_FILE}" ]]; then
+        warn "配置检查失败，正在回滚到备份..."
+        tar -xzf "${BACKUP_FILE}" -C / || die "回滚失败，请手动检查"
+        success "已回滚到备份"
+        nginx -t 1>&2 && systemctl reload nginx && success "回滚后 Nginx 已重载" || warn "回滚后 Nginx 仍存在问题，请手动排查"
+    else
+        die "未找到备份文件，无法回滚"
     fi
 }
 
-nginx_reload() {
-    info "检查 Nginx 配置语法..."
-    nginx -t 2>&1 >&2 || die "Nginx 配置检查失败，请检查刚刚生成的配置"
-    systemctl reload nginx
-    success "Nginx 已重载"
+# ── 安全测试包装 ──
+safe_reload() {
+    if nginx -t 1>&2; then
+        systemctl reload nginx
+        success "Nginx 配置重载成功"
+    else
+        error "Nginx 配置语法错误！"
+        if confirm "是否立即回滚到刚才的备份？"; then
+            restore_backup
+        else
+            die "语法错误且未回滚，请手动修复后重载"
+        fi
+        false
+    fi
 }
 
-# ──────────────────────────────────────────────────────────
-# 加固模块
-# ──────────────────────────────────────────────────────────
+# ── 加固模块 ──
 
-# 1. 隐藏 Nginx 版本号
 harden_server_tokens() {
     local conf="${CONF_D_DIR}/90-security-tokens.conf"
     echo "server_tokens off;" > "$conf"
-    success "已隐藏 Nginx 版本号 (server_tokens off) -> $conf"
+    success "已隐藏版本号 -> $conf"
 }
 
-# 2. 添加全局安全响应头
 harden_security_headers() {
     local conf="${CONF_D_DIR}/91-security-headers.conf"
     cat > "$conf" <<'EOF'
-# X-Frame-Options: 防止点击劫持 (Clickjacking)
 add_header X-Frame-Options "SAMEORIGIN" always;
-
-# X-XSS-Protection: 启用浏览器内置 XSS 过滤
 add_header X-XSS-Protection "1; mode=block" always;
-
-# X-Content-Type-Options: 禁止浏览器 MIME 类型嗅探
 add_header X-Content-Type-Options "nosniff" always;
-
-# Referrer-Policy: 跨域时仅发送同源 Referrer，保护隐私
 add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-
-# Strict-Transport-Security: 强制 HTTPS (HSTS)，仅在 HTTPS 协议下生效
-add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
 EOF
-    success "全局安全响应头已配置 -> $conf"
+    success "基础安全头已配置 -> $conf"
 }
 
-# 3. 限制 HTTP 请求方法 (需区分是否使用 WebDAV)
+# 可选 CSP
+harden_csp() {
+    local conf="${CONF_D_DIR}/93-csp.conf"
+    if confirm "是否启用 Content-Security-Policy (CSP)？"; then
+        warn "CSP 配置不当可能阻止合法资源加载，推荐使用 report-only 模式先观察"
+        echo "  1) 严格模式（阻止未知资源）"
+        echo "  2) 仅报告模式（不影响页面）"
+        safe_read -r -p "请选择 [1-2，默认2]: " csp_mode
+        local policy="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline';"
+        if [[ "$csp_mode" == "1" ]]; then
+            echo "add_header Content-Security-Policy \"${policy}\" always;" > "$conf"
+        else
+            echo "add_header Content-Security-Policy-Report-Only \"${policy}\" always;" > "$conf"
+        fi
+        success "CSP 头已配置 -> $conf"
+    else
+        info "已跳过 CSP 配置"
+    fi
+}
+
+# 可选 Permissions-Policy
+harden_permissions_policy() {
+    local conf="${CONF_D_DIR}/94-permissions-policy.conf"
+    if confirm "是否启用 Permissions-Policy（限制 API 权限）？"; then
+        local policy="camera=(), microphone=(), geolocation=(), interest-cohort=()"
+        echo "add_header Permissions-Policy \"${policy}\" always;" > "$conf"
+        success "Permissions-Policy 已配置 -> $conf"
+    else
+        info "已跳过 Permissions-Policy"
+    fi
+}
+
+# 限制请求方法（严格 / WebDAV）
 harden_http_methods() {
     local conf="${SNIPPETS_DIR}/secure-methods.conf"
-    
     echo ""
-    warn "严格限制请求方法可以有效防范非法探测。"
-    info "如果此服务器运行了 Alist 等依赖 WebDAV 的应用，请务必选择兼容模式。"
-    echo "  1) 严格模式: 仅允许 GET, HEAD, POST"
-    echo "  2) WebDAV 兼容模式: 允许 GET, POST, PUT, DELETE, MKCOL, PROPFIND, OPTIONS 等"
-    safe_read -rp "请选择 [1-2，默认 1]: " _method_choice
+    warn "严格限制请求方法可以防范非法探测"
+    echo "  1) 严格模式: 仅 GET, HEAD, POST"
+    echo "  2) WebDAV 兼容: 增加 PUT, DELETE, MKCOL 等"
+    safe_read -r -p "请选择 [1-2，默认1]: " method_choice
 
-    if [[ "${_method_choice}" == "2" ]]; then
+    if [[ "${method_choice}" == "2" ]]; then
         cat > "$conf" <<'EOF'
-# WebDAV 兼容模式：拦截除 WebDAV 常用方法外的未知请求
-if ($request_method !~ ^(GET|HEAD|POST|PUT|DELETE|MKCOL|COPY|MOVE|PROPFIND|OPTIONS)$) {
-    return 405;
-}
+if ($request_method !~ ^(GET|HEAD|POST|PUT|DELETE|MKCOL|COPY|MOVE|PROPFIND|OPTIONS)$) { return 405; }
 EOF
         success "已生成 WebDAV 兼容请求拦截规则 -> $conf"
     else
         cat > "$conf" <<'EOF'
-# 严格模式：仅允许常规网页请求方法
-if ($request_method !~ ^(GET|HEAD|POST)$) {
-    return 405;
-}
+if ($request_method !~ ^(GET|HEAD|POST)$) { return 405; }
 EOF
-        success "已生成严格 HTTP 请求拦截规则 -> $conf"
+        success "已生成严格请求拦截规则 -> $conf"
     fi
-    warn "注意: 你需要在具体站点的 server {} 块中添加 'include snippets/secure-methods.conf;' 才能生效"
+    warn "需在 server {} 块中手动 include 或使用自动注入功能"
 }
 
-# 4. 缓冲区与超时限制 (防范 Slowloris 和缓冲区溢出攻击)
 harden_buffers_timeouts() {
     local conf="${CONF_D_DIR}/92-security-buffers.conf"
-    
-    echo ""
-    info "如果您的站点(如 WordPress)经常需要上传大文件，请根据实际情况调整 client_max_body_size。"
-    safe_read -rp "全局最大上传限制 (例如: 50M, 0为不限) [默认 50M]: " _max_body
-    [[ -z "$_max_body" ]] && _max_body="50M"
+    while true; do
+        safe_read -r -p "全局最大上传限制 (例: 50M, 0不限) [默认50M]: " max_body
+        [[ -z "$max_body" ]] && max_body="50M"
+        if [[ $max_body =~ ^(0|[1-9][0-9]*[kKmMgG]?)$ ]]; then break
+        else warn "格式无效，请输入 10M、1G 或 0"; fi
+    done
 
     cat > "$conf" <<EOF
-# 缓冲区与超时安全限制
 client_body_buffer_size      128k;
 client_header_buffer_size    1k;
 large_client_header_buffers  4 8k;
-client_max_body_size         ${_max_body};
-
-# 降低超时时间，释放空闲连接，防范慢速攻击
+client_max_body_size         ${max_body};
 client_body_timeout   10;
 client_header_timeout 10;
 keepalive_timeout     15;
 send_timeout          10;
 EOF
-    success "缓冲区与超时安全限制已配置 -> $conf"
+    success "缓冲区与超时限制已配置 -> $conf"
 }
 
-# 5. 阻止访问敏感文件 (.git, .env等)
 harden_sensitive_files() {
     local conf="${SNIPPETS_DIR}/secure-files.conf"
     cat > "$conf" <<'EOF'
-# 禁止访问隐藏文件和目录 (如 .git, .env, .htpasswd)
-location ~ /\.(?!well-known\/) {
-    deny all;
-    access_log off;
-    log_not_found off;
-}
-
-# 禁止访问常见的备份和配置敏感文件
-location ~* (?:\.(?:bak|config|sql|fla|psd|ini|log|sh|inc|swp|dist)|~)$ {
-    deny all;
-    access_log off;
-    log_not_found off;
-}
-EOF
-    success "敏感文件屏蔽规则已生成 -> $conf"
-    warn "注意: 你需要在具体站点的 server {} 块中添加 'include snippets/secure-files.conf;' 才能生效"
-}
-
-# 6. 一键应用所有默认安全配置
-apply_all_hardening() {
-    info "正在应用推荐的全局安全加固..."
-    harden_server_tokens
-    harden_security_headers
-    harden_buffers_timeouts
-    
-    info "正在生成 Server 级引用片段..."
-    # 模拟默认选 1 (或传入参数免交互) 
-    echo 'if ($request_method !~ ^(GET|HEAD|POST|PUT|DELETE|MKCOL|COPY|MOVE|PROPFIND|OPTIONS)$) { return 405; }' > "${SNIPPETS_DIR}/secure-methods.conf"
-    success "已生成默认请求拦截规则 (兼容WebDAV) -> ${SNIPPETS_DIR}/secure-methods.conf"
-    
-    cat > "${SNIPPETS_DIR}/secure-files.conf" <<'EOF'
 location ~ /\.(?!well-known\/) { deny all; access_log off; log_not_found off; }
 location ~* (?:\.(?:bak|config|sql|fla|psd|ini|log|sh|inc|swp|dist)|~)$ { deny all; access_log off; log_not_found off; }
 EOF
-    success "敏感文件屏蔽规则已生成 -> ${SNIPPETS_DIR}/secure-files.conf"
-    
+    success "敏感文件屏蔽规则 -> $conf"
+}
+
+# 连接/请求限流
+harden_rate_limit() {
+    if confirm "是否启用请求/连接限流（防CC、防爬虫）？"; then
+        local zone_conf="${CONF_D_DIR}/95-rate-limit.conf"
+        safe_read -r -p "单IP请求速率限制 (r/s, 如 10r/s) [默认 10r/s]: " rate
+        [[ -z "$rate" ]] && rate="10r/s"
+        local burst="${rate%%r/s}"   # 简单提取数字
+        burst=$(( burst * 2 ))
+        cat > "$zone_conf" <<EOF
+# 共享内存区域，10m 可存储约 16 万个 IP
+limit_req_zone \$binary_remote_addr zone=req_limit:10m rate=${rate};
+limit_conn_zone \$binary_remote_addr zone=conn_limit:10m;
+
+# 应用到所有 server，可在需要时 include 或继承
+EOF
+        # 生成一个 snippet 供 server 块使用
+        local snippet="${SNIPPETS_DIR}/rate-limit.conf"
+        cat > "$snippet" <<EOF
+limit_req zone=req_limit burst=${burst} nodelay;
+limit_conn conn_limit 10;
+EOF
+        success "限流全局配置已生成 -> ${zone_conf}，Snippet -> ${snippet}"
+        warn "需在 server/location 块中 include snippets/rate-limit.conf;"
+    else
+        info "已跳过限流配置"
+    fi
+}
+
+# ── 自动注入 include 片段到所有 server 块 ──
+auto_include_snippets() {
+    if ! confirm "是否自动将所有站点配置注入 security snippets（secure-methods / secure-files 等）？"; then
+        info "跳过自动注入，请手动添加"
+        return
+    fi
+
+    local snippet_methods="snippets/secure-methods.conf"
+    local snippet_files="snippets/secure-files.conf"
+    local snippet_rate="snippets/rate-limit.conf"   # 可选
+
+    # 查找所有包含 'server {' 且不在注释中的配置文件（排除 snippets 和 conf.d 全局）
+    mapfile -t server_files < <(grep -rnIl '^\s*server\s*{' "${NGINX_CONF_DIR}" \
+        --include="*.conf" --exclude-dir=snippets | grep -v "${CONF_D_DIR}/9[0-9]") || true
+
+    if [[ ${#server_files[@]} -eq 0 ]]; then
+        warn "未找到任何 server {} 块，跳过注入"
+        return
+    fi
+
+    info "发现以下站点配置文件："
+    printf '  %s\n' "${server_files[@]}"
+
+    for f in "${server_files[@]}"; do
+        info "处理 $f ..."
+        # 备份单个文件
+        cp "$f" "${f}.bak-$(date +%Y%m%d%H%M%S)"
+        
+        # 在第一个 server { 后插入（注意可能有多行）
+        if ! grep -q "include ${snippet_methods};" "$f"; then
+            sed -i "/^\s*server\s*{/a\    include ${snippet_methods};" "$f"
+            success "  ✓ 已注入 ${snippet_methods}"
+        else
+            info "  - ${snippet_methods} 已存在"
+        fi
+        if ! grep -q "include ${snippet_files};" "$f"; then
+            sed -i "/^\s*server\s*{/a\    include ${snippet_files};" "$f"
+            success "  ✓ 已注入 ${snippet_files}"
+        else
+            info "  - ${snippet_files} 已存在"
+        fi
+        if [[ -f "${SNIPPETS_DIR}/rate-limit.conf" ]] && ! grep -q "include ${snippet_rate};" "$f"; then
+            if confirm "是否为 $f 注入限流规则？"; then
+                sed -i "/^\s*server\s*{/a\    include ${snippet_rate};" "$f"
+                success "  ✓ 已注入 ${snippet_rate}"
+            fi
+        fi
+    done
+}
+
+# ── 一键加固（完整流程） ──
+apply_all_hardening() {
+    backup_configs
+
+    harden_server_tokens
+    harden_security_headers
+    harden_buffers_timeouts
+    harden_csp
+    harden_permissions_policy
+
+    # 生成 snippet（严格方法 + 敏感文件，可选限流）
+    info "生成请求方法限制（严格模式）"
+    cat > "${SNIPPETS_DIR}/secure-methods.conf" <<'EOF'
+if ($request_method !~ ^(GET|HEAD|POST)$) { return 405; }
+EOF
+    harden_sensitive_files   # 会创建 secure-files.conf
+    harden_rate_limit
+
+    # 自动注入
+    auto_include_snippets
+
     echo ""
-    info "全局配置已自动生效。对于各个站点，请编辑其配置文件并注入以下代码："
-    echo -e "${CYAN}    include snippets/secure-methods.conf;${NC}"
-    echo -e "${CYAN}    include snippets/secure-files.conf;${NC}"
-    
-    nginx_reload
+    info "所有配置已生成，即将检查语法并重载"
+    if safe_reload; then
+        success "一键加固完成！"
+    else
+        die "重载失败，已尝试回滚"
+    fi
 }
 
-# 撤销加固
+# 撤销所有配置
 revert_hardening() {
-    confirm "是否移除由本脚本生成的所有全局 Nginx 安全配置文件？" || return
-    rm -f "${CONF_D_DIR}/90-security-tokens.conf"
-    rm -f "${CONF_D_DIR}/91-security-headers.conf"
-    rm -f "${CONF_D_DIR}/92-security-buffers.conf"
-    rm -f "${SNIPPETS_DIR}/secure-methods.conf"
-    rm -f "${SNIPPETS_DIR}/secure-files.conf"
-    success "加固配置已移除。"
-    nginx_reload
+    confirm "是否移除本脚本生成的所有配置并回滚到最近备份？" || return
+    local files=(
+        "${CONF_D_DIR}/90-security-tokens.conf"
+        "${CONF_D_DIR}/91-security-headers.conf"
+        "${CONF_D_DIR}/92-security-buffers.conf"
+        "${CONF_D_DIR}/93-csp.conf"
+        "${CONF_D_DIR}/94-permissions-policy.conf"
+        "${CONF_D_DIR}/95-rate-limit.conf"
+        "${SNIPPETS_DIR}/secure-methods.conf"
+        "${SNIPPETS_DIR}/secure-files.conf"
+        "${SNIPPETS_DIR}/rate-limit.conf"
+    )
+    for f in "${files[@]}"; do rm -f "$f"; done
+    success "已删除所有加固配置"
+
+    # 恢复备份（如果有）
+    local latest_backup=$(ls -1t "${BACKUP_DIR}"/nginx-backup-*.tar.gz 2>/dev/null | head -1)
+    if [[ -f "$latest_backup" ]]; then
+        if confirm "检测到备份 ${latest_backup##*/}，是否恢复？"; then
+            tar -xzf "$latest_backup" -C /
+            success "已从备份恢复"
+        fi
+    fi
+
+    info "建议手动检查 sites-enabled 中的 include 行并移除，然后重载 Nginx"
+    if confirm "是否现在重载 Nginx？"; then
+        safe_reload
+    fi
 }
 
+# ── 命令行解析与主流程 ──
+usage() {
+    echo -e "${BOLD}用法:${NC} $0 [选项]"
+    echo "  -a, --all     一键应用所有推荐加固"
+    echo "  -r, --revert  撤销所有加固并恢复备份"
+    echo "  --dry-run     仅生成配置不重载"
+    echo "  -h, --help    显示帮助"
+    echo "  无参数        进入交互式菜单"
+    exit 0
+}
 
-# ──────────────────────────────────────────────────────────
-# 交互式主菜单
-# ──────────────────────────────────────────────────────────
+DRY_RUN=false
+CMD="menu"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -a|--all) CMD="all"; shift ;;
+        -r|--revert) CMD="revert"; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        -h|--help) usage ;;
+        *) echo "未知参数: $1"; usage ;;
+    esac
+done
+
+main() {
+    require_root
+    init_env
+
+    # 若处于 dry-run，重载函数直接跳过
+    if $DRY_RUN; then
+        safe_reload() { info "Dry-run 模式，跳过重载"; true; }
+    fi
+
+    case "$CMD" in
+        all) apply_all_hardening ;;
+        revert) revert_hardening ;;
+        menu) interactive_menu ;;
+    esac
+}
+
+# 交互菜单（保留原有风格，稍作增强）
 interactive_menu() {
     while true; do
         clear
         echo -e "${BOLD}${GREEN}"
         echo "  ╔════════════════════════════════════════════════╗"
-        echo "  ║             Nginx 安全加固工具                 ║"
+        echo "  ║        Nginx 安全加固工具 v2.0                ║"
         echo "  ╚════════════════════════════════════════════════╝"
         echo -e "${NC}"
-        echo -e " ${CYAN}── 自动加固 ──${NC}"
-        echo "  1) 一键应用推荐安全配置 (全局+片段)"
+        echo -e " ${CYAN}── 快速操作 ──${NC}"
+        echo "  1) 一键加固 + 自动注入 (推荐)"
+        echo "  2) 撤销所有加固配置"
         echo ""
         echo -e " ${CYAN}── 精细配置 ──${NC}"
-        echo "  2) 隐藏版本号 (server_tokens off)"
-        echo "  3) 配置安全响应头 (HSTS, XSS防护等)"
-        echo "  4) 生成限制请求方法规则"
-        echo "  5) 调整缓冲区大小与超时 (防慢速攻击)"
-        echo "  6) 生成禁止访问隐藏文件/敏感文件规则"
-        echo ""
-        echo -e " ${CYAN}── 维护 ──${NC}"
-        echo "  7) 重载 Nginx 配置"
-        echo "  8) 撤销所有加固配置"
+        echo "  3) 隐藏版本号"
+        echo "  4) 基础安全头"
+        echo "  5) 高级安全头 (CSP / Permissions-Policy)"
+        echo "  6) 请求方法限制"
+        echo "  7) 缓冲区与超时"
+        echo "  8) 敏感文件屏蔽"
+        echo "  9) 请求/连接限流"
+        echo " 10) 自动注入 snippets 到站点"
+        echo " 11) 重载 Nginx"
         echo "  0) 退出"
         echo ""
-        safe_read -rp "请选择 [0-8]: " choice
+        safe_read -r -p "请选择 [0-11]: " choice
 
         case "$choice" in
-            1) apply_all_hardening; safe_read -rp "按回车继续..." _ ;;
-            2) harden_server_tokens; nginx_reload; safe_read -rp "按回车继续..." _ ;;
-            3) harden_security_headers; nginx_reload; safe_read -rp "按回车继续..." _ ;;
-            4) harden_http_methods; safe_read -rp "按回车继续..." _ ;;
-            5) harden_buffers_timeouts; nginx_reload; safe_read -rp "按回车继续..." _ ;;
-            6) harden_sensitive_files; safe_read -rp "按回车继续..." _ ;;
-            7) nginx_reload; safe_read -rp "按回车继续..." _ ;;
-            8) revert_hardening; safe_read -rp "按回车继续..." _ ;;
+            1) backup_configs; harden_server_tokens; harden_security_headers; harden_buffers_timeouts
+               harden_csp; harden_permissions_policy; harden_rate_limit
+               harden_http_methods; harden_sensitive_files
+               auto_include_snippets; safe_reload
+               safe_read -r -p "按回车继续..." _ ;;
+            2) revert_hardening; safe_read -r -p "按回车继续..." _ ;;
+            3) harden_server_tokens; safe_reload; safe_read -r -p "按回车继续..." _ ;;
+            4) harden_security_headers; safe_reload; safe_read -r -p "按回车继续..." _ ;;
+            5) harden_csp; harden_permissions_policy; safe_reload; safe_read -r -p "按回车继续..." _ ;;
+            6) harden_http_methods; safe_read -r -p "按回车继续..." _ ;;
+            7) harden_buffers_timeouts; safe_reload; safe_read -r -p "按回车继续..." _ ;;
+            8) harden_sensitive_files; safe_read -r -p "按回车继续..." _ ;;
+            9) harden_rate_limit; safe_read -r -p "按回车继续..." _ ;;
+            10) auto_include_snippets; safe_reload; safe_read -r -p "按回车继续..." _ ;;
+            11) safe_reload; safe_read -r -p "按回车继续..." _ ;;
             0) echo "再见！"; exit 0 ;;
-            *) warn "无效选项，请重试" ;;
+            *) warn "无效选项" ;;
         esac
     done
-}
-
-main() {
-    require_root
-    init_env
-    
-    if [[ $# -eq 0 ]]; then
-        interactive_menu
-        exit 0
-    fi
 }
 
 main "$@"
