@@ -167,7 +167,7 @@ main_menu() {
         echo -e " 3. sing-box 管理"
         echo -e " 4. 系统实时监控"
         echo -e " 5. 流量统计"
-        echo -e " 6. 日志查看/分析"
+        echo -e " 6. 日志查看/删除"
         echo -e " 7. 密钥生成/禁用密码"
         echo -e " 8. 远程SSH跳转(输入exit退出)"
         echo -e " 9. 远程应用"
