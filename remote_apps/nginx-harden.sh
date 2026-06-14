@@ -1,7 +1,9 @@
 #!/bin/bash
 # ============================================================
-#  nginx-harden.sh — Nginx 安全加固 + fail2ban 协同套装 v3.0
-#  - 自动备份、回滚、注入、限流、CSP、fail2ban 联动
+#  nginx-harden.sh — Nginx 全局基础加固 + fail2ban 联动 v4.0
+#  - 仅做全局、对各站点无副作用的基础加固
+#  - CSP / HTTP方法限制 / 限流 等站点相关项已移除，
+#    后续按站点(WordPress/AList/图床等)单独处理
 # ============================================================
 set -euo pipefail
 umask 022
@@ -12,7 +14,7 @@ CONF_D_DIR="${NGINX_CONF_DIR}/conf.d"
 SNIPPETS_DIR="${NGINX_CONF_DIR}/snippets"
 BACKUP_DIR="/var/backups/nginx-harden"
 LOG_FILE="/var/log/nginx-harden.log"
-BLOCKED_LOG="/var/log/nginx/blocked.log"          # ★ 统一阻断日志
+BLOCKED_LOG="/var/log/nginx/blocked.log"          # ★ 统一阻断日志（按站点手动接入）
 TIMESTAMP=$(date +'%Y-%m-%d %H:%M:%S')
 BACKUP_FILE="${BACKUP_DIR}/nginx-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
 FAIL2BAN_FILTER="/etc/fail2ban/filter.d/nginx-harden.conf"
@@ -78,7 +80,7 @@ safe_reload() {
     fi
 }
 
-# ── 加固模块（关键点：统一阻断日志） ──
+# ── 全局基础加固模块（对所有站点安全、无业务副作用） ──
 
 harden_server_tokens() {
     cat > "${CONF_D_DIR}/90-security-tokens.conf" <<'EOF'
@@ -96,29 +98,12 @@ add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
 EOF
     success "安全响应头 -> ${CONF_D_DIR}/91-security-headers.conf"
-}
-
-harden_csp() {
-    local conf="${CONF_D_DIR}/93-csp.conf"
-    if confirm "启用 Content-Security-Policy？"; then
-        warn "默认策略包含 'unsafe-inline'/'unsafe-eval'，会显著削弱 XSS 防护"
-        local policy
-        if confirm "使用更严格的策略（不含 unsafe-inline/unsafe-eval，可能导致依赖内联脚本/样式的站点异常）？"; then
-            policy="default-src 'self'; script-src 'self'; style-src 'self';"
-        else
-            policy="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline';"
-            warn "已选择宽松策略，建议后续根据站点实际需求收紧 script-src/style-src"
-        fi
-        echo "add_header Content-Security-Policy \"${policy}\" always;" > "$conf"
-        success "CSP 已配置 -> $conf"
-    else
-        info "跳过 CSP"
-    fi
+    info "注意：若各站点 server/location 块自行定义了 add_header，会覆盖此处的值（nginx 的 add_header 不会跨层级叠加），请按需检查。"
 }
 
 harden_permissions_policy() {
     local conf="${CONF_D_DIR}/94-permissions-policy.conf"
-    if confirm "启用 Permissions-Policy？"; then
+    if confirm "启用 Permissions-Policy（禁用摄像头/麦克风/地理位置等，对各站点基本无副作用）？"; then
         echo 'add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), interest-cohort=()" always;' > "$conf"
         success "Permissions-Policy -> $conf"
     else
@@ -126,37 +111,10 @@ harden_permissions_policy() {
     fi
 }
 
-harden_http_methods() {
-    local conf="${SNIPPETS_DIR}/secure-methods.conf"
-    echo ""
-    warn "严格限制请求方法"
-    echo "  1) 严格模式 (GET/HEAD/POST)"
-    echo "  2) WebDAV 兼容"
-    safe_read -r -p "选择 [1-2，默认1]: " choice
-    if [[ "$choice" == "2" ]]; then
-        cat > "$conf" <<'EOF'
-if ($request_method !~ ^(GET|HEAD|POST|PUT|DELETE|MKCOL|COPY|MOVE|PROPFIND|OPTIONS)$) {
-    return 405;
-}
-EOF
-        success "WebDAV 兼容请求拦截 -> $conf"
-    else
-        cat > "$conf" <<'EOF'
-if ($request_method !~ ^(GET|HEAD|POST)$) {
-    return 405;
-}
-EOF
-        success "严格请求拦截 -> $conf"
-    fi
-    # ★ 阻断写入统一日志
-    echo 'access_log /var/log/nginx/blocked.log combined if=$blocked;' >> "$conf"
-    warn "需在 server 块中 include"
-}
-
 harden_buffers_timeouts() {
     local conf="${CONF_D_DIR}/92-security-buffers.conf"
     while true; do
-        safe_read -r -p "全局最大上传限制 (如 50M, 0不限) [默认50M]: " max_body
+        safe_read -r -p "全局最大上传限制 (如 50M, 0不限) [默认50M，各站点可在自己的 server/location 块用 client_max_body_size 覆盖]: " max_body
         [[ -z "$max_body" ]] && max_body="50M"
         [[ $max_body =~ ^(0|[1-9][0-9]*[kKmMgG]?)$ ]] && break
         warn "格式无效，请重试"
@@ -172,12 +130,13 @@ keepalive_timeout     15;
 send_timeout          10;
 EOF
     success "缓冲区与超时 -> $conf"
+    info "提示：单个站点如需更大/更小的上传限制（如图床/AList），可在该站点 server 块内单独写 client_max_body_size 覆盖此全局值。"
 }
 
 harden_sensitive_files() {
     local conf="${SNIPPETS_DIR}/secure-files.conf"
     cat > "$conf" <<'EOF'
-# 记录屏蔽事件到统一日志
+# 屏蔽隐藏文件及常见敏感后缀，阻断事件记录到统一日志
 location ~ /\.(?!well-known\/) {
     deny all;
     access_log /var/log/nginx/blocked.log combined if=$blocked;
@@ -189,53 +148,9 @@ location ~* (?:\.(?:bak|config|sql|fla|psd|ini|log|sh|inc|swp|dist)|~)$ {
     log_not_found off;
 }
 EOF
-    success "敏感文件屏蔽 -> $conf"
-}
-
-harden_rate_limit() {
-    if confirm "启用请求/连接限流？"; then
-        local zone_conf="${CONF_D_DIR}/95-rate-limit.conf"
-        local rate
-        while true; do
-            safe_read -r -p "单IP请求速率 (如 10r/s) [默认10r/s]: " rate
-            [[ -z "$rate" ]] && rate="10r/s"
-            # 仅支持整数 r/s 格式，确保后续算术运算安全
-            if [[ "$rate" =~ ^([1-9][0-9]*)r/s$ ]]; then
-                break
-            fi
-            warn "格式无效，请输入形如 10r/s 的整数速率（仅支持 r/s）"
-        done
-        local rate_num="${rate%%r/s}"
-        local burst=$(( rate_num * 2 ))
-        cat > "$zone_conf" <<EOF
-limit_req_zone \$binary_remote_addr zone=req_limit:10m rate=${rate};
-limit_conn_zone \$binary_remote_addr zone=conn_limit:10m;
-EOF
-        cat > "${SNIPPETS_DIR}/rate-limit.conf" <<EOF
-limit_req zone=req_limit burst=${burst} nodelay;
-limit_conn conn_limit 10;
-# 限流拒绝记录到统一日志
-access_log /var/log/nginx/blocked.log combined if=\$limit_req_status;
-EOF
-        success "限流规则已生成"
-    else
-        info "跳过限流"
-    fi
-}
-
-# ── 自动注入 ──
-auto_include_snippets() {
-    confirm "自动注入安全片段到所有 server 块？" || return
-    mapfile -t files < <(grep -rnIl '^\s*server\s*{' "${NGINX_CONF_DIR}" --include="*.conf" | grep -v "${SNIPPETS_DIR}/" | grep -vE "${CONF_D_DIR}/9[0-9]-") || true
-    for f in "${files[@]}"; do
-        cp "$f" "${f}.bak-$(date +%Y%m%d%H%M%S)"
-        for snippet in secure-methods.conf secure-files.conf rate-limit.conf; do
-            [[ -f "${SNIPPETS_DIR}/${snippet}" ]] || continue
-            grep -q "include snippets/${snippet};" "$f" && continue
-            sed -i "/^\s*server\s*{/a\    include snippets/${snippet};" "$f"
-            success "  ✓ $f ← ${snippet}"
-        done
-    done
+    success "敏感文件屏蔽 snippet 已生成 -> $conf"
+    warn "此 snippet 不会自动注入到各站点，请按需手动在 sites-enabled 下对应站点的 server 块中添加："
+    echo "    include snippets/secure-files.conf;"
 }
 
 # ── fail2ban 集成 ──
@@ -260,15 +175,14 @@ install_fail2ban() {
 configure_fail2ban() {
     install_fail2ban
 
-    # 生成过滤器（仅匹配统一阻断日志中已被标记为 403/405/503 的请求，
-    # 避免对正常返回 200 的同名路径误判）
+    # 过滤器：仅匹配统一阻断日志中已被标记为 403/405/503 的请求
     cat > "${FAIL2BAN_FILTER}" <<'EOF'
 [Definition]
 failregex = ^<HOST> .* "(GET|POST|HEAD|PUT|DELETE|MKCOL|PROPFIND|OPTIONS).*" (403|405|503) .*$
 ignoreregex =
 EOF
 
-    # 生成 jail 配置
+    # jail 配置
     cat > "${FAIL2BAN_JAIL}" <<EOF
 [nginx-harden]
 enabled = true
@@ -281,31 +195,19 @@ bantime  = 3600
 EOF
 
     systemctl enable fail2ban
-    systemctl restart fail2ban
-    success "fail2ban 协同规则已部署，监狱: nginx-harden"
+
+    # 优先 reload，避免影响其他已存在的 jail 的当前 ban 状态
+    if systemctl is-active --quiet fail2ban; then
+        systemctl reload fail2ban || systemctl restart fail2ban
+    else
+        systemctl restart fail2ban
+    fi
+    success "fail2ban 联动规则已部署，监狱: nginx-harden"
+    warn "blocked.log 当前只有在各站点手动 include secure-files.conf（及类似 access_log if=\$blocked 的规则）后才会产生数据，此前该 jail 不会触发。"
 }
 
-# ── 一键协同加固 ──
-apply_all_hardening() {
-    backup_configs
-    harden_server_tokens
-    harden_security_headers
-    harden_csp
-    harden_permissions_policy
-    harden_buffers_timeouts
-
-    # 生成 snippet（严格模式、敏感文件、限流）
-    echo 'if ($request_method !~ ^(GET|HEAD|POST)$) { return 405; }' > "${SNIPPETS_DIR}/secure-methods.conf"
-    echo 'access_log /var/log/nginx/blocked.log combined if=$blocked;' >> "${SNIPPETS_DIR}/secure-methods.conf"
-    harden_sensitive_files
-    harden_rate_limit
-
-    auto_include_snippets
-
-    # ★ fail2ban 联动
-    configure_fail2ban
-
-    # 定义 blocked 变量并启用统一日志（覆盖写入，避免重复执行时 map 重复定义）
+ensure_blocked_map() {
+    # 定义 $blocked 条件变量（http 级别，覆盖写入避免重复定义）
     cat > "${CONF_D_DIR}/99-blocked-log.conf" <<'EOF'
 # 为阻断日志定义条件变量（默认开启）
 map $status $blocked {
@@ -315,33 +217,58 @@ map $status $blocked {
     503 1;
 }
 EOF
+    success "阻断日志条件变量 -> ${CONF_D_DIR}/99-blocked-log.conf"
+}
+
+# ── 一键全局基础加固 ──
+apply_all_hardening() {
+    backup_configs
+    harden_server_tokens
+    harden_security_headers
+    harden_permissions_policy
+    harden_buffers_timeouts
+    harden_sensitive_files
+    ensure_blocked_map
+    configure_fail2ban
 
     safe_reload
-    success "Nginx 加固 + fail2ban 联动全部完成！"
+    success "全局基础加固 + fail2ban 联动完成！"
+    echo ""
+    info "以下为站点相关项，本次未处理，留待按站点(WordPress/AList/图床等)单独配置："
+    echo "    - Content-Security-Policy (CSP)"
+    echo "    - HTTP 请求方法限制 (GET/HEAD/POST 严格模式 vs WebDAV 兼容)"
+    echo "    - 请求/连接限流 (limit_req / limit_conn)"
+    echo "    - secure-files.conf 的 include（屏蔽 .git/.env/.bak 等）"
 }
 
 # 撤销
 revert_hardening() {
-    confirm "移除所有加固配置并恢复备份？" || return
+    confirm "移除全局基础加固配置并恢复备份？" || return
     rm -f "${CONF_D_DIR}/90-security-tokens.conf" \
           "${CONF_D_DIR}/91-security-headers.conf" \
           "${CONF_D_DIR}/92-security-buffers.conf" \
-          "${CONF_D_DIR}/93-csp.conf" \
           "${CONF_D_DIR}/94-permissions-policy.conf" \
-          "${CONF_D_DIR}/95-rate-limit.conf" \
           "${CONF_D_DIR}/99-blocked-log.conf" \
-          "${SNIPPETS_DIR}/secure-methods.conf" \
-          "${SNIPPETS_DIR}/secure-files.conf" \
-          "${SNIPPETS_DIR}/rate-limit.conf"
+          "${SNIPPETS_DIR}/secure-files.conf"
     rm -f "${FAIL2BAN_FILTER}" "${FAIL2BAN_JAIL}"
-    systemctl stop fail2ban || true
-    info "已移除所有规则，fail2ban 已停止"
-    local latest=$(ls -1t "${BACKUP_DIR}"/nginx-backup-*.tar.gz 2>/dev/null | head -1)
+    if command -v fail2ban-server &>/dev/null && systemctl is-active --quiet fail2ban; then
+        systemctl reload fail2ban || systemctl restart fail2ban
+        info "已移除 nginx-harden 规则，fail2ban 已重新加载（其他 jail 不受影响）"
+    else
+        info "已移除 nginx-harden 规则（fail2ban 未运行，无需重载）"
+    fi
+    local latest
+    latest=$(ls -1t "${BACKUP_DIR}"/nginx-backup-*.tar.gz 2>/dev/null | head -1)
     if [[ -f "$latest" ]] && confirm "恢复备份 ${latest##*/}？"; then
         tar -xzf "$latest" -C /
         success "已恢复"
     fi
     safe_reload || true
+
+    if [[ -f "${SNIPPETS_DIR}/secure-files.conf.removed-notice" ]]; then
+        :
+    fi
+    warn "若曾手动在某些站点 server 块中 include secure-files.conf，该 include 行不会自动移除，请手动检查对应站点的 conf 文件，否则 reload 可能因找不到该文件而失败。"
 }
 
 # ── 命令行参数 ──
@@ -354,7 +281,7 @@ while [[ $# -gt 0 ]]; do
         -r|--revert) CMD="revert"; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
         -h|--help)
-            echo "用法: $0 [-a 全加固 | -f 仅部署fail2ban联动 | -r 撤销 | --dry-run 预览]"
+            echo "用法: $0 [-a 全局基础加固 | -f 仅部署fail2ban联动 | -r 撤销 | --dry-run 预览]"
             exit 0 ;;
         *) die "未知参数: $1" ;;
     esac
@@ -366,13 +293,14 @@ interactive_menu() {
         clear
         echo -e "${BOLD}${GREEN}"
         echo "  ╔════════════════════════════════════════════════╗"
-        echo "  ║        Nginx 安全加固 + fail2ban v3.0         ║"
+        echo "  ║     Nginx 全局基础加固 + fail2ban v4.0        ║"
+        echo "  ║     (CSP/方法限制/限流请按站点单独处理)        ║"
         echo "  ╚════════════════════════════════════════════════╝"
         echo -e "${NC}"
-        echo "  1) 一键协同加固 (推荐)"
+        echo "  1) 一键全局基础加固 (推荐)"
         echo "  2) 仅部署 fail2ban 联动规则"
-        echo "  3) 撤销所有加固及 fail2ban"
-        echo "  4) 精细配置 (版本头/方法/限流等)"
+        echo "  3) 撤销全局基础加固"
+        echo "  4) 精细配置 (单项执行)"
         echo "  5) 重载 Nginx"
         echo "  0) 退出"
         safe_read -r -p "选择: " choice
@@ -391,22 +319,24 @@ interactive_menu() {
 fine_tune_menu() {
     while true; do
         clear
-        echo -e "${CYAN}精细配置:${NC}"
-        echo "  1) 隐藏版本  2) 安全头  3) CSP/权限策略"
-        echo "  4) 请求方法  5) 缓冲区  6) 敏感文件"
-        echo "  7) 限流      8) 自动注入  9) fail2ban部署"
+        echo -e "${CYAN}精细配置（全局基础项）:${NC}"
+        echo "  1) 隐藏版本号 (server_tokens off)"
+        echo "  2) 安全响应头"
+        echo "  3) Permissions-Policy"
+        echo "  4) 缓冲区/超时/上传限制"
+        echo "  5) 生成敏感文件屏蔽 snippet (需手动 include)"
+        echo "  6) 定义 \$blocked 条件变量"
+        echo "  7) 部署 fail2ban 联动"
         echo "  0) 返回"
         safe_read -r -p "选择: " c
         case "$c" in
             1) harden_server_tokens; safe_reload ;;
             2) harden_security_headers; safe_reload ;;
-            3) harden_csp; harden_permissions_policy; safe_reload ;;
-            4) harden_http_methods ;;
-            5) harden_buffers_timeouts; safe_reload ;;
-            6) harden_sensitive_files ;;
-            7) harden_rate_limit ;;
-            8) auto_include_snippets; safe_reload ;;
-            9) configure_fail2ban ;;
+            3) harden_permissions_policy; safe_reload ;;
+            4) harden_buffers_timeouts; safe_reload ;;
+            5) harden_sensitive_files ;;
+            6) ensure_blocked_map; safe_reload ;;
+            7) configure_fail2ban ;;
             0) return ;;
             *) warn "无效" ;;
         esac
