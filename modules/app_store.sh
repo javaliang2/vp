@@ -19,6 +19,7 @@ declare -A APPS=(
     ["工具环境"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/huanjing.sh"
     ["远程文件传输"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/vps-rsync.sh"
     ["证书/代理/网站"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/nginx-gateway.sh"
+    ["nginx安全加固"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/nginx-harden.sh"
 )
 
 run_remote_app() {
