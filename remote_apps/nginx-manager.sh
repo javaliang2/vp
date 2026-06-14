@@ -1291,9 +1291,11 @@ site_add_acl() {
     echo -e "${CYAN}── 访问控制类型 ──${NC}"
     echo "  1) IP 白名单"
     echo "  2) IP 黑名单"
-    echo "  3) Basic Auth"
+    echo "  3) Basic Auth (账号密码)"
     echo "  4) IP 白名单 + Basic Auth"
-    safe_read -rp "选择 [1-4]: " _acl_type
+    echo "  5) 地区/国家 白名单 (仅允许特定国家)"
+    echo "  6) 地区/国家 黑名单 (拒绝特定国家)"
+    safe_read -rp "选择 [1-6]: " _acl_type
 
     local acl_conf_file="${NGINX_CONF_DIR}/conf.d/acl-${domain}.conf"
 
@@ -1302,12 +1304,13 @@ site_add_acl() {
             local -a ips=()
             local action="" default_action=""
             if [[ "${_acl_type}" == "1" ]]; then
-                action="1"; default_action="0"
+                action="0"; default_action="1" # 白名单: 默认拒绝(1), 名单内放行(0)
                 info "请逐行输入允许的 IP 或 CIDR，空行结束:"
             else
-                action="0"; default_action="1"
+                action="1"; default_action="0" # 黑名单: 默认放行(0), 名单内拒绝(1)
                 info "请逐行输入要拒绝的 IP 或 CIDR，空行结束:"
             fi
+            
             while true; do
                 local _ip=""
                 safe_read -rp "IP/CIDR: " _ip
@@ -1317,7 +1320,7 @@ site_add_acl() {
             [[ ${#ips[@]} -eq 0 ]] && die "至少输入一个 IP"
 
             {
-                echo "# ACL — 生成时间: $(date)"
+                echo "# IP ACL — 生成时间: $(date)"
                 echo "geo \$ip_blocked {"
                 echo "    default ${default_action};"
                 for ip in "${ips[@]}"; do
@@ -1330,11 +1333,7 @@ site_add_acl() {
             echo ""
             success "请将以下指令添加到站点 location / 块中："
             echo "────────────────────────────────"
-            if [[ "${_acl_type}" == "1" ]]; then
-                echo "    if (\$ip_blocked = 0) { return 403; }"
-            else
-                echo "    if (\$ip_blocked = 1) { return 403; }"
-            fi
+            echo "    if (\$ip_blocked = 1) { return 403; }"
             echo "────────────────────────────────"
             warn "请使用 $0 site edit ${domain} 打开编辑器添加上述指令"
             warn "并确认 nginx.conf 的 http{} 中已 include /etc/nginx/conf.d/*.conf"
@@ -1344,7 +1343,7 @@ site_add_acl() {
             command -v htpasswd &>/dev/null \
                 || install_pkg apache2-utils 2>/dev/null \
                 || install_pkg httpd-tools 2>/dev/null \
-                || die "无法安装 htpasswd，请手动安装 apache2-utils"
+                || die "无法安装 htpasswd，请手动安装 apache2-utils/httpd-tools"
 
             local auth_file="${NGINX_CONF_DIR}/.htpasswd-${domain}"
             local username=""
@@ -1383,8 +1382,101 @@ site_add_acl() {
             echo "────────────────────────────────"
             warn "使用 $0 site edit ${domain} 打开编辑器添加"
             ;;
+
+        5|6)
+            local -a countries=()
+            local action="" default_action=""
+
+            if [[ "${_acl_type}" == "5" ]]; then
+                action="0"; default_action="1" # 白名单: 默认拒绝(1), 匹配放行(0)
+                info "请逐行输入允许访问的国家代码 (ISO标准 两位字母, 如 CN, US)，空行结束:"
+            else
+                action="1"; default_action="0" # 黑名单: 默认放行(0), 匹配拒绝(1)
+                info "请逐行输入要拒绝访问的国家代码 (ISO标准 两位字母, 如 CN, US)，空行结束:"
+            fi
+
+            while true; do
+                local _cc=""
+                safe_read -rp "国家代码: " _cc
+                [[ -z "$_cc" ]] && break
+                # 自动将输入转换为大写字母
+                countries+=("$(echo "$_cc" | tr '[:lower:]' '[:upper:]')")
+            done
+            [[ ${#countries[@]} -eq 0 ]] && die "至少输入一个国家代码"
+
+            # 询问是否使用 Cloudflare，以决定使用哪个 Nginx 变量
+            local geo_var="\$geoip2_data_country_iso_code"
+            safe_read -rp "该站点是否使用了 Cloudflare 代理? (y/n) [n]: " _use_cf
+            if [[ "${_use_cf,,}" == "y" || "${_use_cf,,}" == "yes" ]]; then
+                geo_var="\$http_cf_ipcountry"
+            fi
+
+            {
+                echo "# 地区 ACL — 生成时间: $(date)"
+                echo "# 变量使用: ${geo_var}"
+                echo "map ${geo_var} \$country_blocked {"
+                echo "    default ${default_action};"
+                for cc in "${countries[@]}"; do
+                    echo "    ${cc} ${action};"
+                done
+                echo "}"
+            } > "$acl_conf_file"
+            success "地区 ACL map 规则写入: $acl_conf_file"
+
+            echo ""
+            success "请将以下指令添加到站点 location / 块中："
+            echo "────────────────────────────────"
+            echo "    if (\$country_blocked = 1) { return 403; }"
+            echo "────────────────────────────────"
+            warn "请使用 $0 site edit ${domain} 打开编辑器添加上述指令"
+            
+            if [[ "$geo_var" == "\$geoip2_data_country_iso_code" ]]; then
+                warn "注意: 未使用 Cloudflare 的站点，需要确保你的 Nginx 已安装并配置好了 geoip2 模块，否则会报错！"
+            fi
+            ;;
+
         *) die "无效选项" ;;
     esac
+}
+
+site_remove_acl() {
+    require_root; init_dirs
+
+    local domain=""
+    safe_read -rp "要解除访问控制的域名: " domain
+    [[ -z "$domain" ]] && die "域名不能为空"
+
+    local acl_conf_file="${NGINX_CONF_DIR}/conf.d/acl-${domain}.conf"
+    local auth_file="${NGINX_CONF_DIR}/.htpasswd-${domain}"
+    local removed=0
+
+    echo -e "${CYAN}── 开始清理 ${domain} 的限制 ──${NC}"
+
+    if [[ -f "$acl_conf_file" ]]; then
+        rm -f "$acl_conf_file"
+        success "已删除 IP/地区 配置文件: $acl_conf_file"
+        removed=1
+    fi
+
+    if [[ -f "$auth_file" ]]; then
+        rm -f "$auth_file"
+        success "已删除 Basic Auth 密码文件: $auth_file"
+        removed=1
+    fi
+
+    if [[ $removed -eq 1 ]]; then
+        echo ""
+        warn "系统层面的配置文件已清理，但仍需你手动去除 Nginx 里的指令："
+        warn "1. 使用 $0 site edit ${domain} 编辑该站点的配置文件。"
+        warn "2. 删掉 location / 块中以前手动添加的以下指令 (如果存在)："
+        warn "   - if (\$ip_blocked = 1) { return 403; }"
+        warn "   - if (\$country_blocked = 1) { return 403; }"
+        warn "   - auth_basic 相关的两行指令"
+        warn "   - allow xxx / deny all"
+        warn "3. 确保无误后，重新加载 Nginx (例如: systemctl reload nginx)。"
+    else
+        info "未在系统中找到与域名 ${domain} 相关的 ACL 配置或密码文件。"
+    fi
 }
 
 # ──────────────────────────────────────────────────────────
