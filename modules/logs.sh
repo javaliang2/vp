@@ -1,5 +1,5 @@
 #!/bin/bash
-# 日志查看与分析模块
+# 日志查看与分析 + 深度清理模块（融合版）
 
 if [ -z "$VPS_COMMON_LOADED" ]; then
     source /usr/local/share/vn_modules/common.sh 2>/dev/null || {
@@ -22,7 +22,6 @@ FAIL2BAN_LOG="/var/log/fail2ban.log"
 
 # ── 工具函数 ─────────────────────────────────────────────────
 
-# 检查 root 权限
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
         printf "${RED}此操作需要 root 权限${NC}\n"
@@ -32,7 +31,6 @@ require_root() {
     return 0
 }
 
-# 显示日志文件内容（最后 100 行）
 view_log() {
     local file="$1" title="$2"
     if [ ! -f "$file" ]; then
@@ -49,7 +47,6 @@ view_log() {
     read -p "按回车键继续..." dummy
 }
 
-# 实时跟踪日志
 tail_follow() {
     local file="$1"
     if [ ! -f "$file" ]; then
@@ -64,7 +61,6 @@ tail_follow() {
     read -p "已退出跟踪，按回车键继续..." dummy
 }
 
-# 按关键字搜索
 search_log() {
     local file="$1"
     if [ ! -f "$file" ]; then
@@ -81,58 +77,92 @@ search_log() {
     read -p "按回车键继续..." dummy
 }
 
-# 立即清理日志
-clean_logs_now() {
+# ── 深度清理（融合第二个脚本的全部逻辑）─────────────────────
+deep_clean() {
     require_root || return
-    local targets=("$AUTH_LOG" "$SYS_LOG" "$KERN_LOG")
-    [ -f "$FAIL2BAN_LOG" ] && targets+=("$FAIL2BAN_LOG")
 
-    printf "${RED}⚠ 以下日志文件内容将被清空:${NC}\n"
-    for f in "${targets[@]}"; do
-        printf "  %s\n" "$f"
-    done
-    echo ""
-    read -p "确认清空以上所有日志？[y/N]: " confirm
-    if [[ $confirm =~ ^[Yy]$ ]]; then
-        local failed=0
-        for f in "${targets[@]}"; do
-            if [ -f "$f" ]; then
-                if : > "$f" 2>/dev/null; then
-                    printf "${GREEN}  已清空: %s${NC}\n" "$f"
-                else
-                    printf "${RED}  清空失败: %s${NC}\n" "$f"
-                    failed=1
-                fi
-            fi
-        done
-        [ "$failed" -eq 0 ] && printf "\n${GREEN}所有日志已清空。${NC}\n" \
-                             || printf "\n${RED}部分日志清空失败，请检查权限。${NC}\n"
-    else
-        printf "已取消。\n"
-    fi
+    printf "${BLUE}执行时间: %s${NC}\n" "$(date "+%Y-%m-%d %H:%M:%S")"
+    echo "=================================================="
+
+    echo "-> 清理前，占用空间最大的 5 个日志文件："
+    du -sh /var/log/* /var/lib/docker/containers/*/*-json.log 2>/dev/null | sort -rh | head -n 5
+    echo "--------------------------------------------------"
+
+    # 清理 Systemd Journal
+    echo "-> 正在清理 journal 日志 (保留 100MB)..."
+    journalctl --vacuum-size=100M >/dev/null 2>&1
+
+    # 删除旧的轮转日志
+    echo "-> 正在删除旧的轮转日志 (*.gz, *.1)..."
+    rm -f /var/log/*.gz /var/log/*.1
+
+    # 抽干系统日志
+    echo "-> 正在抽干活动系统日志..."
+    truncate -s 0 "$SYS_LOG" 2>/dev/null
+    truncate -s 0 "$KERN_LOG" 2>/dev/null
+    truncate -s 0 "$AUTH_LOG" 2>/dev/null
+    truncate -s 0 /var/log/ufw.log 2>/dev/null
+    [ -f "$FAIL2BAN_LOG" ] && truncate -s 0 "$FAIL2BAN_LOG" 2>/dev/null
+
+    # 抽干 Docker 容器日志
+    echo "-> 正在抽干 Docker 容器日志..."
+    truncate -s 0 /var/lib/docker/containers/*/*-json.log 2>/dev/null
+
+    # 清除 APT 缓存
+    echo "-> 正在清理 APT 缓存..."
+    apt-get clean
+
+    # 清理 /tmp 下旧临时文件
+    echo "-> 正在清理 /tmp 目录下的旧临时文件..."
+    find /tmp -type f -mtime +3 -delete
+
+    echo "--------------------------------------------------"
+    echo "-> 清理完成！当前系统根目录磁盘占用："
+    df -h / | awk 'NR==2 {print "总大小: "$2" | 已用: "$3" | 可用: "$4" | 使用率: "$5}'
+    echo "=================================================="
+
     read -p "按回车键继续..." dummy
 }
 
-# ── 定时清理日志 ──────────────────────────────────────────────
-
-# 生成清理脚本内容
+# ── 定时清理日志（升级为全自动深度清理）─────────────
 _gen_clean_script() {
     local targets=("$AUTH_LOG" "$SYS_LOG" "$KERN_LOG")
     [ -f "$FAIL2BAN_LOG" ] && targets+=("$FAIL2BAN_LOG")
 
     cat <<SCRIPT
 #!/bin/bash
-# 由 log_manager.sh 自动生成 —— 定时清理日志
+# 由 log_manager.sh 自动生成 —— 定时深度清理日志
+
+# 1. 抽干传统系统日志
 for f in ${targets[*]}; do
-    [ -f "\$f" ] && : > "\$f"
+    [ -f "\$f" ] && truncate -s 0 "\$f" 2>/dev/null
 done
+[ -f /var/log/ufw.log ] && truncate -s 0 /var/log/ufw.log 2>/dev/null
+
+# 2. 清理 Systemd Journal 日志
+journalctl --vacuum-size=100M >/dev/null 2>&1
+
+# 3. 删除旧的轮转日志
+rm -f /var/log/*.gz /var/log/*.1
+
+# 4. 抽干 Docker 容器日志
+truncate -s 0 /var/lib/docker/containers/*/*-json.log 2>/dev/null
+
+# 5. 清理包管理缓存 (兼容 Debian/Ubuntu 和 CentOS/RHEL)
+if command -v apt-get >/dev/null 2>&1; then
+    apt-get clean
+elif command -v yum >/dev/null 2>&1; then
+    yum clean all
+fi
+
+# 6. 清理 /tmp 下的旧临时文件
+find /tmp -type f -mtime +3 -delete
 SCRIPT
 }
 
 CRON_SCRIPT="/usr/local/bin/vn_clean_logs.sh"
 CRON_TAG="# vn_log_manager_clean"
 
-# 设置定时清理
 setup_cron_clean() {
     require_root || return
 
@@ -162,10 +192,8 @@ setup_cron_clean() {
         *) printf "${RED}无效选项${NC}\n"; read -p "按回车键继续..." dummy; return ;;
     esac
 
-    # 写入清理脚本
     _gen_clean_script > "$CRON_SCRIPT" && chmod +x "$CRON_SCRIPT"
 
-    # 先移除旧任务，再写入新任务
     ( crontab -l 2>/dev/null | grep -v "$CRON_TAG" ; \
       echo "$cron_time $CRON_SCRIPT $CRON_TAG" ) | crontab -
 
@@ -174,7 +202,6 @@ setup_cron_clean() {
     read -p "按回车键继续..." dummy
 }
 
-# 查看当前定时任务
 view_cron_clean() {
     echo ""
     local entry
@@ -189,7 +216,6 @@ view_cron_clean() {
     read -p "按回车键继续..." dummy
 }
 
-# 取消定时任务
 remove_cron_clean() {
     require_root || return
     if crontab -l 2>/dev/null | grep -q "$CRON_TAG"; then
@@ -202,7 +228,6 @@ remove_cron_clean() {
     read -p "按回车键继续..." dummy
 }
 
-# 定时清理子菜单
 menu_cron_clean() {
     while true; do
         clear
@@ -233,8 +258,8 @@ while true; do
     echo ""
     echo "5. 实时跟踪日志"
     echo "6. 搜索日志关键词"
-    echo "7. 立即清空所有日志"
-    echo "8. 定时清理日志"
+    echo "7. 深度清理系统（日志+缓存+临时文件）"   # 替换为深度清理
+    echo "8. 定时清理日志"                         # 保留简单的定时清理
     echo "0. 返回主菜单"
     read -p "请选择: " choice
 
@@ -261,7 +286,6 @@ while true; do
             fi
             ;;
         5)
-            # 实时跟踪：让用户选择目标文件
             clear
             printf "${BLUE}===== 实时跟踪 =====${NC}\n"
             echo "1. 认证日志"
@@ -301,7 +325,7 @@ while true; do
                 *) printf "${RED}无效选项${NC}\n"; sleep 1 ;;
             esac
             ;;
-        7) clean_logs_now ;;
+        7) deep_clean ;;          # 调用融合后的深度清理
         8) menu_cron_clean ;;
         0) break ;;
         *) printf "${RED}无效选项${NC}\n"; sleep 1 ;;
