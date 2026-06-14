@@ -1856,7 +1856,8 @@ interactive_menu() {
         echo -e " ${CYAN}── Nginx ──${NC}"
         echo " 23) 重载配置"
         echo " 24) 重启 Nginx"
-        echo " 25) 查看状态"
+        echo " 25) 解除限制访问"
+        echo " 26) 查看状态"
         echo "  0) 退出"
         echo ""
         safe_read -rp "请选择 [0-25]: " choice
@@ -1892,7 +1893,8 @@ interactive_menu() {
             22) config_backup_list; safe_read -rp "按回车继续..." _ ;;
             23) nginx_reload ;;
             24) nginx_restart ;;
-            25) nginx_status; safe_read -rp "按回车继续..." _ ;;
+            25) site_remove_acl ;;
+            26) nginx_status; safe_read -rp "按回车继续..." _ ;;
              0) echo "再见！"; exit 0 ;;
              *) warn "无效选项，请重试" ;;
         esac
