@@ -19,6 +19,8 @@ WEBROOT_BASE="${WEBROOT_BASE:-/var/www}"
 LE_CERT_BASE="/etc/letsencrypt/live"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/nginx-gateway}"
 LOG_FILE="/var/log/nginx-gateway.log"
+SNIPPET_DIR="${NGINX_CONF_DIR}/snippets"
+mkdir -p "$SNIPPET_DIR"
 
 # ──────────────────────────────────────────────────────────
 # 颜色 & 日志工具
