@@ -1300,7 +1300,7 @@ site_add_acl() {
     safe_read -rp "选择 [1-6]: " _acl_type
 
     local acl_conf_file="${NGINX_CONF_DIR}/conf.d/acl-${domain}.conf"
-    local snippet_file="${NGINX_CONF_DIR}/conf.d/acl-location-${domain}.conf"
+    local snippet_file="${SNIPPET_DIR}/acl-location-${domain}.conf"
 
     case "${_acl_type:-1}" in
         1|2)
