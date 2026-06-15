@@ -1480,17 +1480,45 @@ site_remove_acl() {
     [[ -z "$domain" ]] && die "域名不能为空"
 
     local acl_conf_file="${NGINX_CONF_DIR}/conf.d/acl-${domain}.conf"
+    local snippet_file="${NGINX_CONF_DIR}/conf.d/acl-location-${domain}.conf"
     local auth_file="${NGINX_CONF_DIR}/.htpasswd-${domain}"
     local removed=0
 
     echo -e "${CYAN}── 开始清理 ${domain} 的限制 ──${NC}"
 
+    # 删除 geo/map 文件
     if [[ -f "$acl_conf_file" ]]; then
         rm -f "$acl_conf_file"
-        success "已删除 IP/地区 配置文件: $acl_conf_file"
+        success "已删除 geo/map 配置文件: $acl_conf_file"
         removed=1
     fi
 
+    # 删除 snippet 文件
+    if [[ -f "$snippet_file" ]]; then
+        rm -f "$snippet_file"
+        success "已删除 location 片段文件: $snippet_file"
+        removed=1
+    fi
+
+    # 从站点配置中移除 include 指令
+    local conf=""
+    for candidate in "${SITES_AVAILABLE}/${domain}.conf" "${SITES_AVAILABLE}/${domain}-redirect.conf"; do
+        if [[ -f "$candidate" ]] && grep -qF "include ${snippet_file};" "$candidate"; then
+            conf="$candidate"
+            break
+        fi
+    done
+
+    if [[ -n "$conf" ]]; then
+        # 删除包含 include snippet 的整行（忽略缩进）
+        sed -i "\|include ${snippet_file};|d" "$conf"
+        success "已从 ${conf} 中移除 include 指令"
+        removed=1
+    else
+        warn "未在站点配置中找到 include 指令，若之前手动添加请自行清理"
+    fi
+
+    # 删除 Basic Auth 密码文件
     if [[ -f "$auth_file" ]]; then
         rm -f "$auth_file"
         success "已删除 Basic Auth 密码文件: $auth_file"
@@ -1498,17 +1526,15 @@ site_remove_acl() {
     fi
 
     if [[ $removed -eq 1 ]]; then
-        echo ""
-        warn "系统层面的配置文件已清理，但仍需你手动去除 Nginx 里的指令："
-        warn "1. 使用 $0 site edit ${domain} 编辑该站点的配置文件。"
-        warn "2. 删掉 location / 块中以前手动添加的以下指令 (如果存在)："
-        warn "   - if (\$ip_blocked = 1) { return 403; }"
-        warn "   - if (\$country_blocked = 1) { return 403; }"
-        warn "   - auth_basic 相关的两行指令"
-        warn "   - allow xxx / deny all"
-        warn "3. 确保无误后，重新加载 Nginx (例如: systemctl reload nginx)。"
+        # 测试并重载
+        if nginx -t; then
+            systemctl reload nginx
+            success "Nginx 配置已通过测试并重载，访问控制已完全解除"
+        else
+            die "Nginx 配置测试失败，请检查并手动修复！"
+        fi
     else
-        info "未在系统中找到与域名 ${domain} 相关的 ACL 配置或密码文件。"
+        info "未在系统中找到与域名 ${domain} 相关的 ACL 配置、片段或密码文件。"
     fi
 }
 
