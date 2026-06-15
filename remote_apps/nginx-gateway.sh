@@ -1298,16 +1298,17 @@ site_add_acl() {
     safe_read -rp "选择 [1-6]: " _acl_type
 
     local acl_conf_file="${NGINX_CONF_DIR}/conf.d/acl-${domain}.conf"
+    local snippet_file="${NGINX_CONF_DIR}/conf.d/acl-location-${domain}.conf"
 
     case "${_acl_type:-1}" in
         1|2)
             local -a ips=()
             local action="" default_action=""
             if [[ "${_acl_type}" == "1" ]]; then
-                action="0"; default_action="1" # 白名单: 默认拒绝(1), 名单内放行(0)
+                action="0"; default_action="1"
                 info "请逐行输入允许的 IP 或 CIDR，空行结束:"
             else
-                action="1"; default_action="0" # 黑名单: 默认放行(0), 名单内拒绝(1)
+                action="1"; default_action="0"
                 info "请逐行输入要拒绝的 IP 或 CIDR，空行结束:"
             fi
             
@@ -1319,6 +1320,7 @@ site_add_acl() {
             done
             [[ ${#ips[@]} -eq 0 ]] && die "至少输入一个 IP"
 
+            # 生成 geo 文件
             {
                 echo "# IP ACL — 生成时间: $(date)"
                 echo "geo \$ip_blocked {"
@@ -1330,13 +1332,11 @@ site_add_acl() {
             } > "$acl_conf_file"
             success "ACL geo 规则写入: $acl_conf_file"
 
-            echo ""
-            success "请将以下指令添加到站点 location / 块中："
-            echo "────────────────────────────────"
-            echo "    if (\$ip_blocked = 1) { return 403; }"
-            echo "────────────────────────────────"
-            warn "请使用 $0 site edit ${domain} 打开编辑器添加上述指令"
-            warn "并确认 nginx.conf 的 http{} 中已 include /etc/nginx/conf.d/*.conf"
+            # 生成 location snippet
+            echo "if (\$ip_blocked = 1) { return 403; }" > "$snippet_file"
+
+            # 自动注入 include
+            _acl_inject_include "$conf" "$snippet_file"
             ;;
 
         3|4)
@@ -1358,7 +1358,8 @@ site_add_acl() {
             chmod 640 "$auth_file"
             success "密码文件已更新: $auth_file"
 
-            local -a snippet=()
+            # 生成 location snippet
+            > "$snippet_file"
             if [[ "${_acl_type}" == "4" ]]; then
                 local -a ips=()
                 info "请逐行输入允许的 IP 或 CIDR，空行结束:"
@@ -1366,21 +1367,18 @@ site_add_acl() {
                     local _ip=""
                     safe_read -rp "IP/CIDR: " _ip
                     [[ -z "$_ip" ]] && break
-                    ips+=("    allow ${_ip};")
+                    echo "    allow ${_ip};" >> "$snippet_file"
                 done
-                snippet+=("${ips[@]}" "    deny all;")
+                echo "    deny all;" >> "$snippet_file"
             fi
-            snippet+=(
-                "    auth_basic \"Restricted\";"
-                "    auth_basic_user_file ${auth_file};"
-            )
+            cat >> "$snippet_file" <<EOF
+    auth_basic "Restricted";
+    auth_basic_user_file ${auth_file};
+EOF
+            success "Basic Auth 规则已生成: $snippet_file"
 
-            echo ""
-            success "请将以下指令添加到站点 location / 块中："
-            echo "────────────────────────────────"
-            printf '%s\n' "${snippet[@]}"
-            echo "────────────────────────────────"
-            warn "使用 $0 site edit ${domain} 打开编辑器添加"
+            # 自动注入 include
+            _acl_inject_include "$conf" "$snippet_file"
             ;;
 
         5|6)
@@ -1388,10 +1386,10 @@ site_add_acl() {
             local action="" default_action=""
 
             if [[ "${_acl_type}" == "5" ]]; then
-                action="0"; default_action="1" # 白名单: 默认拒绝(1), 匹配放行(0)
+                action="0"; default_action="1"
                 info "请逐行输入允许访问的国家代码 (ISO标准 两位字母, 如 CN, US)，空行结束:"
             else
-                action="1"; default_action="0" # 黑名单: 默认放行(0), 匹配拒绝(1)
+                action="1"; default_action="0"
                 info "请逐行输入要拒绝访问的国家代码 (ISO标准 两位字母, 如 CN, US)，空行结束:"
             fi
 
@@ -1399,18 +1397,17 @@ site_add_acl() {
                 local _cc=""
                 safe_read -rp "国家代码: " _cc
                 [[ -z "$_cc" ]] && break
-                # 自动将输入转换为大写字母
                 countries+=("$(echo "$_cc" | tr '[:lower:]' '[:upper:]')")
             done
             [[ ${#countries[@]} -eq 0 ]] && die "至少输入一个国家代码"
 
-            # 询问是否使用 Cloudflare，以决定使用哪个 Nginx 变量
             local geo_var="\$geoip2_data_country_iso_code"
             safe_read -rp "该站点是否使用了 Cloudflare 代理? (y/n) [n]: " _use_cf
             if [[ "${_use_cf,,}" == "y" || "${_use_cf,,}" == "yes" ]]; then
                 geo_var="\$http_cf_ipcountry"
             fi
 
+            # 生成 map 文件
             {
                 echo "# 地区 ACL — 生成时间: $(date)"
                 echo "# 变量使用: ${geo_var}"
@@ -1423,20 +1420,56 @@ site_add_acl() {
             } > "$acl_conf_file"
             success "地区 ACL map 规则写入: $acl_conf_file"
 
-            echo ""
-            success "请将以下指令添加到站点 location / 块中："
-            echo "────────────────────────────────"
-            echo "    if (\$country_blocked = 1) { return 403; }"
-            echo "────────────────────────────────"
-            warn "请使用 $0 site edit ${domain} 打开编辑器添加上述指令"
-            
+            # 生成 location snippet
+            echo "if (\$country_blocked = 1) { return 403; }" > "$snippet_file"
+
+            # 自动注入 include
+            _acl_inject_include "$conf" "$snippet_file"
+
             if [[ "$geo_var" == "\$geoip2_data_country_iso_code" ]]; then
-                warn "注意: 未使用 Cloudflare 的站点，需要确保你的 Nginx 已安装并配置好了 geoip2 模块，否则会报错！"
+                warn "注意: 未使用 Cloudflare 的站点，需要确保你的 Nginx 已安装并配置好 geoip2 模块，否则会报错！"
             fi
             ;;
 
         *) die "无效选项" ;;
     esac
+
+    # 测试配置并重载
+    if nginx -t; then
+        systemctl reload nginx
+        success "Nginx 配置测试通过并已重载，ACL 生效"
+    else
+        die "Nginx 配置测试失败！请检查配置文件"
+    fi
+}
+
+# -------------------------------------------------------------------
+# 辅助函数：将 include 指令注入到站点的 location / 块中
+# 参数: $1 = 站点配置文件路径
+#       $2 = 要 include 的 snippet 文件路径
+# -------------------------------------------------------------------
+_acl_inject_include() {
+    local conf="$1"
+    local snippet="$2"
+    local marker="include ${snippet};"
+
+    # 防止重复注入
+    if grep -qF "$marker" "$conf"; then
+        info "include 指令已存在，跳过注入"
+        return
+    fi
+
+    # 在第一个 location / 块中插入 include
+    if grep -q 'location\s*/\s*{' "$conf"; then
+        # 使用 sed 在第一个匹配行的下一行插入，并添加缩进
+        sed -i "0,/location\s*\/\s*{/ s//&\n    ${marker//\//\\/}/" "$conf"
+        success "已将 include 指令注入到 location / 块"
+    else
+        # 如果没有 location /，则在 server 块的末尾前插入一个完整的 location / 块
+        # 这里假设配置文件中只有一个 server { }，且 } 是 server 的结束符
+        sed -i '/^}/i\    location / {\n        '"${marker//\//\\/}"'\n    }' "$conf"
+        success "未找到 location /，已在 server 块中自动创建并注入 include"
+    fi
 }
 
 site_remove_acl() {
