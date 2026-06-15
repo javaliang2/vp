@@ -1482,7 +1482,8 @@ site_remove_acl() {
     [[ -z "$domain" ]] && die "域名不能为空"
 
     local acl_conf_file="${NGINX_CONF_DIR}/conf.d/acl-${domain}.conf"
-    local snippet_file="${NGINX_CONF_DIR}/conf.d/acl-location-${domain}.conf"
+    local snippet_file="${NGINX_CONF_DIR}/snippets/acl-location-${domain}.conf"
+    local old_snippet_file="${NGINX_CONF_DIR}/conf.d/acl-location-${domain}.conf"   # 兼容旧版路径
     local auth_file="${NGINX_CONF_DIR}/.htpasswd-${domain}"
     local removed=0
 
@@ -1495,25 +1496,30 @@ site_remove_acl() {
         removed=1
     fi
 
-    # 删除 snippet 文件
-    if [[ -f "$snippet_file" ]]; then
-        rm -f "$snippet_file"
-        success "已删除 location 片段文件: $snippet_file"
-        removed=1
-    fi
+    # 删除 snippet 文件（新路径 + 兼容旧路径）
+    for f in "$snippet_file" "$old_snippet_file"; do
+        if [[ -f "$f" ]]; then
+            rm -f "$f"
+            success "已删除 location 片段文件: $f"
+            removed=1
+        fi
+    done
 
-    # 从站点配置中移除 include 指令
+    # 从站点配置中移除 include 指令（新旧路径都处理）
     local conf=""
     for candidate in "${SITES_AVAILABLE}/${domain}.conf" "${SITES_AVAILABLE}/${domain}-redirect.conf"; do
-        if [[ -f "$candidate" ]] && grep -qF "include ${snippet_file};" "$candidate"; then
-            conf="$candidate"
-            break
+        if [[ -f "$candidate" ]]; then
+            if grep -qF "include ${snippet_file};" "$candidate" || grep -qF "include ${old_snippet_file};" "$candidate"; then
+                conf="$candidate"
+                break
+            fi
         fi
     done
 
     if [[ -n "$conf" ]]; then
-        # 删除包含 include snippet 的整行（忽略缩进）
+        # 删除包含对应 include 的行（新旧路径）
         sed -i "\|include ${snippet_file};|d" "$conf"
+        sed -i "\|include ${old_snippet_file};|d" "$conf"
         success "已从 ${conf} 中移除 include 指令"
         removed=1
     else
@@ -1528,7 +1534,6 @@ site_remove_acl() {
     fi
 
     if [[ $removed -eq 1 ]]; then
-        # 测试并重载
         if nginx -t; then
             systemctl reload nginx
             success "Nginx 配置已通过测试并重载，访问控制已完全解除"
