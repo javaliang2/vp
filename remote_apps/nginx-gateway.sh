@@ -1482,7 +1482,7 @@ site_remove_acl() {
     [[ -z "$domain" ]] && die "域名不能为空"
 
     local acl_conf_file="${NGINX_CONF_DIR}/conf.d/acl-${domain}.conf"
-    local snippet_file="${NGINX_CONF_DIR}/snippets/acl-location-${domain}.conf"
+    local snippet_file="${SNIPPET_DIR}/acl-location-${domain}.conf"
     local old_snippet_file="${NGINX_CONF_DIR}/conf.d/acl-location-${domain}.conf"   # 兼容旧版路径
     local auth_file="${NGINX_CONF_DIR}/.htpasswd-${domain}"
     local removed=0
