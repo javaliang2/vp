@@ -104,6 +104,7 @@ ensure_ssh_key() {
 ALL_APPS=(
     wordpress nextcloud gitea uptime-kuma portainer
     phpmyadmin redis-commander minio lskypro easyimage alist
+    sunpanel vaultwarden emby
 )
 
 declare -A APP_DESC=(
