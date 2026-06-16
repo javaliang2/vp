@@ -118,12 +118,16 @@ declare -A APP_DESC=(
     [lskypro]="Lsky Pro           兰空图床（含 MariaDB）"
     [easyimage]="EasyImage          轻量图床"
     [alist]="AList              多存储文件列表/网盘挂载"
+    [sunpanel]="Sun-Panel          个人豪华版导航页"
+    [vaultwarden]="Vaultwarden        轻量级密码管理器"
+    [emby]="Emby Server       多媒体服务器（视频海报墙）"
 )
 
 declare -A APP_DEFAULT_PORT=(
     [wordpress]=8080 [nextcloud]=8081 [gitea]=3000 [uptime-kuma]=3001
     [portainer]=9000 [phpmyadmin]=8082 [redis-commander]=8083
     [minio]=9001 [lskypro]=8085 [easyimage]=8086 [alist]=5244
+    [sunpanel]=3002 [vaultwarden]=8099 [emby]=8096
 )
 
 get_instance_url() {
