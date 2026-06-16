@@ -2595,21 +2595,13 @@ main() {
                 [[ -z "$host_port" ]] && host_port=$(find_free_port "${APP_DEFAULT_PORT[$app]:-8080}")
                 ensure_docker
                 case "$app" in
-                    wordpress)       deploy_wordpress       "$inst_dir" "$host_port" ;;
-                    nextcloud)       deploy_nextcloud       "$inst_dir" "$host_port" ;;
-                    gitea)           deploy_gitea           "$inst_dir" "$host_port" ;;
-                    uptime-kuma)     deploy_uptime_kuma     "$inst_dir" "$host_port" ;;
-                    portainer)       deploy_portainer       "$inst_dir" "$host_port" ;;
-                    phpmyadmin)      deploy_phpmyadmin      "$inst_dir" "$host_port" ;;
-                    redis-commander) deploy_redis_commander "$inst_dir" "$host_port" ;;
-                    minio)           deploy_minio           "$inst_dir" "$host_port" ;;
-                    lskypro)         deploy_lskypro         "$inst_dir" "$host_port" ;;
-                    easyimage)       deploy_easyimage       "$inst_dir" "$host_port" ;;
-                    alist)           deploy_alist           "$inst_dir" "$host_port" ;;
-                    sunpanel)        deploy_sunpanel        "$inst_dir" "$host_port" ;;
-                    vaultwarden)     deploy_vaultwarden     "$inst_dir" "$host_port" ;;
-                    emby)            deploy_emby            "$inst_dir" "$host_port" ;;
-                    *)               error "未知应用: $app" ;;
+                    local fn="deploy_${app//-/_}"
+                    if declare -f "$fn" > /dev/null 2>&1; then
+                        load_app "$app"
+                        "$fn" "$inst_dir" "$host_port"
+                    else
+                        error "未知应用: $app"
+                    fi
                 esac; exit 0 ;;
             --uninstall) [[ -z "${2:-}" ]] && error "请指定目录"; uninstall_app "$2"; exit 0 ;;
             --backup)
