@@ -6,29 +6,7 @@
 #        Lsky Pro / EasyImage / AList
 #  支持多实例：通过 --deploy APP --instance NAME 或交互菜单指定
 #  用法：sudo bash setup-docker-apps.sh [选项]
-# ------------------------------------------------------------
-#  修复记录（原版）：
-#  [1] set -euo pipefail：补加 -e，命令失败立即退出
-#  [2] net_name()：修复原函数两行输出 bug
-#  [3] find_free_port：改用 find 替代 glob
-#  [4] Portainer HTTPS 端口：改用 find_free_port 动态分配
-#  [5] Gitea SSH 端口：改用 find_free_port
-#  [6] backup_app：停止失败时显式警告
-#  [7] print_summary：从 .env 读取实际端口
-#  [8] check_system：改为检测 apt-get
-#  [9] randpw：改用 dd 替代 head -c
-#  ──────────────────────────────────────────────────────────
-#  新增功能：
-#  [10] backup_app：支持推送到远程服务器（rsync+SSH+自动公钥）
-#                   本地/远程各自保留最近 10 份，自动轮转清理
-#  [11] restore_app：从本地 tar.gz 备份文件完整还原实例
-#                    支持覆盖保护（先备份现有 → 再覆盖 / 直接覆盖 / 取消）
-#  [12] _restore_from_local：交互式选择本地备份文件还原
-#  [13] _restore_from_remote：从远程服务器列出并拉取备份后还原
-#  [14] menu_restore_app（菜单项 16）：还原交互菜单
-#  [15] CLI --restore / --restore --remote：命令行还原入口
-#  [16] 备份目录统一改为 /var/backups/docker-apps
-# ============================================================
+# ----------------------------------------------------------
 
 set -euo pipefail
 
