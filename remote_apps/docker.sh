@@ -1115,7 +1115,7 @@ restore_app() {
         case "${overwrite_choice,,}" in
             a)
                 info "备份现有实例..."
-                local existing_bak="${BACKUP_LOCAL_DIR}/${top_dir}_pre_restore_${timestamp:-$(date +%Y%m%d_%H%M%S)}.tar.gz"
+                local existing_bak="${BACKUP_LOCAL_DIR}/${top_dir}_pre_restore_$(date +%Y%m%d_%H%M%S).tar.gz"
                 tar -czf "$existing_bak" -C "$(dirname "$restore_dir")" "$(basename "$restore_dir")" \
                     && log "现有实例已备份到：$existing_bak" \
                     || { warn "备份失败，还原中止"; return 1; }
