@@ -2587,22 +2587,21 @@ main() {
                 [[ -z "${2:-}" ]] && error "请指定应用名称"
                 local app="$2" inst_name="" host_port=""; shift 2
                 while [[ $# -gt 0 ]]; do
-                    case "$1" in --instance) inst_name="$2"; shift 2 ;; --port) host_port="$2"; shift 2 ;;
-                    *) error "未知参数: $1" ;; esac
+                    case "$1" in
+                        --instance) inst_name="$2"; shift 2 ;;
+                        --port)     host_port="$2"; shift 2 ;;
+                        *)          error "未知参数: $1" ;;
+                    esac
                 done
                 local inst_dir
                 [[ -n "$inst_name" ]] && inst_dir="$BASE_DIR/${app}__${inst_name}" || inst_dir="$BASE_DIR/$app"
                 [[ -z "$host_port" ]] && host_port=$(find_free_port "${APP_DEFAULT_PORT[$app]:-8080}")
                 ensure_docker
-                case "$app" in
-                    local fn="deploy_${app//-/_}"
-                    if declare -f "$fn" > /dev/null 2>&1; then
-                        load_app "$app"
-                        "$fn" "$inst_dir" "$host_port"
-                    else
-                        error "未知应用: $app"
-                    fi
-                esac; exit 0 ;;
+                load_app "$app"
+                local fn="deploy_${app//-/_}"
+                declare -f "$fn" > /dev/null 2>&1 || error "未知应用: $app"
+                "$fn" "$inst_dir" "$host_port"
+                exit 0 ;;
             --uninstall) [[ -z "${2:-}" ]] && error "请指定目录"; uninstall_app "$2"; exit 0 ;;
             --backup)
                 [[ -z "${2:-}" ]] && error "请指定目录"
