@@ -616,7 +616,7 @@ _find_service_by_image() {
     grep -v '^\s*#' "$compose_file" \
         | awk -v img="$image" '
             /^  [a-zA-Z]/ { svc=$1; gsub(/:$/, "", svc) }
-            $0 ~ ("image:.*" img) { print svc; exit }
+            $0 ~ ("image:[[:space:]]*" img) { print svc; exit }
         '
 }
  
