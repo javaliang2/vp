@@ -1875,6 +1875,148 @@ YAML
     fi
 }
 
+# ==========================================
+# 个人导航页 (Sun-Panel)
+# ==========================================
+deploy_sunpanel() {
+    local instance_name="${1:-}"
+    [[ -z "$instance_name" ]] && read -r -p "请输入导航页实例名称 (默认: sunpanel): " instance_name
+    instance_name="${instance_name:-sunpanel}"
+    
+    local port
+    get_free_port 3002; port=$?  # 自动获取可用端口，如果脚本有此函数请保留，没有则直接 local port=3002
+    
+    local app_dir="$BASE_DIR/$instance_name"
+    header "正在初始化个人导航页 (Sun-Panel) 实例: $instance_name"
+    
+    mkdir -p "$app_dir/conf" "$app_dir/uploads" "$app_dir/database"
+
+    cat <<EOF > "$app_dir/docker-compose.yml"
+services:
+  sunpanel:
+    image: hslr/sun-panel:latest
+    container_name: ${instance_name}
+    volumes:
+      - ./conf:/app/conf
+      - ./uploads:/app/uploads
+      - ./database:/app/database
+    ports:
+      - "${port}:3002"
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+    networks:
+      - app_net
+
+networks:
+  app_net:
+    name: ${instance_name}_net
+EOF
+
+    log "生成配置文件成功。"
+    ensure_docker
+    cd "$app_dir" && docker compose up -d
+    log "Sun-Panel 部署成功！"
+    info "内部访问地址: http://localhost:${port}"
+}
+
+# ==========================================
+# 密码管理器 (Vaultwarden)
+# ==========================================
+deploy_vaultwarden() {
+    local instance_name="${1:-}"
+    [[ -z "$instance_name" ]] && read -r -p "请输入密码管理器实例名称 (默认: vaultwarden): " instance_name
+    instance_name="${instance_name:-vaultwarden}"
+    
+    local port
+    get_free_port 8089; port=$?
+    
+    local app_dir="$BASE_DIR/$instance_name"
+    header "正在初始化密码管理器 (Vaultwarden) 实例: $instance_name"
+    
+    # 使用脚本原有的随机密码生成函数 randpw
+    local admin_token
+    admin_token=$(randpw 32 2>/dev/null || date +%s | sha256sum | base64 | head -c 32)
+    
+    mkdir -p "$app_dir/data"
+
+    cat <<EOF > "$app_dir/docker-compose.yml"
+services:
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: ${instance_name}
+    environment:
+      - TZ=Asia/Shanghai
+      - WEBSOCKET_ENABLED=true
+      - ADMIN_TOKEN=${admin_token}
+    volumes:
+      - ./data:/data
+    ports:
+      - "${port}:80"
+    restart: unless-stopped
+    networks:
+      - app_net
+
+networks:
+  app_net:
+    name: ${instance_name}_net
+EOF
+
+    log "生成配置文件成功。"
+    ensure_docker
+    cd "$app_dir" && docker compose up -d
+    log "Vaultwarden 部署成功！"
+    info "内部访问地址: http://localhost:${port}"
+    warn "管理面板管理员 Token (建议保存以备后用): ${admin_token}"
+}
+
+# ==========================================
+#  媒体服务器 (Emby Server)
+# ==========================================
+deploy_emby() {
+    local instance_name="${1:-}"
+    [[ -z "$instance_name" ]] && read -r -p "请输入 Emby 实例名称 (默认: emby): " instance_name
+    instance_name="${instance_name:-emby}"
+    
+    local port
+    get_free_port 8096; port=$?
+    
+    local app_dir="$BASE_DIR/$instance_name"
+    header "正在初始化 Emby 媒体服务器 实例: $instance_name"
+    
+    mkdir -p "$app_dir/config" "$app_dir/media"
+
+    cat <<EOF > "$app_dir/docker-compose.yml"
+services:
+  emby:
+    image: amnetworks/embyserver:latest
+    container_name: ${instance_name}
+    environment:
+      - PUID=$(id -u)
+      - PGID=$(id -g)
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./config:/config
+      - ./media:/data/movies
+    ports:
+      - "${port}:8096"
+    restart: unless-stopped
+    networks:
+      - app_net
+
+networks:
+  app_net:
+    name: ${instance_name}_net
+EOF
+
+    log "生成配置文件成功。"
+    ensure_docker
+    cd "$app_dir" && docker compose up -d
+    log "Emby 部署成功！"
+    info "内部访问地址: http://localhost:${port}"
+    info "请将你的媒体文件放至该目录: ${app_dir}/media"
+}
+
 # ============================================================
 # 10) 容器详情
 # ============================================================
