@@ -1884,142 +1884,138 @@ YAML
 # 个人导航页 (Sun-Panel)
 # ==========================================
 deploy_sunpanel() {
-    local instance_name="${1:-}"
-    [[ -z "$instance_name" ]] && read -r -p "请输入导航页实例名称 (默认: sunpanel): " instance_name
-    instance_name="${instance_name:-sunpanel}"
-    
-    local port
-    get_free_port 3002; port=$?  # 自动获取可用端口，如果脚本有此函数请保留，没有则直接 local port=3002
-    
-    local app_dir="$BASE_DIR/$instance_name"
-    header "正在初始化个人导航页 (Sun-Panel) 实例: $instance_name"
-    
-    mkdir -p "$app_dir/conf" "$app_dir/uploads" "$app_dir/database"
-
-    cat <<EOF > "$app_dir/docker-compose.yml"
+    local DIR="${1:-$BASE_DIR/sunpanel}"
+    local HOST_PORT="${2:-${APP_DEFAULT_PORT[sunpanel]}}"
+    local NET
+    NET=$(net_name "$DIR")
+ 
+    header "部署 Sun-Panel → $DIR (端口 $HOST_PORT)"
+    mkdir -p "$DIR"/{conf,uploads,database}
+    cat > "$DIR/.env" <<EOF
+HOST_PORT=${HOST_PORT}
+TZ=Asia/Shanghai
+EOF
+ 
+    cat > "$DIR/docker-compose.yml" <<YAML
 services:
   sunpanel:
     image: hslr/sun-panel:latest
-    container_name: ${instance_name}
+    restart: unless-stopped
+    environment:
+      - TZ=\${TZ}
     volumes:
       - ./conf:/app/conf
       - ./uploads:/app/uploads
       - ./database:/app/database
     ports:
-      - "${port}:3002"
-    environment:
-      - TZ=Asia/Shanghai
-    restart: unless-stopped
-    networks:
-      - app_net
-
+      - "127.0.0.1:${HOST_PORT}:3002"
+    networks: [${NET}]
+ 
 networks:
-  app_net:
-    name: ${instance_name}_net
-EOF
-
-    log "生成配置文件成功。"
-    ensure_docker
-    cd "$app_dir" && docker compose up -d
-    log "Sun-Panel 部署成功！"
-    info "内部访问地址: http://localhost:${port}"
+  ${NET}:
+    driver: bridge
+YAML
+ 
+    run_compose "$DIR" "Sun-Panel"
+    log "Sun-Panel 已启动 → http://127.0.0.1:${HOST_PORT}"
+    info "首次访问请完成初始化设置"
 }
 
 # ==========================================
 # 密码管理器 (Vaultwarden)
 # ==========================================
 deploy_vaultwarden() {
-    local instance_name="${1:-}"
-    [[ -z "$instance_name" ]] && read -r -p "请输入密码管理器实例名称 (默认: vaultwarden): " instance_name
-    instance_name="${instance_name:-vaultwarden}"
-    
-    local port
-    get_free_port 8099; port=$?
-    
-    local app_dir="$BASE_DIR/$instance_name"
-    header "正在初始化密码管理器 (Vaultwarden) 实例: $instance_name"
-    
-    # 使用脚本原有的随机密码生成函数 randpw
-    local admin_token
-    admin_token=$(randpw 32 2>/dev/null || date +%s | sha256sum | base64 | head -c 32)
-    
-    mkdir -p "$app_dir/data"
-
-    cat <<EOF > "$app_dir/docker-compose.yml"
+    local DIR="${1:-$BASE_DIR/vaultwarden}"
+    local HOST_PORT="${2:-${APP_DEFAULT_PORT[vaultwarden]}}"
+    local NET
+    NET=$(net_name "$DIR")
+ 
+    header "部署 Vaultwarden → $DIR (端口 $HOST_PORT)"
+    mkdir -p "$DIR/data"
+ 
+    local ADMIN_TOKEN; ADMIN_TOKEN=$(randpw 48)
+    cat > "$DIR/.env" <<EOF
+HOST_PORT=${HOST_PORT}
+ADMIN_TOKEN=${ADMIN_TOKEN}
+TZ=Asia/Shanghai
+EOF
+ 
+    cat > "$DIR/docker-compose.yml" <<YAML
 services:
   vaultwarden:
     image: vaultwarden/server:latest
-    container_name: ${instance_name}
+    restart: unless-stopped
     environment:
-      - TZ=Asia/Shanghai
+      - TZ=\${TZ}
       - WEBSOCKET_ENABLED=true
-      - ADMIN_TOKEN=${admin_token}
+      - SIGNUPS_ALLOWED=true
+      - ADMIN_TOKEN=\${ADMIN_TOKEN}
     volumes:
       - ./data:/data
     ports:
-      - "${port}:80"
-    restart: unless-stopped
-    networks:
-      - app_net
-
+      - "127.0.0.1:${HOST_PORT}:8099"
+    networks: [${NET}]
+ 
 networks:
-  app_net:
-    name: ${instance_name}_net
-EOF
-
-    log "生成配置文件成功。"
-    ensure_docker
-    cd "$app_dir" && docker compose up -d
-    log "Vaultwarden 部署成功！"
-    info "内部访问地址: http://localhost:${port}"
-    warn "管理面板管理员 Token (建议保存以备后用): ${admin_token}"
+  ${NET}:
+    driver: bridge
+YAML
+ 
+    run_compose "$DIR" "Vaultwarden"
+    log "Vaultwarden 已启动 → http://127.0.0.1:${HOST_PORT}"
+    log "管理面板: http://127.0.0.1:${HOST_PORT}/admin"
+    log "Admin Token 已保存至 $DIR/.env"
+    warn "首次访问后请在管理面板关闭注册（SIGNUPS_ALLOWED → false）"
 }
 
 # ==========================================
 #  媒体服务器 (Emby Server)
 # ==========================================
 deploy_emby() {
-    local instance_name="${1:-}"
-    [[ -z "$instance_name" ]] && read -r -p "请输入 Emby 实例名称 (默认: emby): " instance_name
-    instance_name="${instance_name:-emby}"
-    
-    local port
-    get_free_port 8096; port=$?
-    
-    local app_dir="$BASE_DIR/$instance_name"
-    header "正在初始化 Emby 媒体服务器 实例: $instance_name"
-    
-    mkdir -p "$app_dir/config" "$app_dir/media"
-
-    cat <<EOF > "$app_dir/docker-compose.yml"
+    local DIR="${1:-$BASE_DIR/emby}"
+    local HOST_PORT="${2:-${APP_DEFAULT_PORT[emby]}}"
+    local NET
+    NET=$(net_name "$DIR")
+ 
+    header "部署 Emby → $DIR (端口 $HOST_PORT)"
+    mkdir -p "$DIR"/{config,media}
+ 
+    # sudo 运行时 id -u 返回 0，容器以 root 运行；非 sudo 则取实际用户
+    local PUID PGID
+    PUID=$(id -u); PGID=$(id -g)
+    cat > "$DIR/.env" <<EOF
+HOST_PORT=${HOST_PORT}
+PUID=${PUID}
+PGID=${PGID}
+TZ=Asia/Shanghai
+EOF
+ 
+    cat > "$DIR/docker-compose.yml" <<YAML
 services:
   emby:
-    image: amnetworks/embyserver:latest
-    container_name: ${instance_name}
+    image: emby/embyserver:latest
+    restart: unless-stopped
     environment:
-      - PUID=$(id -u)
-      - PGID=$(id -g)
-      - TZ=Asia/Shanghai
+      - PUID=\${PUID}
+      - PGID=\${PGID}
+      - TZ=\${TZ}
     volumes:
       - ./config:/config
       - ./media:/data/movies
     ports:
-      - "${port}:8096"
-    restart: unless-stopped
-    networks:
-      - app_net
-
+      - "127.0.0.1:${HOST_PORT}:8096"
+    networks: [${NET}]
+ 
 networks:
-  app_net:
-    name: ${instance_name}_net
-EOF
-
-    log "生成配置文件成功。"
-    ensure_docker
-    cd "$app_dir" && docker compose up -d
-    log "Emby 部署成功！"
-    info "内部访问地址: http://localhost:${port}"
-    info "请将你的媒体文件放至该目录: ${app_dir}/media"
+  ${NET}:
+    driver: bridge
+YAML
+ 
+    run_compose "$DIR" "Emby"
+    log "Emby 已启动 → http://127.0.0.1:${HOST_PORT}"
+    info "媒体文件放至：$DIR/media"
+    info "如需挂载多个媒体目录，修改 $DIR/docker-compose.yml 中的 volumes"
+    [[ "$PUID" == "0" ]] && warn "当前以 root 运行，建议用非 root 用户执行脚本后重新部署"
 }
 
 # ============================================================
