@@ -562,12 +562,12 @@ update_app_images() {
 
 menu_update_components() {
     echo ""; echo -e "${CYAN}${BOLD}── 更新应用组件 ──${NC}"; echo ""
-    echo -e "  1) 升级 WordPress PHP → php8.4-fpm-alpine"
-    echo -e "  2) 升级 Nextcloud → stable-fpm-alpine"
-    echo -e "  3) 统一所有 MariaDB → mariadb:11"
-    echo -e "  4) 升级所有 PostgreSQL → postgres:17-alpine"
-    echo -e "  5) 统一所有 Redis → redis:7-alpine"
-    echo -e "  6) 统一所有 Nginx → nginx:alpine"
+    echo -e "  1) 升级 WordPress PHP → ${TARGET_WORDPRESS_PHP}"
+    echo -e "  2) 升级 Nextcloud → ${TARGET_NEXTCLOUD}"
+    echo -e "  3) 统一所有 MariaDB → ${TARGET_MARIADB}"
+    echo -e "  4) 升级所有 PostgreSQL → ${TARGET_POSTGRES}"
+    echo -e "  5) 统一所有 Redis → ${TARGET_REDIS}"
+    echo -e "  6) 统一所有 Nginx → ${TARGET_NGINX}"
     echo -e "  7) 批量执行以上全部"
     echo -e "  0) 返回"
     echo ""; read -rp "请选择 [0-7]: " choice
@@ -578,12 +578,34 @@ menu_update_components() {
         4) update_component_postgres ;;
         5) update_component_redis ;;
         6) update_component_nginx ;;
-        7) update_component_php_wordpress; update_component_nextcloud; update_component_mariadb
-           update_component_postgres; update_component_redis; update_component_nginx
-           log "全部组件更新完成" ;;
+        7) update_component_all ;;
         0) return ;;
         *) warn "无效输入" ;;
     esac
+}
+
+_major_ver() {
+    echo "$1" | grep -oP '\d+' | head -1
+}
+ 
+# ============================================================
+# 内部工具：大版本升级提示
+# 用法：_major_upgrade_warn "mariadb:10" "mariadb:11" → 返回 0=继续 1=跳过
+# ============================================================
+_major_upgrade_warn() {
+    local current="$1" target="$2"
+    local cur_major tgt_major
+    cur_major=$(_major_ver "$current")
+    tgt_major=$(_major_ver "$target")
+ 
+    if [[ -n "$cur_major" && -n "$tgt_major" && "$tgt_major" -gt "$cur_major" ]]; then
+        echo ""
+        warn "检测到大版本升级：${current} → ${target}（${cur_major} → ${tgt_major}）"
+        warn "大版本升级可能导致数据格式不兼容，建议先执行备份（菜单 5）"
+        read -rp "  仍要继续升级？[y/N]: " confirm
+        [[ "${confirm,,}" == "y" ]] && return 0 || return 1
+    fi
+    return 0
 }
 
 _replace_image_and_restart() {
