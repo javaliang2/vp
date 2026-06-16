@@ -1779,104 +1779,94 @@ YAML
 }
 
 deploy_alist() {
-    local DIR="${1:-$BASE_DIR/alist}"
-    local HOST_PORT="${2:-${APP_DEFAULT_PORT[alist]}}"
-    local MEDIA_DIR="${3:-/root/tg_download/downloads}"
-    local NET
-    NET=$(net_name "$DIR")
+    local DIR="$1" HOST_PORT="$2" NET="$3"
+    header "开始部署 AList"
 
-    header "部署 AList → $DIR (端口 $HOST_PORT)"
-
-    # ── 前置检查 ─────────────────────────────────────────────
-    if [[ ! -d "$MEDIA_DIR" ]]; then
-        warn "媒体目录不存在: $MEDIA_DIR"
-        warn "将跳过 /media 挂载，部署后可手动添加"
-        local MEDIA_MOUNT=""
-    else
-        local MEDIA_MOUNT="      - ${MEDIA_DIR}:/media"
+    # ── 媒体库映射逻辑（完美保留并规范化原版特性） ────────────────────
+    local MEDIA_MOUNT=""
+    echo -ne "${YELLOW}[?] 是否需要映射宿主机本地媒体库/存储目录到容器？(y/n): ${NC}"
+    read -r map_media
+    if [[ "$map_media" =~ ^[Yy]$ ]]; then
+        echo -ne "${YELLOW}[?] 请输入宿主机媒体目录的绝对路径 (例如 /mnt/media): ${NC}"
+        read -r host_path
+        if [[ -d "$host_path" ]]; then
+            # 动态生成挂载行，注意严格保持 YAML 的 6 空格缩进
+            MEDIA_MOUNT="      - ${host_path}:/media"
+            log "已成功添加媒体库映射: ${host_path} -> /media"
+        else
+            warn "输入的路径不存在，将跳过本地媒体库映射。"
+        fi
     fi
 
-    # 获取宿主机实际 uid/gid，避免以 root 运行容器进程
-    local PUID PGID
-    PUID=$(id -u)
-    PGID=$(id -g)
-
-    mkdir -p "$DIR/data"
-    echo "HOST_PORT=${HOST_PORT}" > "$DIR/.env"
-
-    # heredoc 用 <<'YAML' 防止意外展开，变量通过 sed 注入
-    sed \
-        -e "s|__HOST_PORT__|${HOST_PORT}|g" \
-        -e "s|__NET__|${NET}|g" \
-        -e "s|__PUID__|${PUID}|g" \
-        -e "s|__PGID__|${PGID}|g" \
-        -e "s|__MEDIA_MOUNT__|${MEDIA_MOUNT}|g" \
-        > "$DIR/docker-compose.yml" <<'YAML'
+    # ── 生成 docker-compose.yml（采用安全的端口长格式语法） ────────────────────
+    cat > "$DIR/docker-compose.yml" <<YAML
 services:
   alist:
     image: xhofe/alist:latest
     restart: unless-stopped
     environment:
-      - PUID=__PUID__
-      - PGID=__PGID__
+      - PUID=${PUID:-0}
+      - PGID=${PGID:-0}
       - UMASK=022
     volumes:
       - ./data:/opt/alist/data
-__MEDIA_MOUNT__
+${MEDIA_MOUNT}
     ports:
-      - "127.0.0.1:__HOST_PORT__:5244"
-    networks: [__NET__]
+      - target: 5244
+        published: ${HOST_PORT}
+        protocol: tcp
+        host_ip: 127.0.0.1
+    networks: [${NET}]
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:5244/"]
       interval: 30s
       timeout: 10s
       retries: 3
 networks:
-  __NET__:
+  ${NET}:
     driver: bridge
 YAML
 
-    # MEDIA_MOUNT 为空时 compose 里会多一个空行，清理掉
-    if [[ -z "$MEDIA_MOUNT" ]]; then
-        sed -i '/^$/d' "$DIR/docker-compose.yml"
+    # ── 启动容器 ──────────────────────────────────────────────────
+    cd "$DIR"
+    docker compose up -d
+
+    local cid
+    cid=$(docker compose ps -q alist 2>/dev/null || true)
+    if [[ -z "$cid" ]]; then
+        error "AList 容器启动失败，请使用 'docker compose logs' 检查错误原因。"
     fi
 
-    run_compose "$DIR" "AList"
+    # ── 提取初始密码（加固版：双重检索机制） ────────────────────────────
+    info "等待 AList 初始化并提取初始密码..."
+    sleep 5
+    local init_pw=""
 
-    # ── 等待容器就绪，最多 60 秒 ──────────────────────────────
-    info "等待 AList 容器启动..."
-    local cid elapsed=0
-    while [[ $elapsed -lt 60 ]]; do
-        cid=$(cd "$DIR" && docker compose ps -q alist 2>/dev/null | head -1)
-        [[ -n "$cid" ]] && break
-        sleep 5
-        (( elapsed += 5 ))
-    done
-
-    if [[ -z "${cid:-}" ]]; then
-        warn "容器未能在 60 秒内启动，请手动检查: docker compose -f $DIR/docker-compose.yml ps"
-        return 1
-    fi
-
-    # ── 提取初始密码（仅首次部署日志中存在）────────────────────
-    # 再等几秒让 AList 完成初始化写入日志
-    sleep 3
-    local init_pw
+    # 方案 A：尝试从标准容器日志捞取
     init_pw=$(docker logs "$cid" 2>&1 \
         | grep -o 'password: [^ ]*' \
         | awk '{print $2}' \
         | tail -1 || true)
 
-    log "AList 已启动 → http://127.0.0.1:${HOST_PORT}"
+    # 方案 B：若日志未记，直接进入容器内核对/提取（适配新版 AList 行为）
+    if [[ -z "$init_pw" ]]; then
+        info "日志中未检索到密码，尝试进入容器主动获取..."
+        init_pw=$(docker exec -i "$cid" ./alist admin 2>/dev/null | grep -oP '(?<=password: ).*' || true)
+    fi
+
+    log "AList 服务已成功拉起 → http://127.0.0.1:${HOST_PORT}"
 
     if [[ -n "${init_pw:-}" ]]; then
+        # 剥离可能混入的 ANSI 终端颜色控制字符，确保存入 .env 的是纯文本
+        init_pw=$(echo "$init_pw" | sed -r "s/\x1B\[([0-9]{1,3}(;[0-9]{1,2})?)?[mGK]//g")
         log "初始管理员密码: ${init_pw}"
         echo "ALIST_INIT_PASSWORD=${init_pw}" >> "$DIR/.env"
-        log "凭据已保存至 $DIR/.env"
+        log "凭据已安全备份至 $DIR/.env"
     else
-        warn "无法自动获取初始密码（可能非首次部署），如需重置请执行："
+        warn "未能自动捕获到初始密码（可能由于非首次部署或存储卷已有数据）。"
+        warn "如果需要手动重置或清空密码，请执行以下命令："
         warn "  随机新密码: docker exec -it ${cid} ./alist admin random"
-        warn "  指定新密码: docker exec -it ${cid} ./alist admin set <新密码>"
+        warn "  指定新密码: docker exec -it ${cid} ./alist admin set <你的新密码>"
     fi
 }
 
