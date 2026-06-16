@@ -1943,7 +1943,10 @@ services:
     volumes:
       - ./data:/data
     ports:
-      - "127.0.0.1:${HOST_PORT}:8099"
+      - target: 8080
+        published: ${HOST_PORT}
+        protocol: tcp
+        host_ip: 127.0.0.1
     networks: [${NET}]
  
 networks:
@@ -1952,10 +1955,10 @@ networks:
 YAML
  
     run_compose "$DIR" "Vaultwarden"
-    log "Vaultwarden 已启动 → http://127.0.0.1:${HOST_PORT}"
-    log "管理面板: http://127.0.0.1:${HOST_PORT}/admin"
-    log "Admin Token 已保存至 $DIR/.env"
-    warn "首次访问后请在管理面板关闭注册（SIGNUPS_ALLOWED → false）"
+    log "Vaultwarden 已成功拉起 → http://127.0.0.1:${HOST_PORT}"
+    log "管理面板链接: http://127.0.0.1:${HOST_PORT}/admin"
+    log "Admin Token 凭据已保存至 $DIR/.env"
+    warn "安全建议：首次登录并创建账号后，请务必进入管理面板关闭公开注册（SIGNUPS_ALLOWED → false）"
 }
 
 # ==========================================
