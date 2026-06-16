@@ -22,10 +22,10 @@ header() { echo -e "\n${CYAN}${BOLD}━━━ $* ━━━${NC}\n"; }
 BASE_DIR="/opt/docker-apps"
 BACKUP_LOCAL_DIR="/var/backups/docker-apps"
 mkdir -p "$BASE_DIR" "$BACKUP_LOCAL_DIR"
-TARGET_WORDPRESS_PHP="wordpress:php8.4-fpm-alpine"
-TARGET_NEXTCLOUD="nextcloud:stable-fpm-alpine"
+TARGET_WORDPRESS_PHP="wordpress:php8.3-fpm-alpine"
+TARGET_NEXTCLOUD="nextcloud:production-fpm-alpine"
 TARGET_MARIADB="mariadb:11"
-TARGET_POSTGRES="postgres:17-alpine"
+TARGET_POSTGRES="postgres:16-alpine"
 TARGET_REDIS="redis:7-alpine"
 TARGET_NGINX="nginx:alpine"
 
