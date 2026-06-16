@@ -1934,7 +1934,7 @@ deploy_vaultwarden() {
     instance_name="${instance_name:-vaultwarden}"
     
     local port
-    get_free_port 8089; port=$?
+    get_free_port 8099; port=$?
     
     local app_dir="$BASE_DIR/$instance_name"
     header "正在初始化密码管理器 (Vaultwarden) 实例: $instance_name"
@@ -2610,6 +2610,9 @@ main() {
                     lskypro)         deploy_lskypro         "$inst_dir" "$host_port" ;;
                     easyimage)       deploy_easyimage       "$inst_dir" "$host_port" ;;
                     alist)           deploy_alist           "$inst_dir" "$host_port" ;;
+                    sunpanel)        deploy_sunpanel        "$inst_dir" "$host_port" ;;
+                    vaultwarden)     deploy_vaultwarden     "$inst_dir" "$host_port" ;;
+                    emby)            deploy_emby            "$inst_dir" "$host_port" ;;
                     *)               error "未知应用: $app" ;;
                 esac; exit 0 ;;
             --uninstall) [[ -z "${2:-}" ]] && error "请指定目录"; uninstall_app "$2"; exit 0 ;;
