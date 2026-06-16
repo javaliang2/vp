@@ -44,6 +44,12 @@ header() { echo -e "\n${CYAN}${BOLD}━━━ $* ━━━${NC}\n"; }
 BASE_DIR="/opt/docker-apps"
 BACKUP_LOCAL_DIR="/var/backups/docker-apps"
 mkdir -p "$BASE_DIR" "$BACKUP_LOCAL_DIR"
+TARGET_WORDPRESS_PHP="wordpress:php8.4-fpm-alpine"
+TARGET_NEXTCLOUD="nextcloud:stable-fpm-alpine"
+TARGET_MARIADB="mariadb:11"
+TARGET_POSTGRES="postgres:17-alpine"
+TARGET_REDIS="redis:7-alpine"
+TARGET_NGINX="nginx:alpine"
 
 # ============================================================
 # SSH 密钥检测与自动推送
@@ -585,116 +591,224 @@ _replace_image_and_restart() {
     sed -i "s|${old_tag}|${new_tag}|g" "$dir/docker-compose.yml"
     cd "$dir"
     if [[ ${#services[@]} -gt 0 ]]; then
-        docker compose pull "${services[@]}" 2>/dev/null || true
-        docker compose up -d "${services[@]}" 2>/dev/null || warn "$(basename "$dir") 部分服务重启失败"
+        docker compose pull "${services[@]}" || warn "$(basename "$dir") 镜像拉取失败"
+        docker compose up -d "${services[@]}" || warn "$(basename "$dir") 服务重启失败"
     else
-        docker compose pull 2>/dev/null || true
-        docker compose up -d --remove-orphans 2>/dev/null || warn "$(basename "$dir") 重启失败"
+        docker compose pull || warn "$(basename "$dir") 镜像拉取失败"
+        docker compose up -d --remove-orphans || warn "$(basename "$dir") 重启失败"
     fi
     cd - > /dev/null
 }
-
+ 
+# ============================================================
+# 内部工具：从 compose 文件中找某个镜像所属的服务名
+# 用法：_find_service_by_image "$dir/docker-compose.yml" "mariadb:10"
+# 输出：服务名（如 db / lskypro-db / redis 等）
+# ============================================================
+_find_service_by_image() {
+    local compose_file="$1" image="$2"
+    # 过滤注释行后，用 awk 扫描：遇到顶层服务行记录服务名，遇到匹配 image 行输出
+    grep -v '^\s*#' "$compose_file" \
+        | awk -v img="$image" '
+            /^  [a-zA-Z]/ { svc=$1; gsub(/:$/, "", svc) }
+            $0 ~ ("image:.*" img) { print svc; exit }
+        '
+}
+ 
+# ============================================================
+# 8-1) 升级 WordPress PHP 版本
+# ============================================================
 update_component_php_wordpress() {
-    local new_tag="wordpress:php8.4-fpm-alpine"
-    header "升级 WordPress PHP → php8.4-fpm-alpine"
+    local new_tag="$TARGET_WORDPRESS_PHP"
+    header "升级 WordPress PHP → ${new_tag}"
     local updated=0
     while IFS= read -r dir; do
-        local current; current=$(grep -oP 'wordpress:php[\d.]+-fpm-alpine' "$dir/docker-compose.yml" | head -1)
+        [[ ! -f "$dir/docker-compose.yml" ]] && continue
+ 
+        # 排除注释行后提取当前标签
+        local current
+        current=$(grep -v '^\s*#' "$dir/docker-compose.yml" \
+            | grep -oP 'wordpress:php[\d.]+-fpm-alpine' | head -1)
         [[ -z "$current" || "$current" == "$new_tag" ]] && continue
+ 
         info "[$(basename "$dir")] $current → $new_tag"
-        read -rp "  确认升级？[y/N]: " confirm
-        [[ "${confirm,,}" != "y" ]] && continue
+ 
+        # 大版本检测
+        _major_upgrade_warn "$current" "$new_tag" || { info "已跳过 $(basename "$dir")"; continue; }
+ 
         _replace_image_and_restart "$dir" "$current" "$new_tag" "wordpress"
-        log "已升级"; ((updated++))
+        log "已升级 $(basename "$dir")"; ((updated++))
     done < <(list_instances "wordpress")
-    [[ $updated -eq 0 ]] && info "无需更新"
+    [[ $updated -eq 0 ]] && info "所有 WordPress 实例均已是最新版本"
 }
-
+ 
+# ============================================================
+# 8-2) 升级 Nextcloud 版本
+# ============================================================
 update_component_nextcloud() {
-    local new_tag="nextcloud:stable-fpm-alpine"
-    header "升级 Nextcloud → stable-fpm-alpine"
+    local new_tag="$TARGET_NEXTCLOUD"
+    header "升级 Nextcloud → ${new_tag}"
     local updated=0
     while IFS= read -r dir; do
-        local current; current=$(grep -oP 'nextcloud:[a-z0-9.\-]+-fpm-alpine' "$dir/docker-compose.yml" | head -1)
+        [[ ! -f "$dir/docker-compose.yml" ]] && continue
+ 
+        local current
+        current=$(grep -v '^\s*#' "$dir/docker-compose.yml" \
+            | grep -oP 'nextcloud:[a-z0-9][a-z0-9.\-]*-fpm-alpine' | head -1)
         [[ -z "$current" || "$current" == "$new_tag" ]] && continue
-        warn "版本跨越升级前请先备份数据"
+ 
+        info "[$(basename "$dir")] $current → $new_tag"
+        warn "Nextcloud 版本跨越升级前请先备份数据（菜单 5）"
+ 
         read -rp "  确认升级？[y/N]: " confirm
-        [[ "${confirm,,}" != "y" ]] && continue
+        [[ "${confirm,,}" != "y" ]] && { info "已跳过 $(basename "$dir")"; continue; }
+ 
         _replace_image_and_restart "$dir" "$current" "$new_tag" "nextcloud" "cron"
-        log "已更新"; ((updated++))
+        log "已升级 $(basename "$dir")"; ((updated++))
     done < <(list_instances "nextcloud")
-    [[ $updated -eq 0 ]] && info "无需更新"
+    [[ $updated -eq 0 ]] && info "所有 Nextcloud 实例均已是最新版本"
 }
-
+ 
+# ============================================================
+# 8-3) 统一 MariaDB 版本
+# ============================================================
 update_component_mariadb() {
-    header "统一 MariaDB → mariadb:11"
+    local new_tag="$TARGET_MARIADB"
+    header "统一 MariaDB → ${new_tag}"
     local updated=0
     for app in "${ALL_APPS[@]}"; do
         while IFS= read -r dir; do
             [[ ! -f "$dir/docker-compose.yml" ]] && continue
-            grep -q 'mariadb:' "$dir/docker-compose.yml" || continue
-            local current; current=$(grep -oP 'mariadb:[^\s"]+' "$dir/docker-compose.yml" | head -1)
-            [[ "$current" == "mariadb:11" ]] && continue
-            info "[$(basename "$dir")] $current → mariadb:11"
-            local db_service; db_service=$(grep -B2 "image: ${current}" "$dir/docker-compose.yml" \
-                | grep -oP '^\s+\K\S+(?=:)' | head -1)
-            _replace_image_and_restart "$dir" "$current" "mariadb:11" "${db_service:-db}"
-            ((updated++))
+            grep -v '^\s*#' "$dir/docker-compose.yml" | grep -q 'image:.*mariadb:' || continue
+ 
+            local current
+            current=$(grep -v '^\s*#' "$dir/docker-compose.yml" \
+                | grep -oP 'mariadb:[^\s"]+' | head -1)
+            [[ -z "$current" || "$current" == "$new_tag" ]] && continue
+ 
+            info "[$(basename "$dir")] $current → $new_tag"
+ 
+            # 大版本检测（mariadb:10 → 11 也要提示）
+            _major_upgrade_warn "$current" "$new_tag" || { info "已跳过 $(basename "$dir")"; continue; }
+ 
+            # 动态提取服务名（awk 解析，不依赖 grep -B2）
+            local db_service
+            db_service=$(_find_service_by_image "$dir/docker-compose.yml" "mariadb:" )
+            db_service="${db_service:-db}"
+            info "  目标服务名：$db_service"
+ 
+            _replace_image_and_restart "$dir" "$current" "$new_tag" "$db_service"
+            log "已升级 $(basename "$dir")"; ((updated++))
         done < <(list_instances "$app")
     done
-    [[ $updated -eq 0 ]] && info "无需更新" || log "已更新 $updated 个实例"
+    [[ $updated -eq 0 ]] && info "所有实例 MariaDB 均已是最新版本" || log "已更新 $updated 个实例"
 }
-
+ 
+# ============================================================
+# 8-4) 升级 PostgreSQL 版本
+# ============================================================
 update_component_postgres() {
-    header "升级 PostgreSQL → postgres:17-alpine"
+    local new_tag="$TARGET_POSTGRES"
+    header "升级 PostgreSQL → ${new_tag}"
     local updated=0
     for app in "${ALL_APPS[@]}"; do
         while IFS= read -r dir; do
             [[ ! -f "$dir/docker-compose.yml" ]] && continue
-            grep -q 'postgres:' "$dir/docker-compose.yml" || continue
-            local current; current=$(grep -oP 'postgres:[^\s"]+' "$dir/docker-compose.yml" | head -1)
-            [[ "$current" == "postgres:17-alpine" ]] && continue
-            warn "[$(basename "$dir")] 大版本升级需手动迁移数据！"
-            read -rp "仍要修改标签？[y/N]: " confirm
-            if [[ "${confirm,,}" == "y" ]]; then
-                sed -i "s|${current}|postgres:17-alpine|g" "$dir/docker-compose.yml"
-                warn "标签已修改，请手动完成数据库迁移后再启动"; ((updated++))
-            fi
+            grep -v '^\s*#' "$dir/docker-compose.yml" | grep -q 'image:.*postgres:' || continue
+ 
+            local current
+            current=$(grep -v '^\s*#' "$dir/docker-compose.yml" \
+                | grep -oP 'postgres:[^\s"]+' | head -1)
+            [[ -z "$current" || "$current" == "$new_tag" ]] && continue
+ 
+            info "[$(basename "$dir")] $current → $new_tag"
+ 
+            # PostgreSQL 大版本升级必须手动迁移数据，强制提示
+            warn "PostgreSQL 大版本升级（如 15→17）需手动迁移数据！"
+            warn "升级流程：pg_dumpall 导出 → 换标签 → up -d → psql 导入"
+            warn "直接挂载旧数据目录启动新版本容器会损坏数据"
+ 
+            _major_upgrade_warn "$current" "$new_tag" || { info "已跳过 $(basename "$dir")"; continue; }
+ 
+            # 只改标签，不自动重启（数据迁移需手动完成）
+            sed -i "s|${current}|${new_tag}|g" "$dir/docker-compose.yml"
+            warn "$(basename "$dir") 标签已修改为 ${new_tag}"
+            warn "请手动完成数据迁移后再执行：cd $dir && docker compose up -d"
+            ((updated++))
         done < <(list_instances "$app")
     done
-    [[ $updated -eq 0 ]] && info "无需更新" || log "已修改 $updated 个实例标签"
+    [[ $updated -eq 0 ]] && info "所有实例 PostgreSQL 均已是最新版本" \
+        || log "已修改 $updated 个实例标签（需手动迁移数据后启动）"
 }
-
+ 
+# ============================================================
+# 8-5) 统一 Redis 版本
+# ============================================================
 update_component_redis() {
-    header "统一 Redis → redis:7-alpine"
+    local new_tag="$TARGET_REDIS"
+    header "统一 Redis → ${new_tag}"
     local updated=0
     for app in "${ALL_APPS[@]}"; do
         while IFS= read -r dir; do
             [[ ! -f "$dir/docker-compose.yml" ]] && continue
-            grep -q 'redis:' "$dir/docker-compose.yml" || continue
-            local current; current=$(grep -oP 'redis:[^\s"]+' "$dir/docker-compose.yml" | head -1)
-            [[ "$current" == "redis:7-alpine" ]] && continue
-            _replace_image_and_restart "$dir" "$current" "redis:7-alpine" "redis"
-            ((updated++))
+            grep -v '^\s*#' "$dir/docker-compose.yml" | grep -q 'image:.*redis:' || continue
+ 
+            local current
+            current=$(grep -v '^\s*#' "$dir/docker-compose.yml" \
+                | grep -oP 'redis:[^\s"]+' | head -1)
+            [[ -z "$current" || "$current" == "$new_tag" ]] && continue
+ 
+            info "[$(basename "$dir")] $current → $new_tag"
+ 
+            # 大版本检测
+            _major_upgrade_warn "$current" "$new_tag" || { info "已跳过 $(basename "$dir")"; continue; }
+ 
+            # 动态提取服务名
+            local redis_service
+            redis_service=$(_find_service_by_image "$dir/docker-compose.yml" "redis:")
+            redis_service="${redis_service:-redis}"
+            info "  目标服务名：$redis_service"
+ 
+            _replace_image_and_restart "$dir" "$current" "$new_tag" "$redis_service"
+            log "已升级 $(basename "$dir")"; ((updated++))
         done < <(list_instances "$app")
     done
-    [[ $updated -eq 0 ]] && info "无需更新" || log "已更新 $updated 个实例"
+    [[ $updated -eq 0 ]] && info "所有实例 Redis 均已是最新版本" || log "已更新 $updated 个实例"
 }
-
+ 
+# ============================================================
+# 8-6) 统一 Nginx 版本
+# ============================================================
 update_component_nginx() {
-    header "统一 Nginx → nginx:alpine"
+    local new_tag="$TARGET_NGINX"
+    header "统一 Nginx → ${new_tag}"
     local updated=0
     for app in "${ALL_APPS[@]}"; do
         while IFS= read -r dir; do
             [[ ! -f "$dir/docker-compose.yml" ]] && continue
-            grep -q 'nginx:' "$dir/docker-compose.yml" || continue
-            local current; current=$(grep -oP 'nginx:[^\s"]+' "$dir/docker-compose.yml" | head -1)
-            [[ "$current" == "nginx:alpine" ]] && continue
-            _replace_image_and_restart "$dir" "$current" "nginx:alpine" "nginx"
-            ((updated++))
+            grep -v '^\s*#' "$dir/docker-compose.yml" | grep -q 'image:.*nginx:' || continue
+ 
+            local current
+            current=$(grep -v '^\s*#' "$dir/docker-compose.yml" \
+                | grep -oP 'nginx:[^\s"]+' | head -1)
+            [[ -z "$current" || "$current" == "$new_tag" ]] && continue
+ 
+            info "[$(basename "$dir")] $current → $new_tag"
+ 
+            # nginx 通常只追 alpine tag，大版本变动较少，仍走通用检测
+            _major_upgrade_warn "$current" "$new_tag" || { info "已跳过 $(basename "$dir")"; continue; }
+ 
+            # 动态提取服务名
+            local nginx_service
+            nginx_service=$(_find_service_by_image "$dir/docker-compose.yml" "nginx:")
+            nginx_service="${nginx_service:-nginx}"
+            info "  目标服务名：$nginx_service"
+ 
+            _replace_image_and_restart "$dir" "$current" "$new_tag" "$nginx_service"
+            log "已升级 $(basename "$dir")"; ((updated++))
         done < <(list_instances "$app")
     done
-    [[ $updated -eq 0 ]] && info "无需更新" || log "已更新 $updated 个实例"
+    [[ $updated -eq 0 ]] && info "所有实例 Nginx 均已是最新版本" || log "已更新 $updated 个实例"
 }
 
 deploy_all_apps() {
