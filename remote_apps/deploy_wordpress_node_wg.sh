@@ -9,6 +9,12 @@
 _write_nginx_wp_conf() {
     local DEST="$1"
     cat > "$DEST" <<'NGINX'
+# 根据 X-Forwarded-Proto 映射 HTTPS 变量
+map $http_x_forwarded_proto $fastcgi_https {
+    default  "";
+    https    "on";
+}
+
 upstream wordpress_fpm {
     server wordpress:9000;
     least_conn;
@@ -17,11 +23,13 @@ upstream wordpress_fpm {
 
 server {
     listen 80;
-    root /var/www/html;
-    index index.php index.html;
+    root   /var/www/html;
+    index  index.php index.html;
     client_max_body_size 2048M;
 
-    # 静态资源直接返回
+    # 节点 nginx 自己不做 HTTP→HTTPS 跳转
+    # 跳转逻辑由 A 机器网关统一处理
+    
     location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff2|webp)$ {
         expires max;
         log_not_found off;
@@ -33,12 +41,17 @@ server {
     }
 
     location ~ \.php$ {
-        fastcgi_pass            wordpress_fpm;
-        fastcgi_index           index.php;
-        include                 fastcgi_params;
-        fastcgi_param           SCRIPT_FILENAME $document_root$fastcgi_script_name;
-        fastcgi_read_timeout    600;
-        fastcgi_keep_conn       on;
+        fastcgi_pass              wordpress_fpm;
+        fastcgi_index             index.php;
+        include                   fastcgi_params;
+        fastcgi_param             SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        # 透传代理信息给 PHP
+        fastcgi_param             HTTPS           $fastcgi_https;
+        fastcgi_param             HTTP_X_FORWARDED_PROTO $http_x_forwarded_proto;
+        fastcgi_param             HTTP_X_FORWARDED_FOR   $http_x_forwarded_for;
+        fastcgi_param             HTTP_X_REAL_IP         $http_x_real_ip;
+        fastcgi_read_timeout      600;
+        fastcgi_keep_conn         on;
     }
 }
 NGINX
