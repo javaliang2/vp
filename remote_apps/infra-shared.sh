@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# infra-shared.sh — 共享 MariaDB + Redis（交互式小白版）
+# infra-shared.sh — 共享 MariaDB + Redis（终极修复小白版）
 # ============================================================
 set -euo pipefail
 
@@ -42,7 +42,8 @@ load_env() {
 
 dc() {
     local DIR="$1"; shift
-    docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" "$@"
+    # 强制切换到工作目录执行，彻底解决新版 Docker Compose 找不到文件的 Bug
+    docker -C "$DIR" compose --env-file "$DIR/.env" "$@"
 }
 
 mariadb_exec() {
@@ -85,7 +86,8 @@ cmd_deploy() {
     info "目标目录: ${DIR}"
     info "监听 IP: ${WG_IP}"
 
-    mkdir -p "${DIR}"/{db,redis,backup}
+    # 预先创建所有必备目录，防止挂载失败
+    mkdir -p "${DIR}"/{db,redis,backup,mariadb-conf,redis-conf}
 
     if [[ ! -f "${DIR}/.env" ]]; then
         local ROOT_PW DB_PW REDIS_PW
@@ -110,9 +112,6 @@ EOF
     fi
 
     load_env "${DIR}"
-
-    # 写入配置文件
-    mkdir -p "${DIR}/mariadb-conf" "${DIR}/redis-conf"
     
     # 容器内部网络监听 0.0.0.0，外部访问由 Docker 端口映射限制在 WG_IP
     cat > "${DIR}/mariadb-conf/custom.cnf" <<INI
@@ -187,7 +186,7 @@ YAML
     dc "${DIR}" up -d
     wait_db_ready "${DIR}"
 
-    # 授权 WG 网段（Docker映射会导致源IP为网关，因此使用 '%' 即可，安全性由外部端口绑定保证）
+    # 授权数据库用户
     mariadb_exec "$DIR" <<SQL
 GRANT ALL PRIVILEGES ON \`${MARIADB_DATABASE}\`.* TO '${MARIADB_USER}'@'%' IDENTIFIED BY '${MARIADB_PASSWORD}';
 FLUSH PRIVILEGES;
@@ -320,7 +319,6 @@ cmd_backup() {
     header "正在备份数据库到 ${DEST}"
 
     local DBS
-    # 清理可能的 \r 回车符，防止备份文件名和路径错乱
     DBS=$(mariadb_exec "$DIR" -sN -e \
         "SELECT schema_name FROM information_schema.schemata \
          WHERE schema_name NOT IN ('mysql','information_schema','performance_schema','sys');" | tr -d '\r')
@@ -418,7 +416,6 @@ interactive_menu() {
 }
 
 # ── 入口处理 ────────────────────────────────────────────────
-# 支持通过参数直接调用（兼顾老模式），无参数则进入小白模式
 if [[ $# -gt 0 ]]; then
     CMD="$1"; shift
     case "$CMD" in
