@@ -1160,74 +1160,55 @@ site_create_loadbalance() {
 
     echo ""
     echo -e "${CYAN}── 负载均衡算法 ──${NC}"
-    echo "  1) round-robin  轮询"
-    echo "  2) least_conn   最少连接"
-    echo "  3) ip_hash      IP 哈希"
-    echo "  4) random       随机"
-    safe_read -rp "选择 [1-4，默认 1]: " _lb_algo
+    echo "  1) round-robin 轮询 (推荐：后端无状态/内容完全相同)"
+    echo "  2) least_conn  最少连接"
+    echo "  3) ip_hash     IP 哈希 (适合需要保持 Session 登录状态的项目)"
+    safe_read -rp "选择 [1-3，默认 1]: " _lb_algo
     local lb_directive=""
     case "${_lb_algo:-1}" in
         1) lb_directive="" ;;
         2) lb_directive="    least_conn;" ;;
         3) lb_directive="    ip_hash;" ;;
-        4) lb_directive="    random;" ;;
-        *) die "无效选项" ;;
+        *) lb_directive="" ;;
     esac
 
+    # 循环读取 B、C、D 多个节点的网卡 IP/端口
     echo ""
-    info "请逐行输入后端节点（回车结束）"
-    info "格式: IP:端口 [weight=N] [backup]"
-    local -a servers=()
+    info "请输入后端节点地址（例如：10.0.0.2:80 或 10.0.0.3:8080）"
+    local -a backend_list=()
     while true; do
-        local _srv=""
-        safe_read -rp "后端节点: " _srv
-        [[ -z "$_srv" ]] && break
-        servers+=("$_srv")
+        local node=""
+        safe_read -rp "添加后端源站节点 (直接回车结束): " node
+        [[ -z "$node" ]] && break
+        
+        # 增加被动健康检查参数：
+        # max_fails=2 fail_timeout=10s 表示 10 秒内如果该节点连续失败 2 次，将其摘除 10 秒
+        backend_list+=("    server ${node} max_fails=2 fail_timeout=10s;")
     done
-    [[ ${#servers[@]} -eq 0 ]] && die "至少需要一个后端节点"
 
-    local _mf="" _ft=""
-    safe_read -rp "max_fails（失败次数，默认 3）: " _mf
-    safe_read -rp "fail_timeout（不可用持续时间，默认 10s）: " _ft
-    [[ -z "$_mf" ]] && _mf=3
-    [[ -z "$_ft" ]] && _ft="10s"
+    [[ ${#backend_list[@]} -eq 0 ]] && die "至少需要添加一个后端节点！"
 
     ask_ssl_params
     resolve_ssl_cert "$domain"
     _check_port_conflict "$_SSL_PORT"
     _ensure_upgrade_map
 
-    # 生成安全的 upstream 名称（替换 - 和 .）
-    local domain_safe="${domain//-/_}"
-    domain_safe="${domain_safe//./_}"
-    local hash
-    if command -v sha256sum &>/dev/null; then
-        hash=$(printf '%s' "$domain" | sha256sum | cut -c1-6)
-    elif command -v openssl &>/dev/null; then
-        hash=$(printf '%s' "$domain" | openssl dgst -sha256 | cut -c1-6)
-    else
-        hash=$(printf '%s' "$domain" | cksum | awk '{print $1}' | tail -c6)
-    fi
-    local upstream_name="${domain_safe}_${hash}_upstream"
-
+    local upstream_name="upstream_${domain//./_}"
     local conf_file="${SITES_AVAILABLE}/${domain}.conf"
+
     {
-        echo "# 负载均衡配置: ${domain}"
-        echo "# 生成时间: $(date)"
-        echo ""
+        # 生成 upstream 块
         echo "upstream ${upstream_name} {"
         [[ -n "$lb_directive" ]] && echo "$lb_directive"
-        echo ""
-        for srv in "${servers[@]}"; do
-            echo "    server ${srv} max_fails=${_mf} fail_timeout=${_ft};"
-        done
-        echo ""
-        echo "    keepalive 32;"
+        printf '%s\n' "${backend_list[@]}"
         echo "}"
         echo ""
 
-        [[ "$_SSL_301" == "yes" ]] && write_redirect_block "$domain" "$_SSL_PORT" "$_SSL_HTTP_PORT"
+        # 生成 301 强转块
+        [[ "$_SSL_MODE" != "none" && "$_SSL_301" == "yes" ]] && \
+            write_redirect_block "$domain" "$_SSL_PORT" "$_SSL_HTTP_PORT"
 
+        # 主 server 块
         echo "server {"
         if [[ "$_SSL_MODE" != "none" ]]; then
             echo "    listen ${_SSL_PORT} ssl;"
@@ -1236,43 +1217,42 @@ site_create_loadbalance() {
             echo "    listen ${_SSL_PORT};"
             echo "    listen [::]:${_SSL_PORT};"
         fi
-
+        
         cat <<CONF
     server_name ${domain};
+    client_max_body_size 0;
 
     access_log /var/log/nginx/${domain}.access.log;
     error_log  /var/log/nginx/${domain}.error.log;
-
 CONF
+
         [[ "$_SSL_MODE" != "none" ]] && ssl_block "$_SSL_CERT" "$_SSL_KEY" && echo ""
 
         cat <<CONF
     location / {
         proxy_pass          http://${upstream_name};
         proxy_http_version  1.1;
-        proxy_set_header    Connection        "";
+        proxy_set_header    Upgrade           \$http_upgrade;
+        proxy_set_header    Connection        \$connection_upgrade;
         proxy_set_header    Host              \$host;
         proxy_set_header    X-Real-IP         \$remote_addr;
         proxy_set_header    X-Forwarded-For   \$proxy_add_x_forwarded_for;
         proxy_set_header    X-Forwarded-Proto \$scheme;
-
-        proxy_connect_timeout  5s;
-        proxy_send_timeout    60s;
-        proxy_read_timeout    60s;
+        proxy_set_header    X-Forwarded-Host  \$host;
+        
+        # 核心：当主节点返回 502/504/超时时，立即无感将请求转给下一个健康的节点
+        proxy_next_upstream error timeout invalid_header http_502 http_503 http_504;
+        proxy_next_upstream_timeout 5s;
+        proxy_next_upstream_tries 3;
     }
 
-    location ~ /\. { deny all; }
+    location ~ /\.well-known { allow all; }
+    location ~ /\.           { deny all; }
 }
 CONF
     } > "$conf_file"
 
     _site_activate "$domain"
-
-    echo ""
-    info "后端节点列表："
-    for srv in "${servers[@]}"; do
-        echo -e "  ${CYAN}▶${NC} $srv"
-    done
 }
 
 # ──────────────────────────────────────────────────────────
