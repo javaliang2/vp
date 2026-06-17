@@ -256,6 +256,15 @@ services:
       S3_REGION:             \${S3_REGION}
       S3_CDN_DOMAIN:         \${S3_CDN_DOMAIN}
       WORDPRESS_CONFIG_EXTRA: |
+        if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] )
+             && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https' ) {
+            $_SERVER['HTTPS'] = 'on';
+        }
+        if ( isset( $_SERVER['HTTP_X_FORWARDED_HOST'] ) ) {
+            $_SERVER['HTTP_HOST'] = $_SERVER['HTTP_X_FORWARDED_HOST'];
+        }
+        define( 'WP_HOME',    'https://' . $_SERVER['HTTP_HOST'] );
+        define( 'WP_SITEURL', 'https://' . $_SERVER['HTTP_HOST'] );
         define('WP_REDIS_HOST',   '\${REDIS_HOST}');
         define('WP_REDIS_PORT',   6379);
         define('WP_REDIS_AUTH',   '\${REDIS_PW}');
