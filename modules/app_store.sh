@@ -20,6 +20,9 @@ declare -A APPS=(
     ["远程文件传输"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/vps-rsync.sh"
     ["证书/代理/网站"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/nginx-gateway.sh"
     ["nginx安全加固"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/nginx-harden.sh"
+    ["wp多后端部署"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/wordpress_node_wg.sh"
+    ["WireGuard安装"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/wireguard-mesh.sh"
+    ["MariaDB + Redis"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/infra-shared.sh"
 )
 
 run_remote_app() {
