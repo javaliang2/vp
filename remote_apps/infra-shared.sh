@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# infra-shared.sh — 共享 MariaDB + Redis（终极修复小白版）
+# infra-shared.sh — 共享 MariaDB + Redis（WG-IP 动态自适应版）
 # ============================================================
 set -euo pipefail
 
@@ -27,7 +27,7 @@ get_wg_ip() {
     local IP
     IP=$(ip addr show "${WG_IFACE}" 2>/dev/null \
         | awk '/inet /{gsub(/\/.*/, "", $2); print $2; exit}')
-    [[ -n "$IP" ]] || error "无法获取 ${WG_IFACE} IP，请确认 WireGuard 已启动"
+    [[ -n "$IP" ]] || error "无法获取 ${WG_IFACE} IP，请确认本机的 WireGuard 已启动"
     echo "$IP"
 }
 
@@ -42,8 +42,10 @@ load_env() {
 
 dc() {
     local DIR="$1"; shift
-    # 强制切换到工作目录执行，彻底解决新版 Docker Compose 找不到文件的 Bug
-    docker -C "$DIR" compose --env-file "$DIR/.env" "$@"
+    # 强制定位系统真实的 docker 二进制文件路径，彻底解决被单机脚本别名拦截的问题
+    local DOCKER_BIN
+    DOCKER_BIN=$(which docker 2>/dev/null || echo "/usr/bin/docker")
+    $DOCKER_BIN compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" "$@"
 }
 
 mariadb_exec() {
@@ -78,16 +80,16 @@ cmd_deploy() {
     [[ $EUID -eq 0 ]] || error "请使用 root 权限执行"
 
     ip link show "${WG_IFACE}" &>/dev/null || \
-        error "${WG_IFACE} 接口不存在，请先启动 WireGuard"
+        error "${WG_IFACE} 接口不存在，请先启动本机的 WireGuard"
     
+    # 🌟 调用脚本自带函数：自动获取当前部署主机的真实 WireGuard IP
     local WG_IP
     WG_IP=$(get_wg_ip)
     
     info "目标目录: ${DIR}"
-    info "监听 IP: ${WG_IP}"
+    info "当前主机 WireGuard IP: ${WG_IP}"
 
-    # 预先创建所有必备目录，防止挂载失败
-    mkdir -p "${DIR}"/{db,redis,backup,mariadb-conf,redis-conf}
+    mkdir -p "${DIR}"/{db,redis,backup}
 
     if [[ ! -f "${DIR}/.env" ]]; then
         local ROOT_PW DB_PW REDIS_PW
@@ -107,13 +109,16 @@ EOF
         chmod 600 "${DIR}/.env"
         log "已自动生成高强度随机密码"
     else
-        warn ".env 已存在，将使用已有凭据（自动更新 IP）"
+        warn ".env 已存在，将使用已有凭据（自动同步刷新本机真实 WG IP）"
         sed -i "s|^WG_IP=.*|WG_IP=${WG_IP}|" "${DIR}/.env"
     fi
 
     load_env "${DIR}"
+
+    # 写入配置文件
+    mkdir -p "${DIR}/mariadb-conf" "${DIR}/redis-conf"
     
-    # 容器内部网络监听 0.0.0.0，外部访问由 Docker 端口映射限制在 WG_IP
+    # 🌟 容器内监听 0.0.0.0 是标准且安全的，因为我们在外层的 ports 已经把端口死死锁在 WG_IP 上了
     cat > "${DIR}/mariadb-conf/custom.cnf" <<INI
 [mysqld]
 innodb_buffer_pool_size  = 512M
@@ -144,6 +149,7 @@ loglevel notice
 logfile ""
 CONF
 
+    # 🌟 核心安全设计：在 ports 映射里，使用来自 get_wg_ip 抄录出来的 \${WG_IP} 变量进行网卡锁定
     cat > "${DIR}/docker-compose.yml" <<YAML
 services:
   db:
@@ -159,12 +165,6 @@ services:
       - ./mariadb-conf/custom.cnf:/etc/mysql/conf.d/custom.cnf:ro
     ports:
       - "\${WG_IP}:${MARIADB_PORT}:3306"
-    healthcheck:
-      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
 
   redis:
     image: ${REDIS_IMAGE}
@@ -175,20 +175,16 @@ services:
     command: redis-server /etc/redis/redis.conf
     ports:
       - "\${WG_IP}:${REDIS_PORT}:6379"
-    healthcheck:
-      test: ["CMD-SHELL", "REDISCLI_AUTH=\"\${REDIS_PASSWORD}\" redis-cli ping | grep PONG"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 YAML
 
     info "正在拉取镜像并启动服务..."
     dc "${DIR}" up -d
     wait_db_ready "${DIR}"
 
-    # 授权数据库用户
+    # 授权当前机器所属的整个 WG 网段（例如 10.10.0.%），允许内网中其他 WG 节点机访问
+    local WG_SUBNET="${WG_IP%.*}.%"
     mariadb_exec "$DIR" <<SQL
-GRANT ALL PRIVILEGES ON \`${MARIADB_DATABASE}\`.* TO '${MARIADB_USER}'@'%' IDENTIFIED BY '${MARIADB_PASSWORD}';
+GRANT ALL PRIVILEGES ON \`${MARIADB_DATABASE}\`.* TO '${MARIADB_USER}'@'${WG_SUBNET}' IDENTIFIED BY '${MARIADB_PASSWORD}';
 FLUSH PRIVILEGES;
 SQL
     
@@ -203,12 +199,13 @@ _print_credentials() {
     _c "1;32" "┌─────────────────────────────────────────────┐"
     _c "1;32" "│           共享基础设施连接信息              │"
     _c "1;32" "├─────────────────────────────────────────────┤"
-    printf "│  MariaDB 地址: %-29s│\n" "${WG_IP}:${MARIADB_PORT}"
+    printf "│  本机监听内网 IP: %-25s│\n" "${WG_IP}"
+    printf "│  MariaDB 端口: %-29s│\n" "${MARIADB_PORT}"
     printf "│  默认库名: %-33s│\n" "${MARIADB_DATABASE}"
     printf "│  默认用户: %-33s│\n" "${MARIADB_USER}"
     printf "│  默认密码: %-33s│\n" "${MARIADB_PASSWORD}"
     _c "1;32" "├─────────────────────────────────────────────┤"
-    printf "│  Redis 地址: %-31s│\n" "${WG_IP}:${REDIS_PORT}"
+    printf "│  Redis 端口: %-31s│\n" "${REDIS_PORT}"
     printf "│  Redis 密码: %-31s│\n" "${REDIS_PASSWORD}"
     _c "1;32" "└─────────────────────────────────────────────┘"
     echo ""
@@ -220,7 +217,6 @@ cmd_add_db() {
     
     read -rp "请输入数据库名: " DB_NAME
     [[ -z "$DB_NAME" ]] && { error "操作取消：数据库名不能为空"; }
-    [[ "$DB_NAME" =~ \  ]] && { error "操作取消：数据库名不能包含空格"; }
     
     read -rp "请输入分配的用户名 [默认同数据库名]: " USER
     USER=${USER:-$DB_NAME}
@@ -231,7 +227,7 @@ cmd_add_db() {
     load_env "$DIR"
     mariadb_exec "$DIR" <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${USER}'@'%' IDENTIFIED BY '${PW}';
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${USER}'@'${WG_IP%.*}.%' IDENTIFIED BY '${PW}';
 FLUSH PRIVILEGES;
 SQL
 
@@ -250,7 +246,7 @@ cmd_list_db() {
     
     header "当前用户列表"
     mariadb_exec "$DIR" -e \
-        "SELECT User AS '用户名', Host AS '允许来源' FROM mysql.user;"
+        "SELECT user AS '用户名', host AS '允许来源' FROM mysql.db GROUP BY user, host;"
 }
 
 cmd_passwd() {
@@ -263,7 +259,7 @@ cmd_passwd() {
 
     load_env "$DIR"
     mariadb_exec "$DIR" -e \
-        "ALTER USER '${USER}'@'%' IDENTIFIED BY '${NEW_PW}'; FLUSH PRIVILEGES;"
+        "ALTER USER '${USER}'@'${WG_IP%.*}.%' IDENTIFIED BY '${NEW_PW}'; FLUSH PRIVILEGES;"
     log "用户 ${USER} 的密码已更新！"
 }
 
@@ -282,7 +278,7 @@ cmd_del_db() {
     load_env "$DIR"
     mariadb_exec "$DIR" <<SQL
 DROP DATABASE IF EXISTS \`${DB_NAME}\`;
-DROP USER IF EXISTS '${USER}'@'%';
+DROP USER IF EXISTS '${USER}'@'${WG_IP%.*}.%';
 FLUSH PRIVILEGES;
 SQL
     log "数据库 ${DB_NAME} 和用户 ${USER} 已彻底删除。"
@@ -301,7 +297,7 @@ cmd_status() {
         warn "MariaDB 无响应"
     fi
 
-    if dc "$DIR" exec -T redis sh -c "REDISCLI_AUTH=\"${REDIS_PASSWORD}\" redis-cli ping" 2>/dev/null | grep -q PONG; then
+    if dc "$DIR" exec -T redis redis-cli -a "${REDIS_PASSWORD}" ping 2>/dev/null | grep -q PONG; then
         log "Redis 状态正常"
     else
         warn "Redis 无响应"
@@ -321,7 +317,7 @@ cmd_backup() {
     local DBS
     DBS=$(mariadb_exec "$DIR" -sN -e \
         "SELECT schema_name FROM information_schema.schemata \
-         WHERE schema_name NOT IN ('mysql','information_schema','performance_schema','sys');" | tr -d '\r')
+         WHERE schema_name NOT IN ('mysql','information_schema','performance_schema','sys');")
 
     for DB in $DBS; do
         local OUT="${DEST}/${DB}_${TS}.sql.gz"
@@ -370,7 +366,7 @@ interactive_menu() {
     while true; do
         echo ""
         _c "1;36" "========================================"
-        _c "1;36" "   共享数据库与缓存管理 (小白向导版)"
+        _c "1;36" "   共享数据库与缓存管理 (WG 绑定版)"
         _c "1;36" "   当前工作目录: ${DIR}"
         _c "1;36" "========================================"
         echo -e "  \e[32m1.\e[0m 🚀 一键部署 MariaDB + Redis"
