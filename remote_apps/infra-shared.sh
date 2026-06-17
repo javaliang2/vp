@@ -114,6 +114,7 @@ EOF
     # 写入配置文件
     mkdir -p "${DIR}/mariadb-conf" "${DIR}/redis-conf"
     
+    # 容器内部网络监听 0.0.0.0，外部访问由 Docker 端口映射限制在 WG_IP
     cat > "${DIR}/mariadb-conf/custom.cnf" <<INI
 [mysqld]
 innodb_buffer_pool_size  = 512M
@@ -123,15 +124,15 @@ max_connections          = 200
 query_cache_type         = 0
 character-set-server     = utf8mb4
 collation-server         = utf8mb4_unicode_ci
-bind-address             = ${WG_IP}
+bind-address             = 0.0.0.0
 slow_query_log           = 1
 slow_query_log_file      = /var/lib/mysql/slow.log
 long_query_time          = 2
 INI
 
     cat > "${DIR}/redis-conf/redis.conf" <<CONF
-bind ${WG_IP} 127.0.0.1
-port ${REDIS_PORT}
+bind 0.0.0.0
+port 6379
 requirepass ${REDIS_PASSWORD}
 save 900 1
 save 300 10
@@ -158,8 +159,7 @@ services:
       - ./db:/var/lib/mysql
       - ./mariadb-conf/custom.cnf:/etc/mysql/conf.d/custom.cnf:ro
     ports:
-      - "${WG_IP}:${MARIADB_PORT}:3306"
-    network_mode: host
+      - "\${WG_IP}:${MARIADB_PORT}:3306"
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 10s
@@ -175,10 +175,9 @@ services:
       - ./redis-conf/redis.conf:/etc/redis/redis.conf:ro
     command: redis-server /etc/redis/redis.conf
     ports:
-      - "${WG_IP}:${REDIS_PORT}:6379"
-    network_mode: host
+      - "\${WG_IP}:${REDIS_PORT}:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "\${REDIS_PASSWORD}", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"\${REDIS_PASSWORD}\" redis-cli ping | grep PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -188,10 +187,9 @@ YAML
     dc "${DIR}" up -d
     wait_db_ready "${DIR}"
 
-    # 授权 WG 网段
-    local WG_SUBNET="${WG_IP%.*}.%"
+    # 授权 WG 网段（Docker映射会导致源IP为网关，因此使用 '%' 即可，安全性由外部端口绑定保证）
     mariadb_exec "$DIR" <<SQL
-GRANT ALL PRIVILEGES ON \`${MARIADB_DATABASE}\`.* TO '${MARIADB_USER}'@'${WG_SUBNET}' IDENTIFIED BY '${MARIADB_PASSWORD}';
+GRANT ALL PRIVILEGES ON \`${MARIADB_DATABASE}\`.* TO '${MARIADB_USER}'@'%' IDENTIFIED BY '${MARIADB_PASSWORD}';
 FLUSH PRIVILEGES;
 SQL
     
@@ -223,6 +221,7 @@ cmd_add_db() {
     
     read -rp "请输入数据库名: " DB_NAME
     [[ -z "$DB_NAME" ]] && { error "操作取消：数据库名不能为空"; }
+    [[ "$DB_NAME" =~ \  ]] && { error "操作取消：数据库名不能包含空格"; }
     
     read -rp "请输入分配的用户名 [默认同数据库名]: " USER
     USER=${USER:-$DB_NAME}
@@ -233,7 +232,7 @@ cmd_add_db() {
     load_env "$DIR"
     mariadb_exec "$DIR" <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${USER}'@'${WG_IP%.*}.%' IDENTIFIED BY '${PW}';
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${USER}'@'%' IDENTIFIED BY '${PW}';
 FLUSH PRIVILEGES;
 SQL
 
@@ -252,7 +251,7 @@ cmd_list_db() {
     
     header "当前用户列表"
     mariadb_exec "$DIR" -e \
-        "SELECT user AS '用户名', host AS '允许来源' FROM mysql.db GROUP BY user, host;"
+        "SELECT User AS '用户名', Host AS '允许来源' FROM mysql.user;"
 }
 
 cmd_passwd() {
@@ -265,7 +264,7 @@ cmd_passwd() {
 
     load_env "$DIR"
     mariadb_exec "$DIR" -e \
-        "ALTER USER '${USER}'@'${WG_IP%.*}.%' IDENTIFIED BY '${NEW_PW}'; FLUSH PRIVILEGES;"
+        "ALTER USER '${USER}'@'%' IDENTIFIED BY '${NEW_PW}'; FLUSH PRIVILEGES;"
     log "用户 ${USER} 的密码已更新！"
 }
 
@@ -284,7 +283,7 @@ cmd_del_db() {
     load_env "$DIR"
     mariadb_exec "$DIR" <<SQL
 DROP DATABASE IF EXISTS \`${DB_NAME}\`;
-DROP USER IF EXISTS '${USER}'@'${WG_IP%.*}.%';
+DROP USER IF EXISTS '${USER}'@'%';
 FLUSH PRIVILEGES;
 SQL
     log "数据库 ${DB_NAME} 和用户 ${USER} 已彻底删除。"
@@ -303,7 +302,7 @@ cmd_status() {
         warn "MariaDB 无响应"
     fi
 
-    if dc "$DIR" exec -T redis redis-cli -a "${REDIS_PASSWORD}" ping 2>/dev/null | grep -q PONG; then
+    if dc "$DIR" exec -T redis sh -c "REDISCLI_AUTH=\"${REDIS_PASSWORD}\" redis-cli ping" 2>/dev/null | grep -q PONG; then
         log "Redis 状态正常"
     else
         warn "Redis 无响应"
@@ -321,9 +320,10 @@ cmd_backup() {
     header "正在备份数据库到 ${DEST}"
 
     local DBS
+    # 清理可能的 \r 回车符，防止备份文件名和路径错乱
     DBS=$(mariadb_exec "$DIR" -sN -e \
         "SELECT schema_name FROM information_schema.schemata \
-         WHERE schema_name NOT IN ('mysql','information_schema','performance_schema','sys');")
+         WHERE schema_name NOT IN ('mysql','information_schema','performance_schema','sys');" | tr -d '\r')
 
     for DB in $DBS; do
         local OUT="${DEST}/${DB}_${TS}.sql.gz"
@@ -423,7 +423,7 @@ if [[ $# -gt 0 ]]; then
     CMD="$1"; shift
     case "$CMD" in
         deploy)   cmd_deploy  "${1:-$DEFAULT_DIR}" ;;
-        add-db)   cmd_add_db  "${1:-$DEFAULT_DIR}" ;; # 兼容老命令可能无法全静默，这里做了混编
+        add-db)   cmd_add_db  "${1:-$DEFAULT_DIR}" ;;
         list-db)  cmd_list_db "${1:-$DEFAULT_DIR}" ;;
         status)   cmd_status  "${1:-$DEFAULT_DIR}" ;;
         *) error "交互式版本请直接运行脚本: bash $0" ;;
