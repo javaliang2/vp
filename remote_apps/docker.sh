@@ -1779,7 +1779,10 @@ YAML
 }
 
 deploy_alist() {
-    local DIR="$1" HOST_PORT="$2" NET="$3"
+    local DIR="${1:-$BASE_DIR/alist}"
+    local HOST_PORT="${2:-${APP_DEFAULT_PORT[alist]}}"
+    local NET
+    NET=$(net_name "$DIR")
     header "开始部署 AList"
 
     # ── 媒体库映射逻辑（完美保留并规范化原版特性） ────────────────────
