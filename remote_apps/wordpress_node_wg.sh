@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # wp-deploy.sh — WordPress 多节点部署（内网 WG + S3 存储交互版）
+# 修复版：安全注入、特殊字符、S3 配置完全环境变量化
 # ============================================================
 set -euo pipefail
 export LANG=en_US.UTF-8
@@ -19,9 +20,6 @@ warn()   { _c "33" "[警告] $*"; }
 error()  { _c "31" "[错误] $*"; exit 1; }
 header() { echo; _c "1;34" "=== $* ==="; }
 
-# 修复：加 true 防止 set -e 误触发
-randpw() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32; true; }
-
 # ── 辅助函数 ────────────────────────────────────────────────
 net_name() { echo "wp_net_$(basename "$1")"; }
 
@@ -35,7 +33,7 @@ wp_cli() {
     dc "$DIR" exec -T wordpress wp --allow-root "$@"
 }
 
-# ── 配置文件生成器 ──────────────────────────────────────────
+# ── 配置文件生成器（全部采用环境变量，无字符串拼接）───────
 _write_nginx_wp_conf() {
     local DEST="$1"
     cat > "$DEST" <<'NGINX'
@@ -90,42 +88,39 @@ max_input_vars      = 10000
 INI
 }
 
+# 完全用环境变量生成 s3-config.php，防止单引号等字符破坏 PHP 语法
 _write_s3_config_php() {
     local DEST="$1"
-    local PROVIDER="$2"
-    local CUSTOM_ENDPOINT="$3"
-    local ENDPOINT_LINE=""
-    [[ -n "$CUSTOM_ENDPOINT" ]] && ENDPOINT_LINE="    'endpoint' => '${CUSTOM_ENDPOINT}',"
-
-    cat > "$DEST" <<PHP
+    cat > "$DEST" <<'PHP'
 <?php
 define('AS3CF_SETTINGS', serialize([
-    'provider'                  => '${PROVIDER}',
-    'access-key-id'             => getenv('AWS_ACCESS_KEY_ID'),
-    'secret-access-key'         => getenv('AWS_SECRET_ACCESS_KEY'),
-    'bucket'                    => getenv('S3_BUCKET'),
-    'region'                    => getenv('S3_REGION'),
-${ENDPOINT_LINE}
-    'copy-to-s3'                => true,
-    'serve-from-s3'             => true,
-    'remove-local-file'         => true,
-    'enable-object-prefix'      => true,
-    'object-prefix'             => 'uploads/',
-    'delivery-provider'         => 'storage',
-    'delivery-provider-domain'  => getenv('S3_CDN_DOMAIN') ?: '',
-    'force-https'               => true,
-    'use-presigned-urls'        => false,
-    'enable-cron'               => false,
+    'provider'                 => getenv('S3_PROVIDER') ?: 'aws',
+    'access-key-id'            => getenv('AWS_ACCESS_KEY_ID'),
+    'secret-access-key'        => getenv('AWS_SECRET_ACCESS_KEY'),
+    'bucket'                   => getenv('S3_BUCKET'),
+    'region'                   => getenv('S3_REGION'),
+    'endpoint'                 => getenv('S3_ENDPOINT') ?: '',
+    'copy-to-s3'               => true,
+    'serve-from-s3'            => true,
+    'remove-local-file'        => true,
+    'enable-object-prefix'     => true,
+    'object-prefix'            => 'uploads/',
+    'delivery-provider'        => 'storage',
+    'delivery-provider-domain' => getenv('S3_CDN_DOMAIN') ?: '',
+    'force-https'              => true,
+    'use-presigned-urls'       => false,
+    'enable-cron'              => false,
 ]));
 PHP
 }
 
-# ── 生成 WORDPRESS_CONFIG_EXTRA（单独函数避免 bash 展开 $_ 变量）──
+# 生成 wp-config-extra.php（修复 session.save_path 特殊字符，唯一加载 s3-config.php 入口）
 _write_wp_config_extra() {
     local REDIS_HOST="$1"
     local REDIS_PW="$2"
-    # 注意：此处故意用单引号heredoc，PHP的$变量不被bash展开
+    # 前半部分用单引号 heredoc 避免 bash 展开
     cat <<'PHPEOF'
+<?php
 if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https' ) {
     $_SERVER['HTTPS'] = 'on';
 }
@@ -135,7 +130,7 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_HOST'] ) ) {
 define( 'WP_HOME',    'https://' . $_SERVER['HTTP_HOST'] );
 define( 'WP_SITEURL', 'https://' . $_SERVER['HTTP_HOST'] );
 PHPEOF
-    # 需要 bash 变量展开的部分单独输出
+    # 后半部分需要 bash 变量展开
     cat <<PHPEOF
 define('WP_REDIS_HOST',   '${REDIS_HOST}');
 define('WP_REDIS_PORT',   6379);
@@ -143,44 +138,49 @@ define('WP_REDIS_AUTH',   '${REDIS_PW}');
 define('WP_CACHE',        true);
 define('WP_MEMORY_LIMIT', '512M');
 define('WP_MAX_MEMORY_LIMIT', '1024M');
+
+// 安全的 session.save_path，密码经过 urlencode 处理
 ini_set('session.save_handler', 'redis');
-ini_set('session.save_path', 'tcp://${REDIS_HOST}:6379?auth=${REDIS_PW}');
+ini_set('session.save_path', 'tcp://' . WP_REDIS_HOST . ':' . WP_REDIS_PORT . '?auth=' . urlencode(WP_REDIS_AUTH));
+
+// 唯一加载 S3 配置的位置
 if (file_exists(ABSPATH . 'wp-content/s3-config.php')) {
     require_once(ABSPATH . 'wp-content/s3-config.php');
 }
 PHPEOF
 }
 
-# ── 核心异步任务：激活并配置 S3 插件 ─────────────────────────
+# ── 核心异步任务：注入额外配置 + 安装 S3 插件 ─────────────
 _wait_and_setup_plugin() {
     local DIR="$1"
-    info "后台任务：等待 WordPress 容器初始化（约需 30 秒）..."
-    sleep 30
-
-    local RETRIES=10
+    info "后台任务：等待 WordPress 容器就绪..."
+    # 最长等待 5 分钟
+    local RETRIES=60
     while ! wp_cli "$DIR" core is-installed &>/dev/null; do
         sleep 5
         (( RETRIES-- ))
         if [[ $RETRIES -eq 0 ]]; then
-            warn "WordPress 初始化未完成，请稍后在菜单手动安装 Offload Media 插件。"
+            warn "WordPress 初始化超时，请稍后通过菜单 6 手动完成配置。"
             return 1
         fi
     done
 
+    # 1. 将 wp-config-extra.php 注入到 wp-config.php 最顶部
+    local WP_CONFIG="/var/www/html/wp-config.php"
+    if ! dc "$DIR" exec -T wordpress grep -q "wp-config-extra.php" "$WP_CONFIG"; then
+        dc "$DIR" exec -T wordpress sed -i "1s|<?php|<?php\nrequire_once(ABSPATH . 'wp-config-extra.php');|" "$WP_CONFIG"
+        log "wp-config-extra.php 注入成功"
+    else
+        log "wp-config-extra.php 已存在，跳过注入"
+    fi
+
+    # 2. 安装并激活 WP Offload Media 插件（不再重复引入 s3-config.php）
     if wp_cli "$DIR" plugin is-installed amazon-s3-and-cloudfront &>/dev/null; then
         wp_cli "$DIR" plugin activate amazon-s3-and-cloudfront
     else
         wp_cli "$DIR" plugin install amazon-s3-and-cloudfront --activate
     fi
-    log "WP Offload Media 插件已在后台成功安装并激活！"
-
-    local WP_CONFIG_FILE
-    WP_CONFIG_FILE=$(dc "$DIR" exec -T wordpress find /var/www/html -maxdepth 1 -name wp-config.php 2>/dev/null | head -1 | tr -d '\r')
-    if [[ -n "$WP_CONFIG_FILE" ]]; then
-        dc "$DIR" exec -T wordpress grep -q "s3-config.php" "$WP_CONFIG_FILE" || \
-        dc "$DIR" exec -T wordpress sed -i "s|<?php|<?php\nrequire_once(ABSPATH . 'wp-content/s3-config.php');|" "$WP_CONFIG_FILE"
-        log "s3-config.php 已成功挂载到 WordPress 核心配置中！"
-    fi
+    log "WP Offload Media 插件已就绪，S3 配置即将生效。"
 }
 
 # ════════════════════════════════════════════════════════════
@@ -238,13 +238,19 @@ cmd_deploy() {
     [[ -z "$S3_SECRET" ]] && error "S3 Secret 不能为空"
     read -rp "请输入绑定的 CDN 域名 [没有请留空直接回车]: " S3_CDN_DOMAIN
 
+    # 输入值安全检查：去除空格防止 .env 解析异常
+    DB_PW="${DB_PW//[[:space:]]/}"
+    REDIS_PW="${REDIS_PW//[[:space:]]/}"
+    S3_KEY="${S3_KEY//[[:space:]]/}"
+    S3_SECRET="${S3_SECRET//[[:space:]]/}"
+
     # ── 开始执行部署 ──────────────────────────────────────────
     info "正在创建目录结构..."
     mkdir -p "$DIR"/{data,uploads,logs}
     local NET
     NET=$(net_name "$DIR")
 
-    # 写入 .env
+    # 写入 .env（增加 S3_PROVIDER 和 S3_ENDPOINT）
     cat > "$DIR/.env" <<EOF
 WORDPRESS_DB_PASSWORD=${DB_PW}
 WORDPRESS_DB_NAME=${DB_NAME}
@@ -257,6 +263,8 @@ AWS_ACCESS_KEY_ID=${S3_KEY}
 AWS_SECRET_ACCESS_KEY=${S3_SECRET}
 S3_BUCKET=${S3_BUCKET}
 S3_REGION=${S3_REGION}
+S3_PROVIDER=${S3_PROVIDER}
+S3_ENDPOINT=${S3_ENDPOINT}
 S3_CDN_DOMAIN=${S3_CDN_DOMAIN}
 EOF
     chmod 600 "$DIR/.env"
@@ -264,14 +272,10 @@ EOF
     # 生成辅助配置文件
     _write_nginx_wp_conf   "$DIR/uploads/nginx-wp.conf"
     _write_php_uploads_ini "$DIR/uploads/php-uploads.ini"
-    _write_s3_config_php   "$DIR/uploads/s3-config.php" "$S3_PROVIDER" "$S3_ENDPOINT"
-
-    # 预生成 config extra 到文件，避免 compose yaml 里的 bash 变量展开问题
-    local CONFIG_EXTRA_FILE="$DIR/uploads/wp-config-extra.php"
-    _write_wp_config_extra "$REDIS_HOST" "$REDIS_PW" > "$CONFIG_EXTRA_FILE"
+    _write_s3_config_php   "$DIR/uploads/s3-config.php"
+    _write_wp_config_extra "$REDIS_HOST" "$REDIS_PW" > "$DIR/uploads/wp-config-extra.php"
 
     # 生成 docker-compose.yml
-    # 修复：WORDPRESS_CONFIG_EXTRA 改为挂载文件方式，彻底避免 $_SERVER 被 bash 展开
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   wordpress:
@@ -286,6 +290,8 @@ services:
       AWS_SECRET_ACCESS_KEY: \${AWS_SECRET_ACCESS_KEY}
       S3_BUCKET:             \${S3_BUCKET}
       S3_REGION:             \${S3_REGION}
+      S3_PROVIDER:           \${S3_PROVIDER}
+      S3_ENDPOINT:           \${S3_ENDPOINT}
       S3_CDN_DOMAIN:         \${S3_CDN_DOMAIN}
     volumes:
       - ./data:/var/www/html
@@ -293,8 +299,6 @@ services:
       - ./uploads/s3-config.php:/var/www/html/wp-content/s3-config.php:ro
       - ./uploads/wp-config-extra.php:/var/www/html/wp-config-extra.php:ro
     networks: [${NET}]
-    extra_hosts:
-      - "host-wg:host-gateway"
 
   nginx:
     image: nginx:alpine
@@ -313,22 +317,10 @@ networks:
     driver: bridge
 YAML
 
-    # 生成 wp-config.php 注入脚本（在容器启动后执行）
-    cat > "$DIR/uploads/inject-config.sh" <<'SH'
-#!/bin/sh
-WP_CONFIG=/var/www/html/wp-config.php
-EXTRA=/var/www/html/wp-config-extra.php
-if [ -f "$WP_CONFIG" ] && [ -f "$EXTRA" ]; then
-    grep -q "wp-config-extra.php" "$WP_CONFIG" || \
-        sed -i "s|<?php|<?php\nrequire_once(ABSPATH . 'wp-config-extra.php');|" "$WP_CONFIG"
-fi
-SH
-    chmod +x "$DIR/uploads/inject-config.sh"
-
     info "正在拉取镜像并构建本地节点环境..."
     dc "$DIR" up -d 2>&1 || error "docker compose up 失败"
 
-    # 异步触发后台插件安装
+    # 异步触发后台配置注入与插件安装
     _wait_and_setup_plugin "$DIR" &
 
     log "WordPress 节点容器群启动成功！"
@@ -336,7 +328,7 @@ SH
     echo -e "内网数据库目标: \e[33m${DB_HOST}\e[0m"
     echo -e "内网缓存共享: \e[33m${REDIS_HOST}\e[0m"
     echo -e "静态资源上云桶: \e[33ms3://${S3_BUCKET}\e[0m"
-    warn "媒体分离插件正在后台静默安装，配置好站点后自动生效。"
+    warn "配置正在后台生效（最长约5分钟），请稍后访问站点。"
 }
 
 cmd_status() {
@@ -368,7 +360,7 @@ interactive_menu() {
         echo -e "  \e[32m3.\e[0m 查看业务节点实时运行日志"
         echo -e "  \e[31m4.\e[0m 停止该节点服务"
         echo -e "  \e[32m5.\e[0m 启动该节点服务"
-        echo -e "  \e[33m6.\e[0m 手动触发重试安装 S3 媒体分离插件"
+        echo -e "  \e[33m6.\e[0m 手动重试注入配置 / 安装 S3 插件"
         echo -e "  \e[36m0.\e[0m 退出管理向导"
         echo "----------------------------------------"
         read -rp "请输入功能序号并回车: " CHOICE
