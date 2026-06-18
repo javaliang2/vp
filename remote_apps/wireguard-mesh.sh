@@ -244,10 +244,18 @@ PY
 }
 
 # ── up ──────────────────────────────────────────────────────
+# ── up ──────────────────────────────────────────────────────
 cmd_up() {
     require_root
     require_conf
     header "启动 ${WG_IFACE}"
+
+    # 清理残留接口，防止 "already exists" 报错
+    if ip link show "${WG_IFACE}" &>/dev/null; then
+        warn "${WG_IFACE} 接口已存在，先清理残留..."
+        wg-quick down "${WG_IFACE}" 2>/dev/null || ip link delete "${WG_IFACE}" 2>/dev/null || true
+        sleep 1
+    fi
 
     systemctl enable --now "wg-quick@${WG_IFACE}"
     sleep 1
@@ -259,7 +267,14 @@ cmd_up() {
 cmd_down() {
     require_root
     header "停止 ${WG_IFACE}"
-    systemctl disable --now "wg-quick@${WG_IFACE}" || true
+    systemctl disable --now "wg-quick@${WG_IFACE}" 2>/dev/null || true
+
+    # 兜底：systemd 停止失败时直接删除接口
+    if ip link show "${WG_IFACE}" &>/dev/null; then
+        warn "接口仍存在，强制删除..."
+        ip link delete "${WG_IFACE}" 2>/dev/null || true
+    fi
+
     log "${WG_IFACE} 已停止"
 }
 
