@@ -267,19 +267,22 @@ YAML
 # 修复 #1：增加 WG_IP 参数，不再从 load_env 隐式获取
 _grant_wg_access() {
     local DIR="$1" DB="$2" USER="$3" PW="$4"
-    local _ARG_WG_IP="${5:-}"   # 先保存参数，load_env 会覆盖同名变量
-    load_env "$DIR"             # source .env → WG_IP 被赋为 .env 中的值
-    # 参数显式传入时优先使用参数值，否则回退到 .env
+    local _ARG_WG_IP="${5:-}"
+    load_env "$DIR"
     local WG_IP="${_ARG_WG_IP:-${WG_IP}}"
     local WG_SUBNET="${WG_IP%.*}.%"
-    # MariaDB 10.4+ 默认开启 NO_AUTO_CREATE_USER
-    # GRANT...IDENTIFIED BY 若用户不存在会报错，必须拆为两步
+
     mariadb_exec "$DIR" <<SQL
 CREATE USER IF NOT EXISTS '${USER}'@'${WG_SUBNET}' IDENTIFIED BY '${PW}';
 GRANT ALL PRIVILEGES ON \`${DB}\`.* TO '${USER}'@'${WG_SUBNET}';
+
+-- Docker 桥接网段（容器通过宿主机 IP 访问数据库时，源 IP 为 172.x.x.x）
+CREATE USER IF NOT EXISTS '${USER}'@'172.%' IDENTIFIED BY '${PW}';
+GRANT ALL PRIVILEGES ON \`${DB}\`.* TO '${USER}'@'172.%';
+
 FLUSH PRIVILEGES;
 SQL
-    log "已授权 ${USER}@${WG_SUBNET} 访问 ${DB}"
+    log "已授权 ${USER}@${WG_SUBNET} 和 ${USER}@172.% 访问 ${DB}"
 }
 
 # ── 打印凭据摘要 ─────────────────────────────────────────────
@@ -325,6 +328,8 @@ cmd_add_db() {
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS '${USER}'@'${WG_IP%.*}.%' IDENTIFIED BY '${PW}';
 GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${USER}'@'${WG_IP%.*}.%';
+CREATE USER IF NOT EXISTS '${USER}'@'172.%' IDENTIFIED BY '${PW}';
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${USER}'@'172.%';
 FLUSH PRIVILEGES;
 SQL
 
@@ -353,6 +358,7 @@ cmd_del_db() {
     mariadb_exec "$DIR" <<SQL
 DROP DATABASE IF EXISTS \`${DB_NAME}\`;
 DROP USER IF EXISTS '${USER}'@'${WG_IP%.*}.%';
+DROP USER IF EXISTS '${USER}'@'172.%';
 FLUSH PRIVILEGES;
 SQL
     log "数据库 ${DB_NAME} 和用户 ${USER} 已删除"
