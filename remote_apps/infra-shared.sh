@@ -463,26 +463,48 @@ cmd_logs()  {
     dc "$DIR" logs -f --tail=100 "$SVC"
 }
 
+# ── 入口 ────────────────────────────────────────────────────
+main() {
+    local CMD="${1:-help}"
+    shift || true
+
+    case "$CMD" in
+        deploy)   cmd_deploy  "$@" ;;
+        add-db)   cmd_add_db  "$@" ;;
+        del-db)   cmd_del_db  "$@" ;;
+        list-db)  cmd_list_db "$@" ;;
+        passwd)   cmd_passwd  "$@" ;;
+        backup)   cmd_backup  "$@" ;;
+        restore)  cmd_restore "$@" ;;
+        status)   cmd_status  "$@" ;;
+        stop)     cmd_stop    "$@" ;;
+        start)    cmd_start   "$@" ;;
+        logs)     cmd_logs    "$@" ;;
+        help|--help|-h)
+            grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \{0,2\}//'
+            ;;
+        *) error "未知子命令: ${CMD}，执行 help 查看用法" ;;
+    esac
+}
+
+main "$@"
+
 # ════════════════════════════════════════════════════════════
 # 交互菜单
 # ════════════════════════════════════════════════════════════
 
-# ── 按回车继续 ───────────────────────────────────────────────
 _pause() { echo; read -rp "  按 Enter 返回菜单..." _; }
 
-# ── 提示输入，支持默认值 ─────────────────────────────────────
 _ask() {
     local PROMPT="$1" VAR="$2" DEFAULT="${3:-}"
     local HINT=""
     [[ -n "$DEFAULT" ]] && HINT=" [默认: ${DEFAULT}]"
     read -rp "  ${PROMPT}${HINT}: " "$VAR"
-    # 若用户直接回车则使用默认值
     if [[ -z "${!VAR}" && -n "$DEFAULT" ]]; then
         printf -v "$VAR" '%s' "$DEFAULT"
     fi
 }
 
-# ── 菜单标题 ─────────────────────────────────────────────────
 _menu_header() {
     clear
     echo
@@ -492,7 +514,6 @@ _menu_header() {
     echo
 }
 
-# ── 主菜单 ───────────────────────────────────────────────────
 menu_main() {
     while true; do
         _menu_header
@@ -517,19 +538,37 @@ menu_main() {
             6) menu_backup   ;;
             7) menu_logs     ;;
             0) echo; info "再见！"; exit 0 ;;
-            *) warn "无效选项，请重新输入" ; sleep 1 ;;
+            *) warn "无效选项，请重新输入"; sleep 1 ;;
         esac
     done
 }
 
-# ── 部署 ─────────────────────────────────────────────────────
 menu_deploy() {
     _menu_header
     _c "1;33" "  ▶ 部署共享基础设施"
     echo
+
+    # 安全检测 wg IP，不调用 error()（error 会 exit，菜单模式不适用）
+    local AUTO_IP=""
+    if ip link show "${WG_IFACE}" &>/dev/null; then
+        AUTO_IP=$(ip addr show "${WG_IFACE}" \
+            | awk '/inet /{gsub(/\/.*/, "", $2); print $2; exit}')
+    fi
+
+    if [[ -z "$AUTO_IP" ]]; then
+        warn "${WG_IFACE} 接口未检测到，请确认 WireGuard 已启动"
+        warn "也可手动输入 WireGuard IP 强制继续"
+        echo
+    fi
+
     _ask "部署目录" DIR "$DEFAULT_DIR"
-    local AUTO_IP; AUTO_IP=$(get_wg_ip 2>/dev/null || echo "")
-    _ask "WireGuard IP（留空自动检测）" WG_IP "${AUTO_IP}"
+    _ask "WireGuard IP" WG_IP "${AUTO_IP}"
+
+    if [[ -z "$WG_IP" ]]; then
+        warn "WireGuard IP 不能为空，已取消"
+        _pause; return
+    fi
+
     echo
     warn "即将部署到 ${DIR}，WireGuard IP: ${WG_IP}"
     read -rp "  确认继续? [y/N] " C
@@ -539,7 +578,6 @@ menu_deploy() {
     _pause
 }
 
-# ── 状态 ─────────────────────────────────────────────────────
 menu_status() {
     _menu_header
     _ask "部署目录" DIR "$DEFAULT_DIR"
@@ -548,7 +586,6 @@ menu_status() {
     _pause
 }
 
-# ── 启动 ─────────────────────────────────────────────────────
 menu_start() {
     _menu_header
     _ask "部署目录" DIR "$DEFAULT_DIR"
@@ -557,7 +594,6 @@ menu_start() {
     _pause
 }
 
-# ── 停止 ─────────────────────────────────────────────────────
 menu_stop() {
     _menu_header
     _ask "部署目录" DIR "$DEFAULT_DIR"
@@ -569,7 +605,6 @@ menu_stop() {
     _pause
 }
 
-# ── 日志 ─────────────────────────────────────────────────────
 menu_logs() {
     _menu_header
     _c "1;33" "  ▶ 查看日志"
@@ -591,7 +626,6 @@ menu_logs() {
     _pause
 }
 
-# ── 数据库子菜单 ─────────────────────────────────────────────
 menu_db() {
     while true; do
         _menu_header
@@ -636,7 +670,6 @@ menu_db_del() {
     _c "1;33" "  ▶ 删除数据库和用户"
     echo
     _ask "部署目录" DIR "$DEFAULT_DIR"
-    # 先列出现有库方便参考
     info "当前数据库列表："
     cmd_list_db "$DIR" 2>/dev/null || true
     echo
@@ -669,7 +702,6 @@ menu_db_passwd() {
     _pause
 }
 
-# ── 备份 / 恢复子菜单 ────────────────────────────────────────
 menu_backup() {
     while true; do
         _menu_header
@@ -681,8 +713,8 @@ menu_backup() {
         echo
         read -rp "  请选择 [0-2]: " C
         case "$C" in
-            1) menu_backup_run    ;;
-            2) menu_restore_run   ;;
+            1) menu_backup_run  ;;
+            2) menu_restore_run ;;
             0) return ;;
             *) warn "无效选项"; sleep 1 ;;
         esac
@@ -714,14 +746,12 @@ menu_restore_run() {
 
 # ── 入口 ────────────────────────────────────────────────────
 main() {
-    # 无参数 → 交互菜单
     if [[ $# -eq 0 ]]; then
         menu_main
         return
     fi
 
-    local CMD="$1"
-    shift
+    local CMD="$1"; shift
 
     case "$CMD" in
         deploy)   cmd_deploy  "$@" ;;
