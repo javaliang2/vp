@@ -145,26 +145,46 @@ PHPEOF
 }
 
 # ── 核心异步任务 ────────────────────────────────────────────
+# 修复：wp-config-extra.php 注入不应依赖 core is-installed
+# （该命令要求已完成网页安装向导才返回 true，全新部署若未立即走完
+#  安装向导，会导致注入被无限期推迟，WP_REDIS_HOST 等常量永不生效，
+#  WordPress/Redis 插件只能 fallback 到默认值 127.0.0.1）。
+# 现在分两步：
+#   1) 只要 wp-config.php 文件存在即可注入 require_once，不等安装向导
+#   2) 仍然等待 core is-installed 后再装/启用插件（wp-cli 插件命令需要已安装的 WP）
 _wait_and_setup_plugin() {
     local DIR="$1"
-    info "后台任务：等待 WordPress 容器就绪..."
+    local WP_CONFIG="/var/www/html/wp-config.php"
+
+    info "等待 wp-config.php 生成..."
+    local CFG_RETRIES=30
+    while ! dc "$DIR" exec -T wordpress test -f "$WP_CONFIG" 2>/dev/null; do
+        sleep 2
+        (( CFG_RETRIES-- ))
+        if [[ $CFG_RETRIES -eq 0 ]]; then
+            warn "wp-config.php 未生成，注入失败，请稍后通过菜单 6 手动重试。"
+            return 1
+        fi
+    done
+
+    if ! dc "$DIR" exec -T wordpress grep -q "wp-config-extra.php" "$WP_CONFIG"; then
+        dc "$DIR" exec -T wordpress sed -i "1s|<?php|<?php\nrequire_once(ABSPATH . 'wp-config-extra.php');|" "$WP_CONFIG"
+        log "wp-config-extra.php 注入成功（Redis/S3 常量已生效）"
+    else
+        log "wp-config-extra.php 已存在，跳过注入"
+    fi
+
+    info "后台任务：等待 WordPress 完成安装向导..."
     local RETRIES=60
     while ! wp_cli "$DIR" core is-installed &>/dev/null; do
         sleep 5
         (( RETRIES-- ))
         if [[ $RETRIES -eq 0 ]]; then
-            warn "WordPress 初始化超时，请稍后通过菜单 6 手动完成配置。"
+            warn "WordPress 安装向导未完成（请先在浏览器里走完初始设置），S3/Redis 插件安装已跳过。"
+            warn "完成安装向导后，请通过菜单 6 重新执行本步骤。"
             return 1
         fi
     done
-
-    local WP_CONFIG="/var/www/html/wp-config.php"
-    if ! dc "$DIR" exec -T wordpress grep -q "wp-config-extra.php" "$WP_CONFIG"; then
-        dc "$DIR" exec -T wordpress sed -i "1s|<?php|<?php\nrequire_once(ABSPATH . 'wp-config-extra.php');|" "$WP_CONFIG"
-        log "wp-config-extra.php 注入成功"
-    else
-        log "wp-config-extra.php 已存在，跳过注入"
-    fi
 
     if wp_cli "$DIR" plugin is-installed amazon-s3-and-cloudfront &>/dev/null; then
         wp_cli "$DIR" plugin activate amazon-s3-and-cloudfront
@@ -172,6 +192,15 @@ _wait_and_setup_plugin() {
         wp_cli "$DIR" plugin install amazon-s3-and-cloudfront --activate
     fi
     log "WP Offload Media 插件已就绪。"
+
+    # Redis Object Cache 插件：常量定义后必须配合此插件的 drop-in 才能真正生效
+    if wp_cli "$DIR" plugin is-installed redis-cache &>/dev/null; then
+        wp_cli "$DIR" plugin activate redis-cache
+    else
+        wp_cli "$DIR" plugin install redis-cache --activate
+    fi
+    wp_cli "$DIR" redis enable || warn "Redis 启用失败，请检查 WP_REDIS_HOST/AUTH 是否正确，并手动执行: wp redis enable"
+    log "Redis Object Cache 已启用"
 }
 
 # ════════════════════════════════════════════════════════════
