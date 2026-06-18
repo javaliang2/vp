@@ -197,23 +197,17 @@ cmd_remove_peer() {
     require_root
     require_conf
     local PUB_KEY="${1:-}"
-    # 去除所有空白字符，避免复制时带入的换行、空格
     PUB_KEY="$(tr -d '[:space:]' <<< "$PUB_KEY")"
     [[ -z "$PUB_KEY" ]] && { warn "公钥为空"; return 1; }
 
     header "移除 Peer: ${PUB_KEY:0:20}..."
 
-    # 先检查是否存在该 Peer
     if ! grep -qF "$PUB_KEY" "$WG_CONF"; then
         warn "配置文件中未找到该公钥: ${PUB_KEY:0:20}..."
         return 1
     fi
 
-    # Python 精确删除，失败时仅警告而不退出脚本
-    python3 - "$WG_CONF" "$PUB_KEY" <<'PY' || {
-        warn "移除失败：Peer 可能不存在或配置格式异常"
-        return 1
-    }
+    python3 - "$WG_CONF" "$PUB_KEY" <<'PY'
 import sys, re
 
 conf_file = sys.argv[1]
@@ -244,8 +238,12 @@ with open(conf_file, 'w') as f:
 
 print(f"已从配置文件移除 Peer: {target_key[:20]}...")
 PY
+    local PY_RET=$?
+    if [[ $PY_RET -ne 0 ]]; then
+        warn "移除失败：Peer 可能不存在或配置格式异常"
+        return 1
+    fi
 
-    # 如果 wg0 已运行，热移除
     if systemctl is-active --quiet "wg-quick@${WG_IFACE}"; then
         wg set "${WG_IFACE}" peer "$PUB_KEY" remove 2>/dev/null || \
             warn "运行时移除失败（可能对端已不存在），配置文件已更新"
