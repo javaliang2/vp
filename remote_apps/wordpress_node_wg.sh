@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # wp-deploy.sh — WordPress 多节点部署（内网 WG + S3 存储交互版）
-# 修复版：安全注入、特殊字符、S3 配置完全环境变量化
-# 新增：Nginx 仅监听 WireGuard IP，增强内网安全
+# 功能：部署、状态、日志、启停、重试配置、删除节点、更新镜像
 # ============================================================
 set -euo pipefail
 export LANG=en_US.UTF-8
@@ -34,7 +33,7 @@ wp_cli() {
     dc "$DIR" exec -T wordpress wp --allow-root "$@"
 }
 
-# ── 配置文件生成器（全部采用环境变量，无字符串拼接）───────
+# ── 配置文件生成器 ──────────────────────────────────────────
 _write_nginx_wp_conf() {
     local DEST="$1"
     cat > "$DEST" <<'NGINX'
@@ -89,7 +88,6 @@ max_input_vars      = 10000
 INI
 }
 
-# 完全用环境变量生成 s3-config.php，防止单引号等字符破坏 PHP 语法
 _write_s3_config_php() {
     local DEST="$1"
     cat > "$DEST" <<'PHP'
@@ -115,11 +113,9 @@ define('AS3CF_SETTINGS', serialize([
 PHP
 }
 
-# 生成 wp-config-extra.php（修复 session.save_path 特殊字符，唯一加载 s3-config.php 入口）
 _write_wp_config_extra() {
     local REDIS_HOST="$1"
     local REDIS_PW="$2"
-    # 前半部分用单引号 heredoc 避免 bash 展开
     cat <<'PHPEOF'
 <?php
 if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https' ) {
@@ -131,7 +127,6 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_HOST'] ) ) {
 define( 'WP_HOME',    'https://' . $_SERVER['HTTP_HOST'] );
 define( 'WP_SITEURL', 'https://' . $_SERVER['HTTP_HOST'] );
 PHPEOF
-    # 后半部分需要 bash 变量展开
     cat <<PHPEOF
 define('WP_REDIS_HOST',   '${REDIS_HOST}');
 define('WP_REDIS_PORT',   6379);
@@ -140,22 +135,19 @@ define('WP_CACHE',        true);
 define('WP_MEMORY_LIMIT', '512M');
 define('WP_MAX_MEMORY_LIMIT', '1024M');
 
-// 安全的 session.save_path，密码经过 urlencode 处理
 ini_set('session.save_handler', 'redis');
 ini_set('session.save_path', 'tcp://' . WP_REDIS_HOST . ':' . WP_REDIS_PORT . '?auth=' . urlencode(WP_REDIS_AUTH));
 
-// 唯一加载 S3 配置的位置
 if (file_exists(ABSPATH . 'wp-content/s3-config.php')) {
     require_once(ABSPATH . 'wp-content/s3-config.php');
 }
 PHPEOF
 }
 
-# ── 核心异步任务：注入额外配置 + 安装 S3 插件 ─────────────
+# ── 核心异步任务 ────────────────────────────────────────────
 _wait_and_setup_plugin() {
     local DIR="$1"
     info "后台任务：等待 WordPress 容器就绪..."
-    # 最长等待 5 分钟
     local RETRIES=60
     while ! wp_cli "$DIR" core is-installed &>/dev/null; do
         sleep 5
@@ -166,7 +158,6 @@ _wait_and_setup_plugin() {
         fi
     done
 
-    # 1. 将 wp-config-extra.php 注入到 wp-config.php 最顶部
     local WP_CONFIG="/var/www/html/wp-config.php"
     if ! dc "$DIR" exec -T wordpress grep -q "wp-config-extra.php" "$WP_CONFIG"; then
         dc "$DIR" exec -T wordpress sed -i "1s|<?php|<?php\nrequire_once(ABSPATH . 'wp-config-extra.php');|" "$WP_CONFIG"
@@ -175,13 +166,12 @@ _wait_and_setup_plugin() {
         log "wp-config-extra.php 已存在，跳过注入"
     fi
 
-    # 2. 安装并激活 WP Offload Media 插件（不再重复引入 s3-config.php）
     if wp_cli "$DIR" plugin is-installed amazon-s3-and-cloudfront &>/dev/null; then
         wp_cli "$DIR" plugin activate amazon-s3-and-cloudfront
     else
         wp_cli "$DIR" plugin install amazon-s3-and-cloudfront --activate
     fi
-    log "WP Offload Media 插件已就绪，S3 配置即将生效。"
+    log "WP Offload Media 插件已就绪。"
 }
 
 # ════════════════════════════════════════════════════════════
@@ -191,13 +181,11 @@ _wait_and_setup_plugin() {
 cmd_deploy() {
     header "启动 WordPress 节点部署向导"
 
-    # 1. 基础路径和端口
     read -rp "请输入部署目录 [默认: ${DEFAULT_DIR}]: " DIR
     DIR="${DIR:-$DEFAULT_DIR}"
     read -rp "请输入本机对外监听端口 [默认: ${DEFAULT_PORT}]: " HOST_PORT
     HOST_PORT="${HOST_PORT:-$DEFAULT_PORT}"
 
-    # 2. 数据库与缓存配置
     info "--- 远端共享数据库与缓存配置 (WireGuard 内网) ---"
     read -rp "请输入 MariaDB 的 WireGuard IP: " DB_HOST
     [[ -z "$DB_HOST" ]] && error "数据库 IP 不能为空"
@@ -213,7 +201,6 @@ cmd_deploy() {
     read -rp "请输入 Redis 连接密码: " REDIS_PW
     [[ -z "$REDIS_PW" ]] && error "Redis 密码不能为空"
 
-    # 3. 对象存储 S3 配置
     info "--- 共享对象存储配置 (支持 AWS / Cloudflare R2 / MinIO) ---"
     read -rp "请选择存储提供商 (1: AWS S3, 2: Cloudflare R2, 3: 其他/MinIO) [默认: 1]: " S3_CHOICE
     local S3_PROVIDER="aws"
@@ -223,13 +210,13 @@ cmd_deploy() {
         3) S3_PROVIDER="other" ;;
     esac
 
-    read -rp "请输入 S3 存储桶(Bucket)名称: " S3_BUCKET
+    read -rp "请输入 S3 存储桶名称: " S3_BUCKET
     [[ -z "$S3_BUCKET" ]] && error "存储桶名称不能为空"
-    read -rp "请输入 S3 区域(Region) [默认: us-east-1 / R2填 auto]: " S3_REGION
+    read -rp "请输入 S3 区域 [默认: us-east-1 / R2填 auto]: " S3_REGION
     S3_REGION="${S3_REGION:-us-east-1}"
 
     if [[ "$S3_PROVIDER" != "aws" ]]; then
-        read -rp "请输入自定义 Endpoint URL (例如 https://<id>.r2.cloudflarestorage.com): " S3_ENDPOINT
+        read -rp "请输入自定义 Endpoint URL: " S3_ENDPOINT
         [[ -z "$S3_ENDPOINT" ]] && error "非 AWS 提供商必须填写 Endpoint"
     fi
 
@@ -237,15 +224,15 @@ cmd_deploy() {
     [[ -z "$S3_KEY" ]] && error "S3 Key 不能为空"
     read -rp "请输入 S3 Secret Access Key: " S3_SECRET
     [[ -z "$S3_SECRET" ]] && error "S3 Secret 不能为空"
-    read -rp "请输入绑定的 CDN 域名 [没有请留空直接回车]: " S3_CDN_DOMAIN
+    read -rp "请输入绑定的 CDN 域名 [没有请留空]: " S3_CDN_DOMAIN
 
-    # 输入值安全检查：去除空格防止 .env 解析异常
+    # 输入清理
     DB_PW="${DB_PW//[[:space:]]/}"
     REDIS_PW="${REDIS_PW//[[:space:]]/}"
     S3_KEY="${S3_KEY//[[:space:]]/}"
     S3_SECRET="${S3_SECRET//[[:space:]]/}"
 
-    # ── 获取 WireGuard 接口 IP ──────────────────────────────
+    # 获取 WireGuard IP
     info "检测本机 WireGuard 接口地址..."
     WG_IP=""
     if ip -4 addr show wg0 &>/dev/null; then
@@ -253,17 +240,15 @@ cmd_deploy() {
         log "检测到 wg0 IP: ${WG_IP}，Nginx 将仅监听此地址。"
     else
         warn "未找到 wg0 接口，回退为监听 0.0.0.0（所有接口）。"
-        warn "请务必通过防火墙限制访问（如仅允许 WireGuard 子网）。"
+        warn "请务必通过防火墙限制访问。"
         WG_IP="0.0.0.0"
     fi
 
-    # ── 开始执行部署 ──────────────────────────────────────────
     info "正在创建目录结构..."
     mkdir -p "$DIR"/{data,uploads,logs}
     local NET
     NET=$(net_name "$DIR")
 
-    # 写入 .env（包含 WG_IP）
     cat > "$DIR/.env" <<EOF
 WORDPRESS_DB_PASSWORD=${DB_PW}
 WORDPRESS_DB_NAME=${DB_NAME}
@@ -283,13 +268,11 @@ WG_IP=${WG_IP}
 EOF
     chmod 600 "$DIR/.env"
 
-    # 生成辅助配置文件
     _write_nginx_wp_conf   "$DIR/uploads/nginx-wp.conf"
     _write_php_uploads_ini "$DIR/uploads/php-uploads.ini"
     _write_s3_config_php   "$DIR/uploads/s3-config.php"
     _write_wp_config_extra "$REDIS_HOST" "$REDIS_PW" > "$DIR/uploads/wp-config-extra.php"
 
-    # 生成 docker-compose.yml（端口绑定至 WG IP）
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   wordpress:
@@ -334,16 +317,15 @@ YAML
     info "正在拉取镜像并构建本地节点环境..."
     dc "$DIR" up -d 2>&1 || error "docker compose up 失败"
 
-    # 异步触发后台配置注入与插件安装
     _wait_and_setup_plugin "$DIR" &
 
     log "WordPress 节点容器群启动成功！"
     echo -e "绑定地址: \e[33m${WG_IP}:${HOST_PORT}\e[0m"
-    echo -e "内网数据库目标: \e[33m${DB_HOST}\e[0m"
-    echo -e "内网缓存共享: \e[33m${REDIS_HOST}\e[0m"
-    echo -e "静态资源上云桶: \e[33ms3://${S3_BUCKET}\e[0m"
+    echo -e "内网数据库: \e[33m${DB_HOST}\e[0m"
+    echo -e "内网缓存: \e[33m${REDIS_HOST}\e[0m"
+    echo -e "对象存储桶: \e[33ms3://${S3_BUCKET}\e[0m"
     if [[ "$WG_IP" == "0.0.0.0" ]]; then
-        warn "当前监听所有接口，请立即配置防火墙保护端口 ${HOST_PORT}！"
+        warn "当前监听所有接口，请立即配置防火墙！"
     fi
 }
 
@@ -362,6 +344,57 @@ cmd_logs() {
     dc "$DIR" logs -f --tail=100 "$SVC"
 }
 
+# ── 新增：删除节点 ──────────────────────────────────────────
+cmd_destroy() {
+    read -rp "请输入要删除的节点目录 [默认: ${DEFAULT_DIR}]: " DIR
+    DIR="${DIR:-$DEFAULT_DIR}"
+    if [[ ! -f "$DIR/docker-compose.yml" ]]; then
+        error "目录 $DIR 中未找到 docker-compose.yml，请检查路径。"
+    fi
+    warn "此操作将停止并删除容器和网络，但保留所有数据（包括数据库、Redis 不受影响）。"
+    read -rp "确认删除节点吗？请输入 'yes' 继续: " CONFIRM
+    if [[ "$CONFIRM" != "yes" ]]; then
+        info "已取消删除。"
+        return
+    fi
+    dc "$DIR" down --volumes --remove-orphans 2>/dev/null || true
+    log "节点容器与网络已删除，数据目录 ${DIR} 保留。"
+}
+
+# ── 新增：更新组件 ──────────────────────────────────────────
+cmd_update() {
+    read -rp "请输入要更新的节点目录 [默认: ${DEFAULT_DIR}]: " DIR
+    DIR="${DIR:-$DEFAULT_DIR}"
+    header "更新节点组件"
+    echo "  1. 仅更新 WordPress 镜像"
+    echo "  2. 仅更新 Nginx 镜像"
+    echo "  3. 更新全部组件"
+    read -rp "请选择 [1-3]: " UP_CHOICE
+    case "$UP_CHOICE" in
+        1) SERVICES="wordpress" ;;
+        2) SERVICES="nginx" ;;
+        3) SERVICES="" ;;  # pull all and recreate
+        *) error "无效选择" ;;
+    esac
+
+    info "正在拉取最新镜像..."
+    if [[ -z "$SERVICES" ]]; then
+        dc "$DIR" pull
+    else
+        dc "$DIR" pull $SERVICES
+    fi
+
+    info "正在重新创建容器..."
+    if [[ -z "$SERVICES" ]]; then
+        dc "$DIR" up -d --force-recreate
+    else
+        dc "$DIR" up -d --force-recreate $SERVICES
+    fi
+
+    log "节点组件更新完成。"
+    cmd_status
+}
+
 # ════════════════════════════════════════════════════════════
 # 交互式主菜单
 # ════════════════════════════════════════════════════════════
@@ -369,7 +402,7 @@ interactive_menu() {
     while true; do
         echo ""
         _c "1;35" "========================================"
-        _c "1;35" "    WordPress 多节点分发管理 (向导版)"
+        _c "1;35" "    WordPress 多节点分发管理 (完整版)"
         _c "1;35" "========================================"
         echo -e "  \e[32m1.\e[0m 部署全新 WordPress 业务节点"
         echo -e "  \e[32m2.\e[0m 查看当前节点容器运行状态"
@@ -377,6 +410,8 @@ interactive_menu() {
         echo -e "  \e[31m4.\e[0m 停止该节点服务"
         echo -e "  \e[32m5.\e[0m 启动该节点服务"
         echo -e "  \e[33m6.\e[0m 手动重试注入配置 / 安装 S3 插件"
+        echo -e "  \e[31m7.\e[0m 删除节点 (移除容器/网络)"
+        echo -e "  \e[36m8.\e[0m 更新节点组件 (拉取新镜像)"
         echo -e "  \e[36m0.\e[0m 退出管理向导"
         echo "----------------------------------------"
         read -rp "请输入功能序号并回车: " CHOICE
@@ -400,6 +435,8 @@ interactive_menu() {
                 DIR="${DIR:-$DEFAULT_DIR}"
                 _wait_and_setup_plugin "$DIR"
                 ;;
+            7) cmd_destroy ;;
+            8) cmd_update ;;
             0) info "退出向导，祝你建站愉快！"; exit 0 ;;
             *) warn "无效输入，请重新输入序号" ;;
         esac
