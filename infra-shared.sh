@@ -45,7 +45,7 @@ warn()   { _c "33" "[!!] $*"; }
 error()  { _c "31" "[EE] $*"; exit 1; }
 header() { echo; _c "1;34" "══ $* ══"; }
 
-randpw() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32; }
+randpw() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32; true; }
 
 # ── 获取 WireGuard 接口 IP ──────────────────────────────────
 get_wg_ip() {
