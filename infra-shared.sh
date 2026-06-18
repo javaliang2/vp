@@ -228,6 +228,9 @@ services:
 YAML
 
     info "启动容器..."
+    # 修复 Redis 内存警告
+    sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 || true
+    grep -q 'vm.overcommit_memory' /etc/sysctl.conf || echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf
     dc "${DIR}" up -d 2>&1 || error "docker compose up 失败，请检查上方错误信息"
 
     wait_db_ready "${DIR}"
