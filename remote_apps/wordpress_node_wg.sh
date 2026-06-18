@@ -2,6 +2,7 @@
 # ============================================================
 # wp-deploy.sh — WordPress 多节点部署（内网 WG + S3 存储交互版）
 # 修复版：安全注入、特殊字符、S3 配置完全环境变量化
+# 新增：Nginx 仅监听 WireGuard IP，增强内网安全
 # ============================================================
 set -euo pipefail
 export LANG=en_US.UTF-8
@@ -244,13 +245,25 @@ cmd_deploy() {
     S3_KEY="${S3_KEY//[[:space:]]/}"
     S3_SECRET="${S3_SECRET//[[:space:]]/}"
 
+    # ── 获取 WireGuard 接口 IP ──────────────────────────────
+    info "检测本机 WireGuard 接口地址..."
+    WG_IP=""
+    if ip -4 addr show wg0 &>/dev/null; then
+        WG_IP=$(ip -4 addr show wg0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+        log "检测到 wg0 IP: ${WG_IP}，Nginx 将仅监听此地址。"
+    else
+        warn "未找到 wg0 接口，回退为监听 0.0.0.0（所有接口）。"
+        warn "请务必通过防火墙限制访问（如仅允许 WireGuard 子网）。"
+        WG_IP="0.0.0.0"
+    fi
+
     # ── 开始执行部署 ──────────────────────────────────────────
     info "正在创建目录结构..."
     mkdir -p "$DIR"/{data,uploads,logs}
     local NET
     NET=$(net_name "$DIR")
 
-    # 写入 .env（增加 S3_PROVIDER 和 S3_ENDPOINT）
+    # 写入 .env（包含 WG_IP）
     cat > "$DIR/.env" <<EOF
 WORDPRESS_DB_PASSWORD=${DB_PW}
 WORDPRESS_DB_NAME=${DB_NAME}
@@ -266,6 +279,7 @@ S3_REGION=${S3_REGION}
 S3_PROVIDER=${S3_PROVIDER}
 S3_ENDPOINT=${S3_ENDPOINT}
 S3_CDN_DOMAIN=${S3_CDN_DOMAIN}
+WG_IP=${WG_IP}
 EOF
     chmod 600 "$DIR/.env"
 
@@ -275,7 +289,7 @@ EOF
     _write_s3_config_php   "$DIR/uploads/s3-config.php"
     _write_wp_config_extra "$REDIS_HOST" "$REDIS_PW" > "$DIR/uploads/wp-config-extra.php"
 
-    # 生成 docker-compose.yml
+    # 生成 docker-compose.yml（端口绑定至 WG IP）
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   wordpress:
@@ -310,7 +324,7 @@ services:
       - ./logs:/var/log/nginx
     networks: [${NET}]
     ports:
-      - "127.0.0.1:${HOST_PORT}:80"
+      - "\${WG_IP}:\${HOST_PORT}:80"
 
 networks:
   ${NET}:
@@ -324,11 +338,13 @@ YAML
     _wait_and_setup_plugin "$DIR" &
 
     log "WordPress 节点容器群启动成功！"
-    echo -e "访问地址 (本地反代目标): \e[33m127.0.0.1:${HOST_PORT}\e[0m"
+    echo -e "绑定地址: \e[33m${WG_IP}:${HOST_PORT}\e[0m"
     echo -e "内网数据库目标: \e[33m${DB_HOST}\e[0m"
     echo -e "内网缓存共享: \e[33m${REDIS_HOST}\e[0m"
     echo -e "静态资源上云桶: \e[33ms3://${S3_BUCKET}\e[0m"
-    warn "配置正在后台生效（最长约5分钟），请稍后访问站点。"
+    if [[ "$WG_IP" == "0.0.0.0" ]]; then
+        warn "当前监听所有接口，请立即配置防火墙保护端口 ${HOST_PORT}！"
+    fi
 }
 
 cmd_status() {
