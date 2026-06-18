@@ -28,6 +28,8 @@
 # WG_IP 默认读取 wg0 接口当前地址，也可显式传入
 # ============================================================
 set -euo pipefail
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
 
 # ── 默认值 ──────────────────────────────────────────────────
 DEFAULT_DIR="${BASE_DIR:-/srv}/infra"
