@@ -187,6 +187,8 @@ logfile ""
 CONF
 
     # ── docker-compose.yml ────────────────────────────────
+    # 修复：network_mode: host 与 ports: 不能共存
+    # 使用 host 网络模式，由配置文件 bind-address 控制监听接口，删除 ports: 块
     cat > "${DIR}/docker-compose.yml" <<YAML
 services:
   db:
@@ -200,9 +202,6 @@ services:
     volumes:
       - ./db:/var/lib/mysql
       - ./mariadb-conf/custom.cnf:/etc/mysql/conf.d/custom.cnf:ro
-    # 只绑定 WireGuard 接口，公网不可见
-    ports:
-      - "${WG_IP}:${MARIADB_PORT}:3306"
     network_mode: host
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
@@ -218,9 +217,6 @@ services:
       - ./redis:/data
       - ./redis-conf/redis.conf:/etc/redis/redis.conf:ro
     command: redis-server /etc/redis/redis.conf
-    # 只绑定 WireGuard 接口
-    ports:
-      - "${WG_IP}:${REDIS_PORT}:6379"
     network_mode: host
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "\${REDIS_PASSWORD}", "ping"]
@@ -228,15 +224,17 @@ services:
       timeout: 5s
       retries: 5
 YAML
-    # 注：network_mode: host 让容器直接用宿主机网络栈，
-    # bind-address 在配置文件里控制，不走 Docker NAT
 
-    dc "${DIR}" up -d
+    info "启动容器..."
+    dc "${DIR}" up -d 2>&1 || error "docker compose up 失败，请检查上方错误信息"
+
     wait_db_ready "${DIR}"
 
     # 授权 WireGuard 网段远程访问
     _grant_wg_access "${DIR}" "${MARIADB_DATABASE}" "${MARIADB_USER}" "${MARIADB_PASSWORD}"
 
+    echo ""
+    dc "${DIR}" ps
     log "共享基础设施部署完成"
     _print_credentials "${DIR}"
 }
@@ -366,7 +364,6 @@ cmd_backup() {
     mkdir -p "$DEST"
     header "备份所有数据库 → ${DEST}"
 
-    # 获取所有业务库列表
     local DBS
     DBS=$(mariadb_exec "$DIR" -sN -e \
         "SELECT schema_name FROM information_schema.schemata \
@@ -399,7 +396,6 @@ cmd_restore() {
     load_env "$DIR"
     [[ -f "$SQL_FILE" ]] || error "文件不存在: ${SQL_FILE}"
 
-    # 从文件名推断库名（去掉 _时间戳.sql.gz 后缀）
     local DB_NAME
     DB_NAME=$(basename "$SQL_FILE" | sed 's/_[0-9]\{8\}_[0-9]\{6\}\.sql\.gz$//' | sed 's/\.sql\.gz$//' | sed 's/\.sql$//')
     warn "将恢复到库: ${DB_NAME}"
@@ -463,32 +459,6 @@ cmd_logs()  {
     dc "$DIR" logs -f --tail=100 "$SVC"
 }
 
-# ── 入口 ────────────────────────────────────────────────────
-main() {
-    local CMD="${1:-help}"
-    shift || true
-
-    case "$CMD" in
-        deploy)   cmd_deploy  "$@" ;;
-        add-db)   cmd_add_db  "$@" ;;
-        del-db)   cmd_del_db  "$@" ;;
-        list-db)  cmd_list_db "$@" ;;
-        passwd)   cmd_passwd  "$@" ;;
-        backup)   cmd_backup  "$@" ;;
-        restore)  cmd_restore "$@" ;;
-        status)   cmd_status  "$@" ;;
-        stop)     cmd_stop    "$@" ;;
-        start)    cmd_start   "$@" ;;
-        logs)     cmd_logs    "$@" ;;
-        help|--help|-h)
-            grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \{0,2\}//'
-            ;;
-        *) error "未知子命令: ${CMD}，执行 help 查看用法" ;;
-    esac
-}
-
-main "$@"
-
 # ════════════════════════════════════════════════════════════
 # 交互菜单
 # ════════════════════════════════════════════════════════════
@@ -548,7 +518,6 @@ menu_deploy() {
     _c "1;33" "  ▶ 部署共享基础设施"
     echo
 
-    # 安全检测 wg IP，不调用 error()（error 会 exit，菜单模式不适用）
     local AUTO_IP=""
     if ip link show "${WG_IFACE}" &>/dev/null; then
         AUTO_IP=$(ip addr show "${WG_IFACE}" \
@@ -744,7 +713,7 @@ menu_restore_run() {
     _pause
 }
 
-# ──--入口 ────────────────────────────────────────────────────
+# ── 入口（唯一） ─────────────────────────────────────────────
 main() {
     if [[ $# -eq 0 ]]; then
         menu_main
