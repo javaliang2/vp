@@ -196,13 +196,24 @@ cmd_add_peer() {
 cmd_remove_peer() {
     require_root
     require_conf
-    local PUB_KEY="${1:?用法: remove-peer <公钥>}"
+    local PUB_KEY="${1:-}"
+    # 去除所有空白字符，避免复制时带入的换行、空格
+    PUB_KEY="$(tr -d '[:space:]' <<< "$PUB_KEY")"
+    [[ -z "$PUB_KEY" ]] && { warn "公钥为空"; return 1; }
 
     header "移除 Peer: ${PUB_KEY:0:20}..."
 
-    # FIX(Bug 5): 原 Python 用字符串包含匹配（target_key not in b），
-    # 改为精确匹配 "PublicKey = <key>"，防止误删其他 Peer 块。
-    python3 - "$WG_CONF" "$PUB_KEY" <<'PY'
+    # 先检查是否存在该 Peer
+    if ! grep -qF "$PUB_KEY" "$WG_CONF"; then
+        warn "配置文件中未找到该公钥: ${PUB_KEY:0:20}..."
+        return 1
+    fi
+
+    # Python 精确删除，失败时仅警告而不退出脚本
+    python3 - "$WG_CONF" "$PUB_KEY" <<'PY' || {
+        warn "移除失败：Peer 可能不存在或配置格式异常"
+        return 1
+    }
 import sys, re
 
 conf_file = sys.argv[1]
@@ -211,11 +222,9 @@ target_key = sys.argv[2].strip()
 with open(conf_file) as f:
     content = f.read()
 
-# 按 [Peer] 块分割，精确匹配 PublicKey 行，避免子串误删
 blocks = re.split(r'(?=\[Peer\])', content)
 
 def peer_matches(block, key):
-    """精确匹配：PublicKey 行的值必须与 key 完全一致"""
     for line in block.splitlines():
         m = re.match(r'^\s*PublicKey\s*=\s*(\S+)', line)
         if m and m.group(1) == key:
@@ -238,12 +247,12 @@ PY
 
     # 如果 wg0 已运行，热移除
     if systemctl is-active --quiet "wg-quick@${WG_IFACE}"; then
-        wg set "${WG_IFACE}" peer "$PUB_KEY" remove
+        wg set "${WG_IFACE}" peer "$PUB_KEY" remove 2>/dev/null || \
+            warn "运行时移除失败（可能对端已不存在），配置文件已更新"
         log "Peer 已从运行中的 ${WG_IFACE} 移除"
     fi
 }
 
-# ── up ──────────────────────────────────────────────────────
 # ── up ──────────────────────────────────────────────────────
 cmd_up() {
     require_root
@@ -489,13 +498,21 @@ _menu_remove_peer() {
     echo
 
     _ask "要移除的 Peer 公钥（完整 Base64）" PEER_PK ""
+    # 去除所有空白字符，防止复制时带入空格或换行
+    PEER_PK="$(tr -d '[:space:]' <<< "$PEER_PK")"
     [[ -n "$PEER_PK" ]] || { warn "公钥不能为空"; _pause; return; }
 
     warn "即将移除 Peer: ${PEER_PK:0:20}..."
     read -rp "  确认? [y/N] " C
     [[ "${C,,}" == "y" ]] || { info "已取消"; _pause; return; }
     echo
-    cmd_remove_peer "$PEER_PK"
+
+    # 调用删除函数，并用返回值给用户明确反馈
+    if cmd_remove_peer "$PEER_PK"; then
+        log "Peer 已成功移除"
+    else
+        warn "移除失败，请检查公钥是否正确"
+    fi
     _pause
 }
 
