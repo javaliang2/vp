@@ -28,6 +28,8 @@
 # WG_IP 默认读取 wg0 接口当前地址，也可显式传入
 # ============================================================
 set -euo pipefail
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
 
 # ── 默认值 ──────────────────────────────────────────────────
 DEFAULT_DIR="${BASE_DIR:-/srv}/infra"
@@ -45,7 +47,7 @@ warn()   { _c "33" "[!!] $*"; }
 error()  { _c "31" "[EE] $*"; exit 1; }
 header() { echo; _c "1;34" "══ $* ══"; }
 
-randpw() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32; }
+randpw() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32; true; }
 
 # ── 获取 WireGuard 接口 IP ──────────────────────────────────
 get_wg_ip() {
@@ -226,6 +228,9 @@ services:
 YAML
 
     info "启动容器..."
+    # 修复 Redis 内存警告
+    sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 || true
+    grep -q 'vm.overcommit_memory' /etc/sysctl.conf || echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf
     dc "${DIR}" up -d 2>&1 || error "docker compose up 失败，请检查上方错误信息"
 
     wait_db_ready "${DIR}"
