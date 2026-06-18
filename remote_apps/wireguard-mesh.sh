@@ -67,12 +67,12 @@ cmd_install() {
     if command -v apt-get &>/dev/null; then
         apt-get update -qq
         apt-get install -y wireguard wireguard-tools
+    elif command -v dnf &>/dev/null; then
+        dnf install -y wireguard-tools
     elif command -v yum &>/dev/null; then
         # RHEL/CentOS 8+
         yum install -y epel-release
         yum install -y wireguard-tools
-    elif command -v dnf &>/dev/null; then
-        dnf install -y wireguard-tools
     else
         error "不支持的包管理器，请手动安装 wireguard-tools"
     fi
@@ -132,14 +132,14 @@ cmd_init() {
     mkdir -p "$WG_DIR"
     chmod 700 "$WG_DIR"
 
+    # FIX(Bug 3): 移除手动 PostUp/PostDown 路由规则。
+    # wg-quick 会依据各 Peer 的 AllowedIPs 自动维护路由，手动添加 /24
+    # 路由会与之冲突，在多网卡环境下可能劫持非 VPN 流量。
     cat > "$WG_CONF" <<EOF
 [Interface]
 Address    = ${MY_WG_IP}/24
 PrivateKey = $(cat "$PRIV_KEY_FILE")
 ListenPort = ${WG_PORT}
-# 启动/停止时维护路由
-PostUp   = ip route add ${MY_WG_IP%.*}.0/24 dev ${WG_IFACE} 2>/dev/null || true
-PostDown = ip route del ${MY_WG_IP%.*}.0/24 dev ${WG_IFACE} 2>/dev/null || true
 EOF
     chmod 600 "$WG_CONF"
 
@@ -176,11 +176,18 @@ cmd_add_peer() {
 
     log "Peer 已追加到 ${WG_CONF}"
 
-    # 如果 wg0 已运行，热添加（无需重启）
+    # FIX(Bug 1): 原代码用 eval 拼接用户输入，存在命令注入风险。
+    # 改用数组直接传参，彻底消除 eval。
     if systemctl is-active --quiet "wg-quick@${WG_IFACE}"; then
-        local CMD="wg set ${WG_IFACE} peer ${PUB_KEY} allowed-ips ${ALLOWED_IPS}"
-        [[ -n "$ENDPOINT" ]] && CMD+=" endpoint ${ENDPOINT} persistent-keepalive 25"
-        eval "$CMD"
+        local WG_ARGS=(
+            set "${WG_IFACE}"
+            peer "${PUB_KEY}"
+            allowed-ips "${ALLOWED_IPS}"
+        )
+        if [[ -n "$ENDPOINT" ]]; then
+            WG_ARGS+=(endpoint "${ENDPOINT}" persistent-keepalive 25)
+        fi
+        wg "${WG_ARGS[@]}"
         log "Peer 已热添加到运行中的 ${WG_IFACE}"
     fi
 }
@@ -193,19 +200,34 @@ cmd_remove_peer() {
 
     header "移除 Peer: ${PUB_KEY:0:20}..."
 
-    # 从配置文件移除对应 [Peer] 块
+    # FIX(Bug 5): 原 Python 用字符串包含匹配（target_key not in b），
+    # 改为精确匹配 "PublicKey = <key>"，防止误删其他 Peer 块。
     python3 - "$WG_CONF" "$PUB_KEY" <<'PY'
 import sys, re
 
 conf_file = sys.argv[1]
-target_key = sys.argv[2]
+target_key = sys.argv[2].strip()
 
 with open(conf_file) as f:
     content = f.read()
 
-# 按 [Peer] 块分割，过滤掉匹配的
+# 按 [Peer] 块分割，精确匹配 PublicKey 行，避免子串误删
 blocks = re.split(r'(?=\[Peer\])', content)
-filtered = [b for b in blocks if target_key not in b]
+
+def peer_matches(block, key):
+    """精确匹配：PublicKey 行的值必须与 key 完全一致"""
+    for line in block.splitlines():
+        m = re.match(r'^\s*PublicKey\s*=\s*(\S+)', line)
+        if m and m.group(1) == key:
+            return True
+    return False
+
+filtered = [b for b in blocks if not peer_matches(b, target_key)]
+
+if len(filtered) == len(blocks):
+    print(f"未找到 Peer: {target_key[:20]}...", file=sys.stderr)
+    sys.exit(1)
+
 result = ''.join(filtered).rstrip('\n') + '\n'
 
 with open(conf_file, 'w') as f:
@@ -255,9 +277,11 @@ cmd_status() {
 
     # ping 每个 Peer 的 AllowedIPs 第一个地址
     header "Peer 连通性"
+    # FIX(Bug 2/代码清理): local 移到循环外，语义更清晰
+    local IP
     while IFS= read -r line; do
         if [[ "$line" =~ ^allowed\ ips:\ +([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
-            local IP="${BASH_REMATCH[1]}"
+            IP="${BASH_REMATCH[1]}"
             if ping -c1 -W2 "$IP" &>/dev/null; then
                 log "✓ ${IP}"
             else
@@ -277,7 +301,7 @@ _ask() {
     local PROMPT="$1" VAR="$2" DEFAULT="${3:-}"
     local HINT=""
     [[ -n "$DEFAULT" ]] && HINT=" [默认: ${DEFAULT}]"
-    read -rp "  ${PROMPT}${HINT}: " "$VAR"
+    read -rp "  ${PROMPT}${HINT}: " "${VAR?}"
     if [[ -z "${!VAR}" && -n "$DEFAULT" ]]; then
         printf -v "$VAR" '%s' "$DEFAULT"
     fi
@@ -297,10 +321,9 @@ menu_main() {
     while true; do
         _menu_header
 
-        # 检测当前节点状态，给用户直观提示
         local STATE_WG STATE_KEY STATE_CONF
         if [[ -f "$PUB_KEY_FILE" ]]; then
-            STATE_KEY="$(cat "$PUB_KEY_FILE" | cut -c1-16)..."
+            STATE_KEY="$(cut -c1-16 "$PUB_KEY_FILE")..."
         else
             STATE_KEY="（未生成）"
         fi
@@ -447,7 +470,6 @@ _menu_remove_peer() {
         warn "配置文件不存在"; _pause; return
     fi
 
-    # 显示现有 Peer 列表方便参考
     _menu_list_peers_inline
     echo
 
@@ -467,13 +489,16 @@ _menu_list_peers_inline() {
     if [[ ! -f "$WG_CONF" ]]; then
         warn "配置文件不存在"; return
     fi
+    # FIX(Bug 4): 原代码 (( IDX++ )) 在 IDX=0 时返回值为 0（假），
+    # 在 set -euo pipefail 下会直接退出脚本。改为 IDX=$(( IDX + 1 )) 或 (( ++IDX ))。
+    # 使用 (( ++IDX )) 前置自增，初始值为 0 时结果为 1，返回值为真，安全。
     local IDX=0
     local PK="" IPS="" EP=""
     while IFS= read -r line; do
         line="${line#"${line%%[![:space:]]*}"}"  # ltrim
         if [[ "$line" == "[Peer]" ]]; then
             if [[ -n "$PK" ]]; then
-                (( IDX++ ))
+                (( ++IDX ))
                 printf "  [%d] %s\n      AllowedIPs: %s\n      Endpoint:   %s\n\n" \
                     "$IDX" "${PK:0:32}..." "$IPS" "${EP:-（无）}"
             fi
@@ -485,7 +510,7 @@ _menu_list_peers_inline() {
     done < "$WG_CONF"
     # 最后一个 Peer
     if [[ -n "$PK" ]]; then
-        (( IDX++ ))
+        (( ++IDX ))
         printf "  [%d] %s\n      AllowedIPs: %s\n      Endpoint:   %s\n\n" \
             "$IDX" "${PK:0:32}..." "$IPS" "${EP:-（无）}"
     fi
