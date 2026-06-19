@@ -165,45 +165,50 @@ define('AS3CF_SETTINGS', serialize([
 PHP
 }
 
-# FIX: 原脚本混用了引号与非引号 heredoc，导致 REDIS_HOST/REDIS_PW
-#      在第一段（单引号 heredoc）中不被展开，但在第二段中又被展开，
-#      生成的 PHP 文件包含 bash 变量字面量而非实际值。
-#      修复：两段均使用非引号 heredoc，统一展开。
 _write_wp_config_extra() {
     local REDIS_HOST="$1"
     local REDIS_PW="$2"
     local DEST="$3"
-    # 对 PHP heredoc 内的 $ 进行转义，防止 bash 误展开 PHP 变量
+
+    # 对密码中的单引号进行 PHP 转义（' → \'）
+    local REDIS_PW_SAFE="${REDIS_PW//\'/\'\\\'\'}"
+
     cat > "$DEST" <<PHPEOF
 <?php
-// 反向代理 HTTPS 修复
-if ( isset( \$_SERVER['HTTP_X_FORWARDED_PROTO'] )
-     && \$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https' ) {
-    \$_SERVER['HTTPS'] = 'on';
+// 反向代理 HTTPS 修复（仅在 Web 环境下生效，CLI 中跳过以避免 Undefined index）
+if ( php_sapi_name() !== 'cli' ) {
+    if ( isset( \$_SERVER['HTTP_X_FORWARDED_PROTO'] )
+         && \$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https' ) {
+        \$_SERVER['HTTPS'] = 'on';
+    }
+    if ( isset( \$_SERVER['HTTP_X_FORWARDED_HOST'] ) ) {
+        \$_SERVER['HTTP_HOST'] = \$_SERVER['HTTP_X_FORWARDED_HOST'];
+    }
+    if ( isset( \$_SERVER['HTTP_HOST'] ) ) {
+        define( 'WP_HOME',    'https://' . \$_SERVER['HTTP_HOST'] );
+        define( 'WP_SITEURL', 'https://' . \$_SERVER['HTTP_HOST'] );
+    }
 }
-if ( isset( \$_SERVER['HTTP_X_FORWARDED_HOST'] ) ) {
-    \$_SERVER['HTTP_HOST'] = \$_SERVER['HTTP_X_FORWARDED_HOST'];
-}
-define( 'WP_HOME',    'https://' . \$_SERVER['HTTP_HOST'] );
-define( 'WP_SITEURL', 'https://' . \$_SERVER['HTTP_HOST'] );
 
 // Redis 对象缓存
 define( 'WP_REDIS_HOST', '${REDIS_HOST}' );
 define( 'WP_REDIS_PORT', 6379 );
-define( 'WP_REDIS_AUTH', '${REDIS_PW}' );
+define( 'WP_REDIS_AUTH', '${REDIS_PW_SAFE}' );
 define( 'WP_CACHE',      true );
 
 // 内存限制
 define( 'WP_MEMORY_LIMIT',     '512M' );
 define( 'WP_MAX_MEMORY_LIMIT', '1024M' );
 
-// 将 PHP Session 存入 Redis（多节点共享会话）
-ini_set( 'session.save_handler', 'redis' );
-ini_set( 'session.save_path',
-    'tcp://' . WP_REDIS_HOST . ':' . WP_REDIS_PORT
-    . '?auth=' . urlencode( WP_REDIS_AUTH ) );
+// 将 PHP Session 存入 Redis（需安装 redis 扩展才能生效）
+if ( extension_loaded( 'redis' ) ) {
+    ini_set( 'session.save_handler', 'redis' );
+    ini_set( 'session.save_path',
+        'tcp://' . WP_REDIS_HOST . ':' . WP_REDIS_PORT
+        . '?auth=' . urlencode( WP_REDIS_AUTH ) );
+}
 
-// S3 配置（挂载至 /etc/wordpress/ 独立路径，避免与 wp-content volume 冲突）
+// S3 配置
 if ( file_exists( '/etc/wordpress/s3-config.php' ) ) {
     require_once '/etc/wordpress/s3-config.php';
 }
