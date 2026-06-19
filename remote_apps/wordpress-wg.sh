@@ -72,11 +72,10 @@ read_secret() {
 # 配置文件生成函数
 # ════════════════════════════════════════════════════════
 
-# ── Nginx 配置（单引号 heredoc，彻底避免 $ 展开）──────
+# ── Nginx 配置（单引号 heredoc + sed 替换 WG_IP）──────
 _write_nginx_wp_conf() {
     local DEST="$1"
     local WG_IP="$2"
-    # 用 __WG_IP__ 占位，写完后 sed 替换，其余 $ 不需要转义
     sed "s/__WG_IP__/${WG_IP}/g" > "$DEST" <<'NGINX'
 map $http_x_forwarded_proto $fastcgi_https {
     default "";
@@ -138,7 +137,7 @@ max_input_vars      = 10000
 INI
 }
 
-# ── S3 配置 PHP（挂载到 /etc/wordpress）─────────────
+# ── S3 配置 PHP ──────────────────────────────────────
 _write_s3_config_php() {
     local DEST="$1"
     cat > "$DEST" <<'PHP'
@@ -165,26 +164,51 @@ PHP
 }
 
 # ── WordPress 额外配置 PHP ───────────────────────────
-# 挂载到 /etc/wordpress/wp-config-extra.php（webroot 之外，不可被 web 访问）
+# 挂载到 /etc/wordpress/（webroot 之外）
 # 由 WORDPRESS_CONFIG_EXTRA 单行 require 触发加载
+#
+# 核心策略：
+#   不写死域名，WP_HOME/WP_SITEURL 完全由网关传入的
+#   X-Forwarded-Host 动态决定，但只信任来自 WireGuard
+#   内网段的请求，外部直连无法伪造 Host 头。
 _write_wp_config_extra() {
     local DEST="$1"
     cat > "$DEST" <<'PHP'
 <?php
-// ── 代理信任头：仅修正 $_SERVER['HTTPS']，不动态拼 URL ──
-if (php_sapi_name() !== 'cli') {
-    if (isset($_SERVER['HTTP_X_FORWARDED_PROTO'])
-        && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
-        $_SERVER['HTTPS'] = 'on';
-    }
+// ── 可信代理判断（仅接受 WireGuard 内网段）────────────
+function _wp_is_trusted_proxy(string $ip): bool {
+    return (bool) preg_match(
+        '/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/',
+        $ip
+    );
 }
 
-// ── WP_HOME / WP_SITEURL：从环境变量读取固定值 ──────
-// 避免依赖运行时 Host 头导致 301 重定向循环
-$_wp_site_url = getenv('WP_SITEURL_OVERRIDE');
-if (!empty($_wp_site_url) && !defined('WP_HOME')) {
-    define('WP_HOME',    $_wp_site_url);
-    define('WP_SITEURL', $_wp_site_url);
+// ── 动态设置 WP_HOME / WP_SITEURL ────────────────────
+// 域名完全由网关 X-Forwarded-Host 决定，无需写死，
+// 换域名只需改网关配置，WordPress 容器无需重启。
+if (php_sapi_name() !== 'cli') {
+    $remote = $_SERVER['REMOTE_ADDR'] ?? '';
+
+    if (_wp_is_trusted_proxy($remote)) {
+        // 修正 HTTPS 标志
+        if (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https') {
+            $_SERVER['HTTPS'] = 'on';
+        }
+
+        // 用网关传来的真实 Host 动态构造站点 URL
+        $fwd_host = $_SERVER['HTTP_X_FORWARDED_HOST'] ?? '';
+        // 只取第一个 host（防止逗号分隔的多值）
+        $fwd_host = trim(explode(',', $fwd_host)[0]);
+
+        if ($fwd_host !== '') {
+            $scheme = ($_SERVER['HTTPS'] ?? '') === 'on' ? 'https' : 'http';
+            $site_url = $scheme . '://' . $fwd_host;
+            if (!defined('WP_HOME')) {
+                define('WP_HOME',    $site_url);
+                define('WP_SITEURL', $site_url);
+            }
+        }
+    }
 }
 
 // ── Redis ────────────────────────────────────────────
@@ -212,6 +236,7 @@ PHP
 }
 
 # ── docker-compose.yml（host 网络）──────────────────
+# 去掉 WP_SITEURL_OVERRIDE，域名完全动态
 _write_docker_compose() {
     local DIR="$1"
     cat > "$DIR/docker-compose.yml" <<'YAML'
@@ -234,7 +259,6 @@ services:
       S3_CDN_DOMAIN:          ${S3_CDN_DOMAIN}
       REDIS_HOST:             ${REDIS_HOST}
       REDIS_PW:               ${REDIS_PW}
-      WP_SITEURL_OVERRIDE:    ${WP_SITEURL_OVERRIDE}
       # 单行 require，由官方镜像 entrypoint 写入 wp-config.php
       WORDPRESS_CONFIG_EXTRA: "require_once('/etc/wordpress/wp-config-extra.php');"
     volumes:
@@ -349,9 +373,9 @@ cmd_deploy() {
         || error "无效端口: $HOST_PORT"
 
     info "--- 站点配置 ---"
-    read -rp "站点完整 URL（如 https://example.com）: " WP_URL
+    # 仅用于 WP-CLI 初始安装，运行时域名由网关 X-Forwarded-Host 动态决定
+    read -rp "初始安装 URL（如 https://example.com，后续换域名无需改此处）: " WP_URL
     [[ -z "$WP_URL" ]] && error "URL 不能为空"
-
     read -rp "站点名称 [默认: Distributed WP]: " WP_TITLE
     WP_TITLE="${WP_TITLE:-Distributed WP}"
     read -rp "管理员用户名 [默认: wpadmin]: " WP_ADMIN
@@ -416,6 +440,7 @@ cmd_deploy() {
     info "生成配置文件..."
     mkdir -p "$DIR"/{data,uploads,logs}
 
+    # 不写入 WP_SITEURL_OVERRIDE，域名完全由网关动态传入
     cat > "$DIR/.env" <<EOF
 WORDPRESS_DB_PASSWORD=${DB_PW}
 WORDPRESS_DB_NAME=${DB_NAME}
@@ -432,7 +457,6 @@ S3_PROVIDER=${S3_PROVIDER}
 S3_ENDPOINT=${S3_ENDPOINT}
 S3_CDN_DOMAIN=${S3_CDN_DOMAIN}
 WG_IP=${WG_IP}
-WP_SITEURL_OVERRIDE=${WP_URL}
 EOF
     chmod 600 "$DIR/.env"
 
@@ -450,8 +474,9 @@ EOF
         || warn "插件配置未完全成功，可通过菜单 6 重试。"
 
     log "节点部署完成！"
-    echo -e "  内网访问: \e[33mhttp://${WG_IP}:${HOST_PORT}\e[0m"
-    echo -e "  公网站点: \e[33m${WP_URL}\e[0m"
+    echo -e "  内网访问:   \e[33mhttp://${WG_IP}:${HOST_PORT}\e[0m"
+    echo -e "  初始站点:   \e[33m${WP_URL}\e[0m"
+    echo -e "  \e[36m换域名只需改网关 X-Forwarded-Host，容器无需重启。\e[0m"
 }
 
 cmd_status() {
