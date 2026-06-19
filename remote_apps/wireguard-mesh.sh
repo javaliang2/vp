@@ -110,12 +110,13 @@ cmd_genkey() {
 
     local tmp_priv; tmp_priv=$(mktemp "${WG_KEY_DIR}/privatekey.XXXXXX")
     local tmp_pub;  tmp_pub=$(mktemp  "${WG_KEY_DIR}/publickey.XXXXXX")
-    
+
     wg genkey > "$tmp_priv"
     wg pubkey < "$tmp_priv" > "$tmp_pub"
 
     chmod 600 "$tmp_priv"
-    chmod 644 "$tmp_pub"
+    # [SEC] 公钥权限收紧至 640，避免全局可读
+    chmod 640 "$tmp_pub"
     mv "$tmp_priv" "$PRIV_KEY_FILE"
     mv "$tmp_pub"  "$PUB_KEY_FILE"
 
@@ -152,17 +153,27 @@ cmd_init() {
     chmod 700 "$WG_DIR"
     install -m 600 /dev/null "$WG_CONF"
 
+    # [SEC] ip_forward 持久化写入 sysctl，重启后仍生效
+    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-wireguard.conf
+    sysctl -p /etc/sysctl.d/99-wireguard.conf -q
+    info "ip_forward 已持久化至 /etc/sysctl.d/99-wireguard.conf"
+
+    # [SEC] iptables 规则改用幂等写法（-C 检测存在性，避免重复追加）
+    # PostUp/PostDown 中不再执行 sysctl（已持久化），专注防火墙规则
     cat > "$WG_CONF" <<EOF
 [Interface]
 Address = ${WG_ADDR}
 PrivateKey = $(cat "$PRIV_KEY_FILE")
 ListenPort = ${WG_PORT}
-PostUp = sysctl -w net.ipv4.ip_forward=1
-PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${default_iface} -j MASQUERADE
-PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${default_iface} -j MASQUERADE
+PostUp   = iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %i -j ACCEPT
+PostUp   = iptables -C FORWARD -o %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -o %i -j ACCEPT
+PostUp   = iptables -C POSTROUTING -t nat -o ${default_iface} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o ${default_iface} -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true
+PostDown = iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null || true
+PostDown = iptables -t nat -D POSTROUTING -o ${default_iface} -j MASQUERADE 2>/dev/null || true
 EOF
 
-    log "配置已生成并注入路由转发规则 (出站网卡: ${default_iface})"
+    log "配置已生成，iptables 规则已幂等化 (出站网卡: ${default_iface})"
 }
 
 cmd_add_peer() {
@@ -170,6 +181,28 @@ cmd_add_peer() {
     local PUB_KEY="$1" ALLOWED_IPS="$2" ENDPOINT="${3:-}"
 
     header "添加 Peer: ${ALLOWED_IPS}"
+
+    # [SEC] 输入校验
+    if ! is_valid_pubkey "$PUB_KEY"; then
+        warn "公钥格式不合法（需 44 位 Base64）"
+        return 1
+    fi
+    if ! is_valid_cidr "$ALLOWED_IPS" && ! is_valid_ipv4 "$ALLOWED_IPS"; then
+        warn "AllowedIPs 格式不合法: $ALLOWED_IPS"
+        return 1
+    fi
+    if [[ -n "$ENDPOINT" ]] && ! is_valid_endpoint "$ENDPOINT"; then
+        warn "Endpoint 格式不合法: $ENDPOINT（应为 host:port）"
+        return 1
+    fi
+
+    # [SEC] 全路由警告：AllowedIPs = 0.0.0.0/0 会将所有流量导入隧道
+    if [[ "$ALLOWED_IPS" == "0.0.0.0/0" || "$ALLOWED_IPS" == "::/0" || "$ALLOWED_IPS" == "0.0.0.0/0,::/0" ]]; then
+        warn "AllowedIPs 设置为全路由 (${ALLOWED_IPS})，该 Peer 将接管本机所有出站流量！"
+        read -r -t 30 -p "  确认继续? [y/N] " _fullroute_confirm || { echo; warn "输入超时，已取消"; return 1; }
+        [[ "${_fullroute_confirm,,}" == "y" ]] || { info "已取消"; return 0; }
+    fi
+
     if grep -qE "^\s*PublicKey\s*=\s*${PUB_KEY}\s*$" "$WG_CONF"; then
         warn "该 Peer 公钥已存在"
         return 0
@@ -197,7 +230,7 @@ cmd_add_peer() {
 cmd_remove_peer() {
     require_conf
     local PUB_KEY="$1"
-    
+
     header "移除 Peer"
     if ! grep -qE "^\s*PublicKey\s*=\s*${PUB_KEY}\s*$" "$WG_CONF"; then
         warn "未找到该 Peer"
@@ -205,7 +238,7 @@ cmd_remove_peer() {
     fi
 
     _backup_conf
-    
+
     # 使用 awk 精确移除指定的 [Peer] 块
     awk -v target="$PUB_KEY" '
         BEGIN { in_peer = 0; block = ""; found = 0 }
@@ -243,7 +276,7 @@ cmd_up() {
     header "启动 ${WG_IFACE}"
 
     _stop_iface_safe
-    
+
     # 兼容 systemd 与非 systemd 环境
     if pidof systemd &>/dev/null || [[ -d /run/systemd/system ]]; then
         systemctl enable --now "wg-quick@${WG_IFACE}"
@@ -285,17 +318,23 @@ _stop_iface_safe() {
 _backup_conf() {
     local bak="${WG_CONF}.bak.$(date +%Y%m%d_%H%M%S)"
     cp "$WG_CONF" "$bak"
+    # [SEC] 备份文件显式设为 600，与主配置保持一致
+    chmod 600 "$bak"
     info "配置已备份: $bak"
 }
 
+# [SEC] _ask 加入 read 超时（120s），防止长时间挂起
 _ask() {
     local prompt="$1" varname="$2" default="${3:-}" val hint=""
     [[ -n "$default" ]] && hint=" [默认: ${default}]"
-    read -rp "  ${prompt}${hint}: " val
+    if ! read -r -t 120 -p "  ${prompt}${hint}: " val; then
+        echo
+        error "输入超时（120s），已退出"
+    fi
     printf -v "$varname" '%s' "${val:-$default}"
 }
 
-_pause() { echo; read -rp "  按 Enter 返回主菜单..." _; }
+_pause() { echo; read -r -t 300 -p "  按 Enter 返回主菜单..." _ || true; }
 
 # ═══════════════════════════════════════════════════════════
 # 交互菜单逻辑
@@ -308,7 +347,7 @@ _menu_header() {
     echo "  ║       WireGuard Mesh Panel - 交互式管控台        ║"
     echo "  ╚══════════════════════════════════════════════════╝"
     printf "${C_RESET}\n"
-    
+
     local key_disp conf_disp wg_disp
     [[ -f "$PUB_KEY_FILE" ]] && key_disp="$(cut -c1-16 "$PUB_KEY_FILE")..." || key_disp="（未生成）"
     [[ -f "$WG_CONF" ]] && conf_disp="${WG_CONF} ($(grep -c '^\[Peer\]' "$WG_CONF" 2>/dev/null || echo 0) peers)" || conf_disp="（未初始化）"
@@ -349,11 +388,11 @@ menu_main() {
         echo "  "
         echo "  0. 退出面板"
         echo
-        read -rp "  请输入序号选择: " CHOICE
+        read -r -t 300 -p "  请输入序号选择: " CHOICE || { echo; continue; }
         case "$CHOICE" in
             1) _run "安装 WireGuard" cmd_install ;;
             2) _run "生成密钥对" cmd_genkey ;;
-            3) 
+            3)
                 _menu_header
                 [[ -f "$PUB_KEY_FILE" ]] && echo "  公钥: $(cat "$PUB_KEY_FILE")" || warn "密钥未生成"
                 _pause
@@ -361,15 +400,23 @@ menu_main() {
             4)
                 _menu_header
                 _ask "请输入本机 WG IP (如 10.10.0.1/24)" MY_IP
-                [[ -n "$MY_IP" ]] && is_valid_cidr "$MY_IP" || is_valid_ipv4 "$MY_IP" && cmd_init "$MY_IP" || { warn "IP格式错误"; _pause; }
+                if is_valid_cidr "$MY_IP" || is_valid_ipv4 "$MY_IP"; then
+                    cmd_init "$MY_IP"
+                else
+                    warn "IP 格式错误: $MY_IP"
+                fi
                 _pause
                 ;;
             5)
                 _menu_header
                 _ask "对端公钥 (44字符 Base64)" P_PK
-                _ask "对端内网 IP (如 10.10.0.2/32)" P_IP
+                _ask "对端内网 IP/CIDR (如 10.10.0.2/32)" P_IP
                 _ask "对端公网 Endpoint (如 1.2.3.4:51820，无则回车跳过)" P_EP
-                [[ -n "$P_PK" && -n "$P_IP" ]] && cmd_add_peer "$P_PK" "$P_IP" "$P_EP" || warn "公钥和IP不能为空"
+                if [[ -n "$P_PK" && -n "$P_IP" ]]; then
+                    cmd_add_peer "$P_PK" "$P_IP" "$P_EP"
+                else
+                    warn "公钥和 IP 不能为空"
+                fi
                 _pause
                 ;;
             6)
@@ -378,14 +425,12 @@ menu_main() {
                 [[ -n "$RM_PK" ]] && cmd_remove_peer "$RM_PK"
                 _pause
                 ;;
-            7)
-                _run "节点列表" wg show "${WG_IFACE}"
-                ;;
-            8) _run "启动接口" cmd_up ;;
-            9) _run "停止接口" cmd_down ;;
+            7)  _run "节点列表" wg show "${WG_IFACE}" ;;
+            8)  _run "启动接口" cmd_up ;;
+            9)  _run "停止接口" cmd_down ;;
             10) _run "网络状态" wg show "${WG_IFACE}" ;;
-            0) echo; exit 0 ;;
-            *) ;;
+            0)  echo; exit 0 ;;
+            *)  ;;
         esac
     done
 }
