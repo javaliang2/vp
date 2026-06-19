@@ -61,18 +61,24 @@ wp_cli() {
     dc "$DIR" exec -T wordpress wp --allow-root "$@"
 }
 
-# 安全读取密码：优先使用 read -s，避免密码出现在终端回显与 shell 历史
+# 安全读取密码：手动 stty -echo 替代 read -s，
+# 确保粘贴输入在所有终端下均可正常工作。
 read_secret() {
     local PROMPT="$1"
     local VAR_NAME="$2"
     local VALUE=""
     if [[ -t 0 ]]; then
-        read -rsp "$PROMPT" VALUE
-        echo  # 换行
+        # 手动关闭回显，避免 read -s 在部分终端下阻断粘贴
+        stty -echo 2>/dev/null || true
+        IFS= read -rp "$PROMPT" VALUE
+        stty echo 2>/dev/null || true
+        echo  # 补换行
     else
-        read -rp "$PROMPT" VALUE
+        IFS= read -rp "$PROMPT" VALUE
     fi
-    # 将值赋给调用方变量（nameref 兼容 bash 4.3+）
+    # 去除首尾所有空白（空格/Tab/\r 等粘贴残留）
+    VALUE="${VALUE#"${VALUE%%[![:space:]]*}"}"
+    VALUE="${VALUE%"${VALUE##*[![:space:]]}"}"
     printf -v "$VAR_NAME" '%s' "$VALUE"
 }
 
@@ -483,15 +489,7 @@ cmd_deploy() {
     read -rp "请输入绑定的 CDN 域名 [没有请留空]: " S3_CDN_DOMAIN
     S3_CDN_DOMAIN="${S3_CDN_DOMAIN:-}"
 
-    # 去除密码前后的空白字符（防止粘贴时混入空格）
-    DB_PW="${DB_PW#"${DB_PW%%[! ]*}"}"
-    DB_PW="${DB_PW%"${DB_PW##*[! ]}"}"
-    REDIS_PW="${REDIS_PW#"${REDIS_PW%%[! ]*}"}"
-    REDIS_PW="${REDIS_PW%"${REDIS_PW##*[! ]}"}"
-    S3_KEY="${S3_KEY#"${S3_KEY%%[! ]*}"}"
-    S3_KEY="${S3_KEY%"${S3_KEY##*[! ]}"}"
-    S3_SECRET="${S3_SECRET#"${S3_SECRET%%[! ]*}"}"
-    S3_SECRET="${S3_SECRET%"${S3_SECRET##*[! ]}"}"
+    # read_secret 内已统一去除首尾空白，此处无需重复处理
 
     # 获取 WireGuard IP，wg0 不存在则拒绝部署
     info "检测本机 WireGuard 接口地址..."
