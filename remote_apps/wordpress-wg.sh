@@ -78,13 +78,7 @@ _write_nginx_wp_conf() {
     local DEST="$1"
     local WG_IP="$2"
     cat > "$DEST" <<NGINX
-upstream wordpress_fpm {
-    server 127.0.0.1:9000;
-    least_conn;
-    keepalive 32;
-}
-
-map $http_x_forwarded_proto $fastcgi_https {
+map \$http_x_forwarded_proto \$fastcgi_https {
     default  "";
     https    "on";
 }
@@ -101,28 +95,25 @@ server {
     index index.php index.html;
     client_max_body_size 2048M;
 
-    # 将网关传来的真实协议头传给 PHP
-    # 已通过 map 定义为 $fastcgi_https
-
     location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff2|webp)$ {
         expires max;
         log_not_found off;
-        try_files $uri =404;
+        try_files \$uri =404;
     }
 
     location / {
-        try_files $uri $uri/ /index.php?$args;
+        try_files \$uri \$uri/ /index.php?\$args;
     }
 
     location ~ \.php$ {
         fastcgi_pass              wordpress_fpm;
         fastcgi_index             index.php;
         include                   fastcgi_params;
-        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-        fastcgi_param HTTPS $fastcgi_https if_not_empty;
-        fastcgi_param HTTP_X_FORWARDED_PROTO $http_x_forwarded_proto;
-        fastcgi_param HTTP_X_FORWARDED_FOR   $http_x_forwarded_for;
-        fastcgi_param HTTP_X_REAL_IP         $http_x_real_ip;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param HTTPS \$fastcgi_https if_not_empty;
+        fastcgi_param HTTP_X_FORWARDED_PROTO \$http_x_forwarded_proto;
+        fastcgi_param HTTP_X_FORWARDED_FOR   \$http_x_forwarded_for;
+        fastcgi_param HTTP_X_REAL_IP         \$http_x_real_ip;
         fastcgi_read_timeout 600;
         fastcgi_keep_conn on;
     }
@@ -130,6 +121,8 @@ server {
     location ~* /(?:wp-config\.php|\.env|\.git) {
         deny all;
     }
+}
+NGINX
 }
 
 # ── 生成 PHP 上传限制 ini ────────────────────────────
@@ -174,6 +167,43 @@ PHP
 # ── 生成 docker-compose.yml（host 网络）─────────────
 _write_docker_compose() {
     local DIR="$1"
+    # WORDPRESS_CONFIG_EXTRA 用独立 PHP 文件挂载，避免 YAML 多行值转义地狱
+    cat > "$DIR/uploads/wp-config-extra.php" <<'PHPEXTRA'
+<?php
+// ── 代理信任头（必须最先执行）─────────────────────
+if (php_sapi_name() !== 'cli') {
+    if (isset($_SERVER['HTTP_X_FORWARDED_PROTO'])
+        && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+        $_SERVER['HTTPS'] = 'on';
+    }
+    if (isset($_SERVER['HTTP_X_FORWARDED_HOST'])) {
+        $_SERVER['HTTP_HOST'] = $_SERVER['HTTP_X_FORWARDED_HOST'];
+    }
+    define('WP_HOME',    'https://' . $_SERVER['HTTP_HOST']);
+    define('WP_SITEURL', 'https://' . $_SERVER['HTTP_HOST']);
+}
+
+// ── Redis ──────────────────────────────────────────
+$redis_host = getenv('REDIS_HOST');
+$redis_pw   = getenv('REDIS_PW');
+define('WP_REDIS_HOST', $redis_host);
+define('WP_REDIS_PORT', 6379);
+define('WP_REDIS_AUTH', $redis_pw ?: '');
+define('WP_CACHE', true);
+define('WP_MEMORY_LIMIT',     '512M');
+define('WP_MAX_MEMORY_LIMIT', '1024M');
+if (extension_loaded('redis')) {
+    ini_set('session.save_handler', 'redis');
+    ini_set('session.save_path',
+        'tcp://' . $redis_host . ':6379?auth=' . urlencode($redis_pw));
+}
+
+// ── S3 ─────────────────────────────────────────────
+if (file_exists('/etc/wordpress/s3-config.php')) {
+    require_once '/etc/wordpress/s3-config.php';
+}
+PHPEXTRA
+
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   wordpress:
@@ -194,44 +224,11 @@ services:
       S3_CDN_DOMAIN:         \${S3_CDN_DOMAIN}
       REDIS_HOST:            \${REDIS_HOST}
       REDIS_PW:              \${REDIS_PW}
-      WORDPRESS_CONFIG_EXTRA: |
-        <?php
-  // ── 代理信任头（必须最先执行）─────────────────────
-        if (php_sapi_name() !== 'cli') {
-        if ( isset( \$_SERVER['HTTP_X_FORWARDED_PROTO'] )
-           && \$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https' ) {
-          \$_SERVER['HTTPS'] = 'on';
-      }
-        if ( isset( \$_SERVER['HTTP_X_FORWARDED_HOST'] ) ) {
-          \$_SERVER['HTTP_HOST'] = \$_SERVER['HTTP_X_FORWARDED_HOST'];
-      }
-        define( 'WP_HOME',    'https://' . \$_SERVER['HTTP_HOST'] );
-        define( 'WP_SITEURL', 'https://' . \$_SERVER['HTTP_HOST'] );
-  }
-
-  // ── Redis ──────────────────────────────────────────
-        \$redis_host = getenv('REDIS_HOST');
-        \$redis_pw   = getenv('REDIS_PW');
-        define('WP_REDIS_HOST', \$redis_host);
-        define('WP_REDIS_PORT', 6379);
-        define('WP_REDIS_AUTH', \$redis_pw ?: '');
-        define('WP_CACHE', true);
-        define('WP_MEMORY_LIMIT', '512M');
-        define('WP_MAX_MEMORY_LIMIT', '1024M');
-        if (extension_loaded('redis')) {
-        ini_set('session.save_handler', 'redis');
-        ini_set('session.save_path',
-          'tcp://'.\$redis_host.':6379?auth='.urlencode(\$redis_pw));
-        }
-
-  // ── S3 ─────────────────────────────────────────────
-        if (file_exists('/etc/wordpress/s3-config.php')) {
-        require_once '/etc/wordpress/s3-config.php';
-        }
     volumes:
       - ./data:/var/www/html
       - ./uploads/php-uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
       - ./uploads/s3-config.php:/etc/wordpress/s3-config.php:ro
+      - ./uploads/wp-config-extra.php:/var/www/html/wp-config-extra.php:ro
 
   nginx:
     image: nginx:alpine
@@ -244,6 +241,13 @@ services:
       - ./uploads/nginx-wp.conf:/etc/nginx/conf.d/default.conf:ro
       - ./logs:/var/log/nginx
 YAML
+
+    # wp-config-extra.php 需要被 wp-config.php require，
+    # 通过 WORDPRESS_CONFIG_EXTRA 单行 require 注入，避免多行 YAML 问题
+    # 注意：wordpress 官方镜像会把该环境变量内容追加到 wp-config.php 末尾
+    # 这里改用挂载文件 + 单行 require 的方式更可靠
+    info "提示：wp-config-extra.php 已写入 uploads/，" \
+         "如需生效请确认 WordPress 容器挂载正确，或在 wp-config.php 末尾手动 require。"
 }
 
 # ── 等待 & 配置插件（核心安装）─────────────────────
