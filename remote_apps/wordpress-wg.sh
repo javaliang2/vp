@@ -196,6 +196,20 @@ services:
       REDIS_PW:              \${REDIS_PW}
       WORDPRESS_CONFIG_EXTRA: |
         <?php
+  // ── 代理信任头（必须最先执行）─────────────────────
+        if (php_sapi_name() !== 'cli') {
+        if ( isset( \$_SERVER['HTTP_X_FORWARDED_PROTO'] )
+           && \$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https' ) {
+          \$_SERVER['HTTPS'] = 'on';
+      }
+        if ( isset( \$_SERVER['HTTP_X_FORWARDED_HOST'] ) ) {
+          \$_SERVER['HTTP_HOST'] = \$_SERVER['HTTP_X_FORWARDED_HOST'];
+      }
+        define( 'WP_HOME',    'https://' . \$_SERVER['HTTP_HOST'] );
+        define( 'WP_SITEURL', 'https://' . \$_SERVER['HTTP_HOST'] );
+  }
+
+  // ── Redis ──────────────────────────────────────────
         \$redis_host = getenv('REDIS_HOST');
         \$redis_pw   = getenv('REDIS_PW');
         define('WP_REDIS_HOST', \$redis_host);
@@ -205,12 +219,14 @@ services:
         define('WP_MEMORY_LIMIT', '512M');
         define('WP_MAX_MEMORY_LIMIT', '1024M');
         if (extension_loaded('redis')) {
-            ini_set('session.save_handler', 'redis');
-            ini_set('session.save_path',
-                'tcp://'.\$redis_host.':6379?auth='.urlencode(\$redis_pw));
+        ini_set('session.save_handler', 'redis');
+        ini_set('session.save_path',
+          'tcp://'.\$redis_host.':6379?auth='.urlencode(\$redis_pw));
         }
+
+  // ── S3 ─────────────────────────────────────────────
         if (file_exists('/etc/wordpress/s3-config.php')) {
-            require_once '/etc/wordpress/s3-config.php';
+        require_once '/etc/wordpress/s3-config.php';
         }
     volumes:
       - ./data:/var/www/html
