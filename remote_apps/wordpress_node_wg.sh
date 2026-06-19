@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
-# wp-deploy.sh — WordPress 多节点部署（内网 WG + S3 存储交互版）
-# 功能：部署、状态、日志、启停、重试配置、删除节点、更新镜像
+# wp-deploy.sh — WordPress 多节点全自动部署（内网 WG + S3 + Redis 闭环版）
+# 功能：全自动安装核心、状态、日志、启停、重试配置、删除节点、更新镜像
 # ============================================================
 set -euo pipefail
 export LANG=en_US.UTF-8
@@ -30,6 +30,10 @@ dc() {
 
 wp_cli() {
     local DIR="$1"; shift
+    # 动态检查并具备自愈能力：如果容器内没有安装 wp-cli，则自动下载并赋予执行权限
+    if ! dc "$DIR" exec -T wordpress test -f /usr/local/bin/wp 2>/dev/null; then
+        dc "$DIR" exec -T wordpress sh -c "wget -qO /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && chmod +x /usr/local/bin/wp" >/dev/null 2>&1 || true
+    fi
     dc "$DIR" exec -T wordpress wp --allow-root "$@"
 }
 
@@ -144,63 +148,96 @@ if (file_exists(ABSPATH . 'wp-content/s3-config.php')) {
 PHPEOF
 }
 
-# ── 核心异步任务 ────────────────────────────────────────────
-# 修复：wp-config-extra.php 注入不应依赖 core is-installed
-# （该命令要求已完成网页安装向导才返回 true，全新部署若未立即走完
-#  安装向导，会导致注入被无限期推迟，WP_REDIS_HOST 等常量永不生效，
-#  WordPress/Redis 插件只能 fallback 到默认值 127.0.0.1）。
-# 现在分两步：
-#   1) 只要 wp-config.php 文件存在即可注入 require_once，不等安装向导
-#   2) 仍然等待 core is-installed 后再装/启用插件（wp-cli 插件命令需要已安装的 WP）
+# ── 核心自动化安装与配置模块 ─────────────────────────────────
 _wait_and_setup_plugin() {
     local DIR="$1"
+    local IS_AUTO_INSTALL="${2:-false}"
+    local URL="${3:-}"
+    local TITLE="${4:-}"
+    local ADMIN="${5:-}"
+    local PASS="${6:-}"
+    local EMAIL="${7:-}"
     local WP_CONFIG="/var/www/html/wp-config.php"
 
-    info "等待 wp-config.php 生成..."
-    local CFG_RETRIES=30
-    while ! dc "$DIR" exec -T wordpress test -f "$WP_CONFIG" 2>/dev/null; do
+    info "正在检测 wordpress 基础容器初始化状态..."
+    local CFG_RETRIES=45
+    # 严格判断初始化完毕：必须等到 entrypoint.sh 创建并写入 ABSPATH 关键字
+    while ! dc "$DIR" exec -T wordpress grep -q "ABSPATH" "$WP_CONFIG" 2>/dev/null; do
         sleep 2
         (( CFG_RETRIES-- ))
         if [[ $CFG_RETRIES -eq 0 ]]; then
-            warn "wp-config.php 未生成，注入失败，请稍后通过菜单 6 手动重试。"
+            warn "wp-config.php 基础配置文件生成超时。可能数据库连接有误，请通过菜单 3 查看容器日志。"
             return 1
         fi
     done
 
+    # 注入高级配置
     if ! dc "$DIR" exec -T wordpress grep -q "wp-config-extra.php" "$WP_CONFIG"; then
         dc "$DIR" exec -T wordpress sed -i "1s|<?php|<?php\nrequire_once(ABSPATH . 'wp-config-extra.php');|" "$WP_CONFIG"
-        log "wp-config-extra.php 注入成功（Redis/S3 常量已生效）"
+        log "高级核心配置注入成功 (wp-config-extra.php 已生效)"
     else
-        log "wp-config-extra.php 已存在，跳过注入"
+        log "高级核心配置已存在，跳过注入"
     fi
 
-    info "后台任务：等待 WordPress 完成安装向导..."
-    local RETRIES=60
-    while ! wp_cli "$DIR" core is-installed &>/dev/null; do
-        sleep 5
-        (( RETRIES-- ))
-        if [[ $RETRIES -eq 0 ]]; then
-            warn "WordPress 安装向导未完成（请先在浏览器里走完初始设置），S3/Redis 插件安装已跳过。"
-            warn "完成安装向导后，请通过菜单 6 重新执行本步骤。"
+    info "正在配置容器内环境并同步验证 WP-CLI 状态..."
+    if ! dc "$DIR" exec -T wordpress test -f /usr/local/bin/wp 2>/dev/null; then
+        dc "$DIR" exec -T wordpress sh -c "wget -qO /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && chmod +x /usr/local/bin/wp" >/dev/null 2>&1 || true
+    fi
+
+    if ! dc "$DIR" exec -T wordpress test -f /usr/local/bin/wp 2>/dev/null; then
+        warn "容器内未能成功部署 WP-CLI 核心，无法继续自动化插件配置。请检查容器外网连通性。"
+        return 1
+    fi
+
+    # 全自动核心静默安装
+    if [[ "$IS_AUTO_INSTALL" == "true" ]]; then
+        if ! wp_cli "$DIR" core is-installed &>/dev/null; then
+            info "检测到空数据库，正在执行 WordPress 核心全静默自动化安装..."
+            if wp_cli "$DIR" core install --url="$URL" --title="$TITLE" --admin_user="$ADMIN" --admin_password="$PASS" --admin_email="$EMAIL" --skip-email; then
+                log "WordPress 核心数据初始化成功！"
+                echo -e "  站点主页: \e[32m${URL}\e[0m"
+                echo -e "  管理账号: \e[32m${ADMIN}\e[0m"
+                echo -e "  管理密码: \e[32m${PASS}\e[0m"
+            else
+                warn "WordPress 核心数据初始化失败，请通过菜单 3 查看具体错误。"
+                return 1
+            fi
+        else
+            log "检测到数据库已有旧数据，跳过核心初始化。"
+        fi
+    else
+        if ! wp_cli "$DIR" core is-installed &>/dev/null; then
+            warn "WordPress 尚未完成数据初始化。若需要全自动安装，请重新选择菜单 1 部署。"
             return 1
         fi
-    done
+    fi
 
+    info "正在检测并配置持久化分布式插件..."
+    # 彻底解决权限问题导致的写入受阻（特别是 Redis 需要在 wp-content 生成 object-cache.php）
+    dc "$DIR" exec -T wordpress chown -R www-data:www-data /var/www/html/wp-content || true
+
+    # WP Offload Media (S3插件)
+    info "下载并配置 S3 对象存储插件 (amazon-s3-and-cloudfront)..."
     if wp_cli "$DIR" plugin is-installed amazon-s3-and-cloudfront &>/dev/null; then
         wp_cli "$DIR" plugin activate amazon-s3-and-cloudfront
     else
-        wp_cli "$DIR" plugin install amazon-s3-and-cloudfront --activate
+        wp_cli "$DIR" plugin install amazon-s3-and-cloudfront --activate || warn "S3 插件安装失败，请检查官方镜像源连通性。"
     fi
-    log "WP Offload Media 插件已就绪。"
 
-    # Redis Object Cache 插件：常量定义后必须配合此插件的 drop-in 才能真正生效
+    # Redis Object Cache (Redis插件)
+    info "下载并配置分布式高速缓存插件 (redis-cache)..."
     if wp_cli "$DIR" plugin is-installed redis-cache &>/dev/null; then
         wp_cli "$DIR" plugin activate redis-cache
     else
-        wp_cli "$DIR" plugin install redis-cache --activate
+        wp_cli "$DIR" plugin install redis-cache --activate || warn "Redis 插件安装失败，请检查官方镜像源连通性。"
     fi
-    wp_cli "$DIR" redis enable || warn "Redis 启用失败，请检查 WP_REDIS_HOST/AUTH 是否正确，并手动执行: wp redis enable"
-    log "Redis Object Cache 已启用"
+
+    info "激活 Redis 核心集群加速器..."
+    if wp_cli "$DIR" redis enable; then
+        log "Redis Object Cache 成功启用，内存级高并发架构已闭环！"
+    else
+        warn "Redis 握手启用失败。请检查后台网络安全组隔离状态、密码正确性、或手动在 WP 后台激活。"
+    fi
 }
 
 # ════════════════════════════════════════════════════════════
@@ -208,12 +245,26 @@ _wait_and_setup_plugin() {
 # ════════════════════════════════════════════════════════════
 
 cmd_deploy() {
-    header "启动 WordPress 节点部署向导"
+    header "启动 WordPress 分布式节点全自动部署向导"
 
     read -rp "请输入部署目录 [默认: ${DEFAULT_DIR}]: " DIR
     DIR="${DIR:-$DEFAULT_DIR}"
     read -rp "请输入本机对外监听端口 [默认: ${DEFAULT_PORT}]: " HOST_PORT
     HOST_PORT="${HOST_PORT:-$DEFAULT_PORT}"
+
+    info "--- 自动化建站与初始管理员配置 ---"
+    read -rp "请输入站点访问域名或公网IP (用于多节点跨域绑定) [例如: https://wp.example.com]: " WP_URL
+    [[ -z "$WP_URL" ]] && error "站点 URL 不能为空"
+    read -rp "请输入站点名称 [默认: Distributed WP]: " WP_TITLE
+    WP_TITLE="${WP_TITLE:-Distributed WP}"
+    read -rp "请输入管理员用户名 [默认: wpadmin]: " WP_ADMIN
+    WP_ADMIN="${WP_ADMIN:-wpadmin}"
+    read -rp "请输入管理员密码 [留空则全自动随机生成]: " WP_PASS
+    if [[ -z "$WP_PASS" ]]; then
+        WP_PASS=$(tr -dc 'A-Za-z0-9!@#%^&*()' < /dev/urandom | head -16 || echo "Wp@Pass12345678")
+    fi
+    read -rp "请输入管理员绑定的电子邮箱 [默认: admin@example.com]: " WP_EMAIL
+    WP_EMAIL="${WP_EMAIL:-admin@example.com}"
 
     info "--- 远端共享数据库与缓存配置 (WireGuard 内网) ---"
     read -rp "请输入 MariaDB 的 WireGuard IP: " DB_HOST
@@ -255,7 +306,7 @@ cmd_deploy() {
     [[ -z "$S3_SECRET" ]] && error "S3 Secret 不能为空"
     read -rp "请输入绑定的 CDN 域名 [没有请留空]: " S3_CDN_DOMAIN
 
-    # 输入清理
+    # 输入清洗
     DB_PW="${DB_PW//[[:space:]]/}"
     REDIS_PW="${REDIS_PW//[[:space:]]/}"
     S3_KEY="${S3_KEY//[[:space:]]/}"
@@ -266,10 +317,10 @@ cmd_deploy() {
     WG_IP=""
     if ip -4 addr show wg0 &>/dev/null; then
         WG_IP=$(ip -4 addr show wg0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
-        log "检测到 wg0 IP: ${WG_IP}，Nginx 将仅监听此地址。"
+        log "检测到 wg0 IP: ${WG_IP}，Nginx 将仅监听此内网隔离地址。"
     else
         warn "未找到 wg0 接口，回退为监听 0.0.0.0（所有接口）。"
-        warn "请务必通过防火墙限制访问。"
+        warn "请务必通过防火墙限制外部恶意访问。"
         WG_IP="0.0.0.0"
     fi
 
@@ -343,18 +394,19 @@ networks:
     driver: bridge
 YAML
 
-    info "正在拉取镜像并构建本地节点环境..."
-    dc "$DIR" up -d 2>&1 || error "docker compose up 失败"
+    info "正在拉取镜像并构建本地多节点计算环境..."
+    dc "$DIR" up -d 2>&1 || error "docker compose 容器群编排失败"
 
-    _wait_and_setup_plugin "$DIR" &
+    # 前台顺序执行核心部署与配置注入，保证全自动任务彻底闭环
+    _wait_and_setup_plugin "$DIR" "true" "$WP_URL" "$WP_TITLE" "$WP_ADMIN" "$WP_PASS" "$WP_EMAIL"
 
-    log "WordPress 节点容器群启动成功！"
-    echo -e "绑定地址: \e[33m${WG_IP}:${HOST_PORT}\e[0m"
-    echo -e "内网数据库: \e[33m${DB_HOST}\e[0m"
-    echo -e "内网缓存: \e[33m${REDIS_HOST}\e[0m"
+    log "WordPress 业务节点集群启动并全自动组装完成！"
+    echo -e "绑定监听: \e[33m${WG_IP}:${HOST_PORT}\e[0m"
+    echo -e "共享数据库: \e[33m${DB_HOST}\e[0m"
+    echo -e "共享缓存: \e[33m${REDIS_HOST}\e[0m"
     echo -e "对象存储桶: \e[33ms3://${S3_BUCKET}\e[0m"
     if [[ "$WG_IP" == "0.0.0.0" ]]; then
-        warn "当前监听所有接口，请立即配置防火墙！"
+        warn "当前系统暴露至全网网卡，请务必及时限制宿主机安全组策略！"
     fi
 }
 
@@ -373,54 +425,52 @@ cmd_logs() {
     dc "$DIR" logs -f --tail=100 "$SVC"
 }
 
-# ── 新增：删除节点 ──────────────────────────────────────────
 cmd_destroy() {
     read -rp "请输入要删除的节点目录 [默认: ${DEFAULT_DIR}]: " DIR
     DIR="${DIR:-$DEFAULT_DIR}"
     if [[ ! -f "$DIR/docker-compose.yml" ]]; then
-        error "目录 $DIR 中未找到 docker-compose.yml，请检查路径。"
+        error "目录 $DIR 中未找到有效编排文件，请检查路径。"
     fi
-    warn "此操作将停止并删除容器和网络，但保留所有数据（包括数据库、Redis 不受影响）。"
-    read -rp "确认删除节点吗？请输入 'yes' 继续: " CONFIRM
+    warn "此操作将热停止并销毁当前节点的容器与网桥，但挂载的数据目录将完好保留。"
+    read -rp "确认摧毁当前业务计算节点吗？请输入 'yes' 继续: " CONFIRM
     if [[ "$CONFIRM" != "yes" ]]; then
-        info "已取消删除。"
+        info "操作已取消。"
         return
     fi
     dc "$DIR" down --volumes --remove-orphans 2>/dev/null || true
-    log "节点容器与网络已删除，数据目录 ${DIR} 保留。"
+    log "节点网络及计算层释放成功。本地持久化目录 ${DIR} 已安全留存。"
 }
 
-# ── 新增：更新组件 ──────────────────────────────────────────
 cmd_update() {
     read -rp "请输入要更新的节点目录 [默认: ${DEFAULT_DIR}]: " DIR
     DIR="${DIR:-$DEFAULT_DIR}"
-    header "更新节点组件"
-    echo "  1. 仅更新 WordPress 镜像"
-    echo "  2. 仅更新 Nginx 镜像"
-    echo "  3. 更新全部组件"
-    read -rp "请选择 [1-3]: " UP_CHOICE
+    header "热更新计算节点组件"
+    echo "  1. 仅无缝升级 WordPress 镜像"
+    echo "  2. 仅无缝升级 Nginx 镜像"
+    echo "  3. 全量安全升级整体计算集群"
+    read -rp "请选择核心升级策略 [1-3]: " UP_CHOICE
     case "$UP_CHOICE" in
         1) SERVICES="wordpress" ;;
         2) SERVICES="nginx" ;;
-        3) SERVICES="" ;;  # pull all and recreate
+        3) SERVICES="" ;;
         *) error "无效选择" ;;
     esac
 
-    info "正在拉取最新镜像..."
+    info "正在向官方上游拉取最新安全镜像..."
     if [[ -z "$SERVICES" ]]; then
         dc "$DIR" pull
     else
         dc "$DIR" pull $SERVICES
     fi
 
-    info "正在重新创建容器..."
+    info "正在热重载并重建容器集群..."
     if [[ -z "$SERVICES" ]]; then
         dc "$DIR" up -d --force-recreate
     else
         dc "$DIR" up -d --force-recreate $SERVICES
     fi
 
-    log "节点组件更新完成。"
+    log "节点环境热升级已完成。"
     cmd_status
 }
 
@@ -431,16 +481,16 @@ interactive_menu() {
     while true; do
         echo ""
         _c "1;35" "========================================"
-        _c "1;35" "    WordPress 多节点分发管理 (完整版)"
+        _c "1;35" "    WordPress 多节点分发管理 (自动化版)"
         _c "1;35" "========================================"
-        echo -e "  \e[32m1.\e[0m 部署全新 WordPress 业务节点"
+        echo -e "  \e[32m1.\e[0m 部署全新 WordPress 业务节点 (全自动建站)"
         echo -e "  \e[32m2.\e[0m 查看当前节点容器运行状态"
         echo -e "  \e[32m3.\e[0m 查看业务节点实时运行日志"
         echo -e "  \e[31m4.\e[0m 停止该节点服务"
         echo -e "  \e[32m5.\e[0m 启动该节点服务"
-        echo -e "  \e[33m6.\e[0m 手动重试注入配置 / 安装 S3 插件"
-        echo -e "  \e[31m7.\e[0m 删除节点 (移除容器/网络)"
-        echo -e "  \e[36m8.\e[0m 更新节点组件 (拉取新镜像)"
+        echo -e "  \e[33m6.\e[0m 强制触发重试配置 / 手动安装并启用 S3 与 Redis 插件"
+        echo -e "  \e[31m7.\e[0m 删除节点 (移除容器/网桥)"
+        echo -e "  \e[36m8.\e[0m 滚动更新计算组件 (拉取最新镜像)"
         echo -e "  \e[36m0.\e[0m 退出管理向导"
         echo "----------------------------------------"
         read -rp "请输入功能序号并回车: " CHOICE
@@ -452,26 +502,26 @@ interactive_menu() {
             4)
                 read -rp "请输入要停止的节点目录 [默认: ${DEFAULT_DIR}]: " DIR
                 DIR="${DIR:-$DEFAULT_DIR}"
-                dc "$DIR" stop && log "节点服务已停止！"
+                dc "$DIR" stop && log "节点服务已安全挂起！"
                 ;;
             5)
                 read -rp "请输入要启动的节点目录 [默认: ${DEFAULT_DIR}]: " DIR
                 DIR="${DIR:-$DEFAULT_DIR}"
-                dc "$DIR" up -d && log "节点服务已恢复运行！"
+                dc "$DIR" up -d && log "节点业务已恢复在线运行！"
                 ;;
             6)
-                read -rp "请输入节点目录 [默认: ${DEFAULT_DIR}]: " DIR
+                read -rp "请输入要执行维护的节点目录 [默认: ${DEFAULT_DIR}]: " DIR
                 DIR="${DIR:-$DEFAULT_DIR}"
-                _wait_and_setup_plugin "$DIR"
+                _wait_and_setup_plugin "$DIR" "false"
                 ;;
             7) cmd_destroy ;;
             8) cmd_update ;;
-            0) info "退出向导，祝你建站愉快！"; exit 0 ;;
-            *) warn "无效输入，请重新输入序号" ;;
+            0) info "管理向导已退出。"; exit 0 ;;
+            *) warn "无效输入，请重新输入可用序号" ;;
         esac
 
         echo ""
-        read -rp "按回车键返回主菜单..."
+        read -rp "按回车键返回主管理菜单..."
         clear
     done
 }
