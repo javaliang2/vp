@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# wp-deploy.sh — WordPress 多节点全自动部署（内网 WG + S3 + Redis 闭环版）
+# wp-deploy.sh — WordPress 多节点全自动部署（内网 WG + S3 + Redis）
 # 功能：全自动安装核心、状态、日志、启停、重试配置、删除节点、更新镜像
 # ============================================================
 set -uo pipefail
@@ -61,22 +61,20 @@ wp_cli() {
     dc "$DIR" exec -T wordpress wp --allow-root "$@"
 }
 
-# 安全读取密码：手动 stty -echo 替代 read -s，
-# 确保粘贴输入在所有终端下均可正常工作。
 read_secret() {
     local PROMPT="$1"
     local VAR_NAME="$2"
     local VALUE=""
+
     if [[ -t 0 ]]; then
-        # 手动关闭回显，避免 read -s 在部分终端下阻断粘贴
-        stty -echo 2>/dev/null || true
-        IFS= read -rp "$PROMPT" VALUE
-        stty echo 2>/dev/null || true
-        echo  # 补换行
+        # 使用 read -s 隐藏输入，兼容粘贴（带 -r 避免反斜杠转义）
+        IFS= read -rsp "$PROMPT" VALUE
+        echo    # 补一个换行
     else
         IFS= read -rp "$PROMPT" VALUE
     fi
-    # 去除首尾所有空白（空格/Tab/\r 等粘贴残留）
+
+    # 去除首尾所有空白（空格/Tab/换行等粘贴残留）
     VALUE="${VALUE#"${VALUE%%[![:space:]]*}"}"
     VALUE="${VALUE%"${VALUE##*[![:space:]]}"}"
     printf -v "$VAR_NAME" '%s' "$VALUE"
