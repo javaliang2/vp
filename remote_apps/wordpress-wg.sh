@@ -66,15 +66,10 @@ read_secret() {
     local VAR_NAME="$2"
     local VALUE=""
 
-    if [[ -t 0 ]]; then
-        # 使用 read -s 隐藏输入，兼容粘贴（带 -r 避免反斜杠转义）
-        IFS= read -rsp "$PROMPT" VALUE
-        echo    # 补一个换行
-    else
-        IFS= read -rp "$PROMPT" VALUE
-    fi
+    # 直接读取，密码会明文显示（直观，粘贴完全正常）
+    IFS= read -rp "$PROMPT" VALUE
 
-    # 去除首尾所有空白（空格/Tab/换行等粘贴残留）
+    # 去除首尾空白（粘贴时可能带入的换行或空格）
     VALUE="${VALUE#"${VALUE%%[![:space:]]*}"}"
     VALUE="${VALUE%"${VALUE##*[![:space:]]}"}"
     printf -v "$VAR_NAME" '%s' "$VALUE"
