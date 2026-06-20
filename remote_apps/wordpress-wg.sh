@@ -217,7 +217,7 @@ $_redis_pw   = getenv('REDIS_PW')   ?: '';
 if (!defined('WP_REDIS_HOST')) {
     define('WP_REDIS_HOST', $_redis_host);
     define('WP_REDIS_PORT', 6379);
-    define('WP_REDIS_AUTH', $_redis_pw);
+    define('WP_REDIS_PASSWORD', $_redis_pw);
     define('WP_CACHE',      true);
 }
 define('WP_MEMORY_LIMIT',     '512M');
