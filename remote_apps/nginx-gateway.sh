@@ -1255,6 +1255,99 @@ CONF
     _site_activate "$domain"
 }
 
+# ══════════════════════════════════════════════════════════════════
+# 负载均衡节点管理
+# ══════════════════════════════════════════════════════════════════
+site_lb_node() {
+    require_root
+
+    local domain=""
+    safe_read -rp "负载均衡域名: " domain
+    [[ -z "$domain" ]] && die "域名不能为空"
+
+    local conf="${SITES_AVAILABLE}/${domain}.conf"
+    [[ -f "$conf" ]] || die "配置不存在: $conf"
+    grep -q "^upstream " "$conf" || die "${domain} 不是负载均衡站点"
+
+    local upstream_name="upstream_${domain//./_}"
+
+    echo ""
+    echo -e "${CYAN}── 节点管理: ${domain} ──${NC}"
+    echo "  1) 添加节点"
+    echo "  2) 删除节点"
+    echo "  3) 列出节点"
+    safe_read -rp "选择 [1-3]: " _action
+
+    case "${_action}" in
+        1)
+            local node=""
+            safe_read -rp "新节点地址（如 10.0.0.4:8080）: " node
+            [[ -z "$node" ]] && die "节点地址不能为空"
+
+            if grep -qE "^\s+server ${node//./\\.}( |$)" "$conf"; then
+                die "节点 ${node} 已存在"
+            fi
+
+            sed -i "/^upstream ${upstream_name}/,/^}/ {
+                /^}/ i\\    server ${node} max_fails=2 fail_timeout=10s;
+            }" "$conf"
+
+            success "节点 ${node} 已添加"
+            ;;
+
+        2)
+            local -a nodes=()
+            while IFS= read -r line; do
+                nodes+=("$(echo "$line" | awk '{print $2}')")
+            done < <(grep -E "^\s+server .+ max_fails" "$conf")
+
+            [[ ${#nodes[@]} -eq 0 ]] && die "未找到节点"
+            [[ ${#nodes[@]} -eq 1 ]] && die "只剩一个节点，无法删除"
+
+            echo ""
+            echo -e "${CYAN}当前节点:${NC}"
+            local i=1
+            for node in "${nodes[@]}"; do
+                printf "  %d) %s\n" "$i" "$node"
+                (( i++ ))
+            done
+
+            safe_read -rp "选择要删除的节点序号 [1-${#nodes[@]}]: " _idx
+            if ! [[ "$_idx" =~ ^[0-9]+$ ]] || (( _idx < 1 || _idx > ${#nodes[@]} )); then
+                die "无效序号"
+            fi
+
+            local target="${nodes[$(( _idx - 1 ))]}"
+            sed -i "/^\s\+server ${target//./\\.} max_fails/d" "$conf"
+            success "节点 ${target} 已删除"
+            ;;
+
+        3)
+            echo ""
+            echo -e "${CYAN}当前节点列表 — ${domain}:${NC}"
+            local found=false
+            while IFS= read -r line; do
+                found=true
+                local addr fails timeout
+                addr=$(echo "$line" | awk '{print $2}')
+                fails=$(echo "$line" | grep -oP 'max_fails=\K[0-9]+')
+                timeout=$(echo "$line" | grep -oP 'fail_timeout=\K\S+')
+                printf "  • %-25s  max_fails=%-3s fail_timeout=%s\n" \
+                    "$addr" "$fails" "$timeout"
+            done < <(grep -E "^\s+server .+ max_fails" "$conf")
+            $found || warn "未找到节点"
+            echo ""
+            return
+            ;;
+
+        *) die "无效选项" ;;
+    esac
+
+    nginx -t || die "配置检查失败，请手动检查: $conf"
+    systemctl reload nginx
+    success "Nginx 已重载，节点变更生效"
+}
+
 # ──────────────────────────────────────────────────────────
 # 访问控制
 # ──────────────────────────────────────────────────────────
@@ -1808,6 +1901,8 @@ ${BOLD}站点创建:${NC}
   site stream             TCP/UDP 流代理（需 stream 模块）
   site redirect           域名跳转（301/302/307/308，多种路径策略）
   site loadbalance        负载均衡（upstream 多节点，含健康检查）
+  site lb-node            负载均衡节点管理（添加/删除/列出）
+  
  
 ${BOLD}站点管理:${NC}
   site enable  <域名>     启用站点
@@ -1903,7 +1998,8 @@ interactive_menu() {
         echo " 23) 重载配置"
         echo " 24) 重启 Nginx"
         echo " 25) 解除限制访问"
-        echo " 26) 查看状态"
+        echo " 26) 负载均衡节点管理"
+        echo " 27) 查看状态"
         echo "  0) 退出"
         echo ""
         safe_read -rp "请选择 [0-25]: " choice
@@ -1940,7 +2036,8 @@ interactive_menu() {
             23) nginx_reload ;;
             24) nginx_restart ;;
             25) site_remove_acl ;;
-            26) nginx_status; safe_read -rp "按回车继续..." _ ;;
+            26) site_lb_node ;;
+            27) nginx_status; safe_read -rp "按回车继续..." _ ;;
              0) echo "再见！"; exit 0 ;;
              *) warn "无效选项，请重试" ;;
         esac
@@ -1981,6 +2078,7 @@ main() {
                 list)        site_list ;;
                 info)        site_info "${1:-}" ;;
                 edit)        site_edit "${1:-}" ;;
+                lb-node)     site_lb_node ;;
                 *)           show_help ;;
             esac ;;
         cert)
