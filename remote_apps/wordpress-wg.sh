@@ -414,20 +414,22 @@ cmd_deploy() {
     echo "  2. Cloudflare R2"
     echo "  3. 其他 S3 兼容（MinIO 等）"
     read -rp "选择 [默认: 1]: " S3_CHOICE
-    local S3_PROVIDER="aws" S3_ENDPOINT=""
+    local S3_PROVIDER="aws" S3_ENDPOINT="" S3_REGION=""
     case "${S3_CHOICE:-1}" in
         2) read -rp "R2 Endpoint URL (https://xxx.r2.cloudflarestorage.com): " S3_ENDPOINT
            [[ -z "$S3_ENDPOINT" ]] && error "R2 必须填写 Endpoint"
            read -rp "区域 [默认: auto]: " S3_REGION
            S3_REGION="${S3_REGION:-auto}" ;;
         3) read -rp "自定义 Endpoint URL: " S3_ENDPOINT
-           [[ -z "$S3_ENDPOINT" ]] && error "非 AWS 提供商必须填写 Endpoint" ;;
+           [[ -z "$S3_ENDPOINT" ]] && error "非 AWS 提供商必须填写 Endpoint"
+           read -rp "区域 [默认: us-east-1]: " S3_REGION
+           S3_REGION="${S3_REGION:-us-east-1}" ;;
     esac
     read -rp "存储桶名称: " S3_BUCKET
     [[ -z "$S3_BUCKET" ]] && error "桶名不能为空"
     if [[ "${S3_CHOICE:-1}" == "1" ]]; then
-    read -rp "区域 [默认: us-east-1]: " S3_REGION
-    S3_REGION="${S3_REGION:-us-east-1}"
+        read -rp "区域 [默认: us-east-1]: " S3_REGION
+        S3_REGION="${S3_REGION:-us-east-1}"
     fi
     local S3_KEY="" S3_SECRET=""
     read_secret "S3 Access Key ID: " S3_KEY
