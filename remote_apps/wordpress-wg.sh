@@ -501,11 +501,12 @@ cmd_logs() {
 cmd_destroy() {
     read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
-    warn "将停止容器并清理网络，数据目录保留。"
+    warn "将停止容器并删除全部数据（不可恢复）。"
     read -rp "输入 'yes' 确认: " CONFIRM
     [[ "$CONFIRM" != "yes" ]] && { info "已取消"; return; }
     dc "$DIR" down --volumes --remove-orphans 2>/dev/null || true
-    log "节点已释放，数据保留在 ${DIR}"
+    rm -rf "$DIR"
+    log "节点及数据已完全删除：${DIR}"
 }
 
 cmd_stop() {
