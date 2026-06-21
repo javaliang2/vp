@@ -154,7 +154,7 @@ define('AS3CF_SETTINGS', serialize([
     'remove-local-file'        => false,
     'enable-object-prefix'     => true,
     'object-prefix'            => 'uploads/',
-    'delivery-provider'        => getenv('S3_CDN_DOMAIN') ? 'cloudfront' : 'storage',
+    'delivery-provider'        => getenv('S3_CDN_DOMAIN') ? 'cloudfront' : 'storage',
     'delivery-provider-domain' => getenv('S3_CDN_DOMAIN') ?: '',
     'force-https'              => true,
     'use-presigned-urls'       => false,
