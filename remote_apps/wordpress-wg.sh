@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署（内网 WG + S3 + Redis 闭环版）
+# v2.1 修复：DB_HOST 端口剥离 / WP_HOME 兜底 / S3_PROVIDER / 语言选择
 # ============================================================
 set -uo pipefail
 export LANG=en_US.UTF-8
@@ -72,7 +73,7 @@ read_secret() {
 # 配置文件生成函数
 # ════════════════════════════════════════════════════════
 
-# ── Nginx 配置（单引号 heredoc + sed 替换 WG_IP）──────
+# ── Nginx 配置 ───────────────────────────────────────
 _write_nginx_wp_conf() {
     local DEST="$1"
     local WG_IP="$2"
@@ -138,12 +139,26 @@ INI
 }
 
 # ── S3 配置 PHP ──────────────────────────────────────
+# 修复：delivery-provider 按 provider 类型正确设置
 _write_s3_config_php() {
     local DEST="$1"
     cat > "$DEST" <<'PHP'
 <?php
+$_s3_provider   = getenv('S3_PROVIDER') ?: 'aws';
+$_s3_cdn_domain = getenv('S3_CDN_DOMAIN') ?: '';
+
+// delivery-provider 合法值：
+//   aws + CDN  → 'cloudfront'
+//   其他 + CDN → 'domain'
+//   无 CDN     → 'storage'
+if ($_s3_cdn_domain !== '') {
+    $_delivery = ($_s3_provider === 'aws') ? 'cloudfront' : 'domain';
+} else {
+    $_delivery = 'storage';
+}
+
 define('AS3CF_SETTINGS', serialize([
-    'provider'                 => getenv('S3_PROVIDER') ?: 'aws',
+    'provider'                 => $_s3_provider,
     'access-key-id'            => getenv('AWS_ACCESS_KEY_ID'),
     'secret-access-key'        => getenv('AWS_SECRET_ACCESS_KEY'),
     'bucket'                   => getenv('S3_BUCKET'),
@@ -154,8 +169,8 @@ define('AS3CF_SETTINGS', serialize([
     'remove-local-file'        => false,
     'enable-object-prefix'     => true,
     'object-prefix'            => 'uploads/',
-    'delivery-provider'        => getenv('S3_CDN_DOMAIN') ? 'cloudfront' : 'storage',
-    'delivery-provider-domain' => getenv('S3_CDN_DOMAIN') ?: '',
+    'delivery-provider'        => $_delivery,
+    'delivery-provider-domain' => $_s3_cdn_domain,
     'force-https'              => true,
     'use-presigned-urls'       => false,
     'enable-cron'              => false,
@@ -164,13 +179,10 @@ PHP
 }
 
 # ── WordPress 额外配置 PHP ───────────────────────────
-# 挂载到 /etc/wordpress/（webroot 之外）
-# 由 WORDPRESS_CONFIG_EXTRA 单行 require 触发加载
-#
-# 核心策略：
-#   不写死域名，WP_HOME/WP_SITEURL 完全由网关传入的
-#   X-Forwarded-Host 动态决定，但只信任来自 WireGuard
-#   内网段的请求，外部直连无法伪造 Host 头。
+# 修复：
+#   1. 仅 WireGuard 内网段请求信任 X-Forwarded-Host
+#   2. 本地回环（REST API/wp-cron）用 WP_SITEURL_FALLBACK 兜底，
+#      防止 Gutenberg 编辑器因 WP_HOME 未定义报"意外错误"
 _write_wp_config_extra() {
     local DEST="$1"
     cat > "$DEST" <<'PHP'
@@ -184,8 +196,6 @@ function _wp_is_trusted_proxy(string $ip): bool {
 }
 
 // ── 动态设置 WP_HOME / WP_SITEURL ────────────────────
-// 域名完全由网关 X-Forwarded-Host 决定，无需写死，
-// 换域名只需改网关配置，WordPress 容器无需重启。
 if (php_sapi_name() !== 'cli') {
     $remote = $_SERVER['REMOTE_ADDR'] ?? '';
 
@@ -196,17 +206,26 @@ if (php_sapi_name() !== 'cli') {
         }
 
         // 用网关传来的真实 Host 动态构造站点 URL
-        $fwd_host = $_SERVER['HTTP_X_FORWARDED_HOST'] ?? '';
-        // 只取第一个 host（防止逗号分隔的多值）
-        $fwd_host = trim(explode(',', $fwd_host)[0]);
+        $fwd_host = trim(explode(',', $_SERVER['HTTP_X_FORWARDED_HOST'] ?? '')[0]);
 
         if ($fwd_host !== '') {
-            $scheme = ($_SERVER['HTTPS'] ?? '') === 'on' ? 'https' : 'http';
+            $scheme   = ($_SERVER['HTTPS'] ?? '') === 'on' ? 'https' : 'http';
             $site_url = $scheme . '://' . $fwd_host;
             if (!defined('WP_HOME')) {
                 define('WP_HOME',    $site_url);
                 define('WP_SITEURL', $site_url);
             }
+        }
+    }
+
+    // ── 兜底：本地回环请求（REST API / wp-cron 等）────
+    // REMOTE_ADDR 为 127.0.0.1 时无网关转发头，用环境变量保证
+    // WP_HOME 始终有值，防止 Gutenberg 编辑器报"意外错误"
+    if (!defined('WP_HOME')) {
+        $fallback = getenv('WP_SITEURL_FALLBACK') ?: '';
+        if ($fallback !== '') {
+            define('WP_HOME',    $fallback);
+            define('WP_SITEURL', $fallback);
         }
     }
 }
@@ -215,10 +234,10 @@ if (php_sapi_name() !== 'cli') {
 $_redis_host = getenv('REDIS_HOST') ?: '127.0.0.1';
 $_redis_pw   = getenv('REDIS_PW')   ?: '';
 if (!defined('WP_REDIS_HOST')) {
-    define('WP_REDIS_HOST', $_redis_host);
-    define('WP_REDIS_PORT', 6379);
+    define('WP_REDIS_HOST',     $_redis_host);
+    define('WP_REDIS_PORT',     6379);
     define('WP_REDIS_PASSWORD', $_redis_pw);
-    define('WP_CACHE',      true);
+    define('WP_CACHE',          true);
 }
 define('WP_MEMORY_LIMIT',     '512M');
 define('WP_MAX_MEMORY_LIMIT', '1024M');
@@ -235,8 +254,7 @@ if (file_exists('/etc/wordpress/s3-config.php')) {
 PHP
 }
 
-# ── docker-compose.yml（host 网络）──────────────────
-# 去掉 WP_SITEURL_OVERRIDE，域名完全动态
+# ── docker-compose.yml ───────────────────────────────
 _write_docker_compose() {
     local DIR="$1"
     cat > "$DIR/docker-compose.yml" <<'YAML'
@@ -259,7 +277,7 @@ services:
       S3_CDN_DOMAIN:          ${S3_CDN_DOMAIN}
       REDIS_HOST:             ${REDIS_HOST}
       REDIS_PW:               ${REDIS_PW}
-      # 单行 require，由官方镜像 entrypoint 写入 wp-config.php
+      WP_SITEURL_FALLBACK:    ${WP_SITEURL_FALLBACK}
       WORDPRESS_CONFIG_EXTRA: "require_once('/etc/wordpress/wp-config-extra.php');"
     volumes:
       - ./data:/var/www/html
@@ -286,7 +304,8 @@ YAML
 _wait_and_setup_plugin() {
     local DIR="$1"
     local IS_AUTO_INSTALL="${2:-false}"
-    local URL="${3:-}" TITLE="${4:-}" ADMIN="${5:-}" PASS="${6:-}" EMAIL="${7:-}"
+    local URL="${3:-}" TITLE="${4:-}" ADMIN="${5:-}" PASS="${6:-}" \
+          EMAIL="${7:-}" LOCALE="${8:-zh_CN}"
     local WP_CONFIG="/var/www/html/wp-config.php"
 
     info "等待 wp-config.php 生成..."
@@ -309,7 +328,7 @@ _wait_and_setup_plugin() {
             wp_cli "$DIR" core install \
                 --url="$URL" --title="$TITLE" \
                 --admin_user="$ADMIN" --admin_password="$PASS" \
-                --admin_email="$EMAIL" --skip-email \
+                --admin_email="$EMAIL" --locale="$LOCALE" --skip-email \
             && log "WordPress 安装成功！" \
             || { warn "安装失败，请查看日志。"; return 1; }
             echo -e "  站点: \e[32m${URL}\e[0m"
@@ -346,10 +365,13 @@ _wait_and_setup_plugin() {
     fi
 
     # ── 探测连通性后启用对象缓存 ──
+    # 修复：alpine 无 nc，改用 PHP fsockopen 探测
     info "探测 Redis 连通性..."
     local REDIS_HOST_VAL
     REDIS_HOST_VAL=$(grep '^REDIS_HOST=' "$DIR/.env" | cut -d= -f2-)
-    if dc "$DIR" exec -T wordpress sh -c "nc -zw5 '${REDIS_HOST_VAL}' 6379" 2>/dev/null; then
+    if dc "$DIR" exec -T wordpress php -r \
+        "\$c=@fsockopen('${REDIS_HOST_VAL}',6379,\$e,\$s,5);if(\$c){fclose(\$c);exit(0);}exit(1);" \
+        2>/dev/null; then
         wp_cli "$DIR" redis enable \
             && log "Redis 对象缓存已启用！" \
             || warn "redis enable 失败，请检查密码或插件状态。"
@@ -373,11 +395,12 @@ cmd_deploy() {
         || error "无效端口: $HOST_PORT"
 
     info "--- 站点配置 ---"
-    # 仅用于 WP-CLI 初始安装，运行时域名由网关 X-Forwarded-Host 动态决定
-    read -rp "初始安装 URL（如 https://example.com，后续换域名无需改此处）: " WP_URL
+    read -rp "初始安装 URL（如 https://example.com）: " WP_URL
     [[ -z "$WP_URL" ]] && error "URL 不能为空"
     read -rp "站点名称 [默认: Distributed WP]: " WP_TITLE
     WP_TITLE="${WP_TITLE:-Distributed WP}"
+    read -rp "安装语言 [默认: zh_CN]: " WP_LOCALE
+    WP_LOCALE="${WP_LOCALE:-zh_CN}"
     read -rp "管理员用户名 [默认: wpadmin]: " WP_ADMIN
     WP_ADMIN="${WP_ADMIN:-wpadmin}"
 
@@ -392,8 +415,11 @@ cmd_deploy() {
     WP_EMAIL="${WP_EMAIL:-admin@example.com}"
 
     info "--- 数据库 ---"
-    read -rp "MariaDB WireGuard IP: " DB_HOST
+    read -rp "MariaDB WireGuard IP（不含端口，如 10.10.0.2）: " DB_HOST
     [[ -z "$DB_HOST" ]] && error "数据库 IP 不能为空"
+    # 修复：剥离用户可能误输入的 :3306
+    DB_HOST="${DB_HOST%%:*}"
+
     read -rp "数据库名 [默认: wordpress]: " DB_NAME
     DB_NAME="${DB_NAME:-wordpress}"
     read -rp "数据库用户名 [默认: wpuser]: " DB_USER
@@ -405,6 +431,7 @@ cmd_deploy() {
     info "--- Redis ---"
     read -rp "Redis WireGuard IP [默认同数据库 ${DB_HOST}]: " REDIS_HOST
     REDIS_HOST="${REDIS_HOST:-$DB_HOST}"
+    REDIS_HOST="${REDIS_HOST%%:*}"
     local REDIS_PW=""
     read_secret "Redis 密码: " REDIS_PW
     [[ -z "$REDIS_PW" ]] && error "Redis 密码不能为空"
@@ -414,23 +441,25 @@ cmd_deploy() {
     echo "  2. Cloudflare R2"
     echo "  3. 其他 S3 兼容（MinIO 等）"
     read -rp "选择 [默认: 1]: " S3_CHOICE
+    # 修复：各分支明确赋值 S3_PROVIDER，否则 R2/MinIO delivery-provider 会传错
     local S3_PROVIDER="aws" S3_ENDPOINT="" S3_REGION=""
     case "${S3_CHOICE:-1}" in
-        2) read -rp "R2 Endpoint URL (https://xxx.r2.cloudflarestorage.com): " S3_ENDPOINT
+        2) S3_PROVIDER="cloudflare"
+           read -rp "R2 Endpoint URL (https://xxx.r2.cloudflarestorage.com): " S3_ENDPOINT
            [[ -z "$S3_ENDPOINT" ]] && error "R2 必须填写 Endpoint"
            read -rp "区域 [默认: auto]: " S3_REGION
            S3_REGION="${S3_REGION:-auto}" ;;
-        3) read -rp "自定义 Endpoint URL: " S3_ENDPOINT
+        3) S3_PROVIDER="other"
+           read -rp "自定义 Endpoint URL: " S3_ENDPOINT
            [[ -z "$S3_ENDPOINT" ]] && error "非 AWS 提供商必须填写 Endpoint"
+           read -rp "区域 [默认: us-east-1]: " S3_REGION
+           S3_REGION="${S3_REGION:-us-east-1}" ;;
+        *) S3_PROVIDER="aws"
            read -rp "区域 [默认: us-east-1]: " S3_REGION
            S3_REGION="${S3_REGION:-us-east-1}" ;;
     esac
     read -rp "存储桶名称: " S3_BUCKET
     [[ -z "$S3_BUCKET" ]] && error "桶名不能为空"
-    if [[ "${S3_CHOICE:-1}" == "1" ]]; then
-        read -rp "区域 [默认: us-east-1]: " S3_REGION
-        S3_REGION="${S3_REGION:-us-east-1}"
-    fi
     local S3_KEY="" S3_SECRET=""
     read_secret "S3 Access Key ID: " S3_KEY
     [[ -z "$S3_KEY" ]] && error "S3 Key 不能为空"
@@ -446,7 +475,6 @@ cmd_deploy() {
     info "生成配置文件..."
     mkdir -p "$DIR"/{data,uploads,logs}
 
-    # 不写入 WP_SITEURL_OVERRIDE，域名完全由网关动态传入
     cat > "$DIR/.env" <<EOF
 WORDPRESS_DB_PASSWORD=${DB_PW}
 WORDPRESS_DB_NAME=${DB_NAME}
@@ -463,6 +491,7 @@ S3_PROVIDER=${S3_PROVIDER}
 S3_ENDPOINT=${S3_ENDPOINT}
 S3_CDN_DOMAIN=${S3_CDN_DOMAIN}
 WG_IP=${WG_IP}
+WP_SITEURL_FALLBACK=${WP_URL}
 EOF
     chmod 600 "$DIR/.env"
 
@@ -476,12 +505,12 @@ EOF
     dc "$DIR" up -d || error "容器启动失败，请检查 Docker 环境。"
 
     _wait_and_setup_plugin "$DIR" "true" \
-        "$WP_URL" "$WP_TITLE" "$WP_ADMIN" "$WP_PASS" "$WP_EMAIL" \
+        "$WP_URL" "$WP_TITLE" "$WP_ADMIN" "$WP_PASS" "$WP_EMAIL" "$WP_LOCALE" \
         || warn "插件配置未完全成功，可通过菜单 6 重试。"
 
     log "节点部署完成！"
-    echo -e "  内网访问:   \e[33mhttp://${WG_IP}:${HOST_PORT}\e[0m"
-    echo -e "  初始站点:   \e[33m${WP_URL}\e[0m"
+    echo -e "  内网访问: \e[33mhttp://${WG_IP}:${HOST_PORT}\e[0m"
+    echo -e "  初始站点: \e[33m${WP_URL}\e[0m"
     echo -e "  \e[36m换域名只需改网关 X-Forwarded-Host，容器无需重启。\e[0m"
 }
 
@@ -547,6 +576,51 @@ cmd_update() {
     log "更新完成。"; dc "$DIR" ps
 }
 
+# ── 修复现有部署（补写 .env 缺失项）────────────────
+# 用于已部署节点的一次性修复，无需重新走完整部署流程
+cmd_fix_env() {
+    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"
+    [[ -f "$DIR/.env" ]] || error "未找到 .env 文件"
+
+    # 剥离 DB_HOST 中的端口
+    local CURRENT_DB_HOST
+    CURRENT_DB_HOST=$(grep '^DB_HOST=' "$DIR/.env" | cut -d= -f2-)
+    local CLEAN_DB_HOST="${CURRENT_DB_HOST%%:*}"
+    if [[ "$CURRENT_DB_HOST" != "$CLEAN_DB_HOST" ]]; then
+        sed -i "s|^DB_HOST=.*|DB_HOST=${CLEAN_DB_HOST}|" "$DIR/.env"
+        log "DB_HOST 已修正: ${CURRENT_DB_HOST} → ${CLEAN_DB_HOST}"
+    else
+        log "DB_HOST 无需修正: ${CURRENT_DB_HOST}"
+    fi
+
+    # 补写 WP_SITEURL_FALLBACK（Gutenberg 编辑器兜底 URL）
+    if ! grep -q '^WP_SITEURL_FALLBACK=' "$DIR/.env"; then
+        read -rp "请输入站点 URL（用于 Gutenberg 兜底，如 https://example.com）: " FALLBACK_URL
+        [[ -z "$FALLBACK_URL" ]] && error "URL 不能为空"
+        echo "WP_SITEURL_FALLBACK=${FALLBACK_URL}" >> "$DIR/.env"
+        log "已写入 WP_SITEURL_FALLBACK=${FALLBACK_URL}"
+    else
+        log "WP_SITEURL_FALLBACK 已存在，跳过。"
+    fi
+
+    # 同步更新 wp-config-extra.php（重新生成）
+    info "同步 wp-config-extra.php..."
+    _write_wp_config_extra "$DIR/uploads/wp-config-extra.php"
+    log "wp-config-extra.php 已更新。"
+
+    # 同步更新 s3-config.php（修复 delivery-provider）
+    info "同步 s3-config.php..."
+    _write_s3_config_php "$DIR/uploads/s3-config.php"
+    log "s3-config.php 已更新。"
+
+    read -rp "是否立即重启容器使修改生效？[y/N]: " RESTART
+    if [[ "${RESTART,,}" == "y" ]]; then
+        dc "$DIR" up -d --force-recreate && log "容器已重启。"
+    else
+        warn "请手动执行: docker compose -f $DIR/docker-compose.yml --env-file $DIR/.env up -d --force-recreate"
+    fi
+}
+
 # ════════════════════════════════════════════════════════
 # 主菜单
 # ════════════════════════════════════════════════════════
@@ -564,6 +638,7 @@ interactive_menu() {
         echo -e "  \e[33m6.\e[0m 重试插件配置"
         echo -e "  \e[31m7.\e[0m 删除节点"
         echo -e "  \e[36m8.\e[0m 更新镜像"
+        echo -e "  \e[33m9.\e[0m 修复现有部署 .env"
         echo -e "  \e[36m0.\e[0m 退出"
         echo "----------------------------------------"
         read -rp "选择: " CHOICE
@@ -572,6 +647,7 @@ interactive_menu() {
             3) cmd_logs ;;          4) cmd_stop ;;
             5) cmd_start ;;         6) cmd_retry_plugins ;;
             7) cmd_destroy ;;       8) cmd_update ;;
+            9) cmd_fix_env ;;
             0) info "再见！"; exit 0 ;;
             *) warn "无效输入" ;;
         esac
