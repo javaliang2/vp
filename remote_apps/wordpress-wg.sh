@@ -581,7 +581,7 @@ cmd_sync() {
     SRC_DIR="${SRC_DIR:-$DEFAULT_DIR}"
     [[ -f "$SRC_DIR/.env" ]] || error "未找到 .env：${SRC_DIR}"
 
-    [[ -f "$NODES_FILE" ]] || error "未找到节点列表：${NODES_FILE}（每行一个 WireGuard IP）"
+    [[ -f "$NODES_FILE" ]] || error "未找到节点列表：${NODES_FILE}"
 
     local CURRENT_IP
     CURRENT_IP=$(get_wg_ip)
@@ -589,42 +589,91 @@ cmd_sync() {
     read -rp "目标节点部署目录 [默认: ${DEFAULT_DIR}]: " DEST_DIR
     DEST_DIR="${DEST_DIR:-$DEFAULT_DIR}"
 
+    # ── 检查 SSH 免密登录 ──────────────────────────────
+    info "检查各节点 SSH 免密登录..."
+    local SSH_FAIL=false
+    while IFS= read -r NODE_IP; do
+        [[ -z "$NODE_IP" || "$NODE_IP" == "#"* ]] && continue
+        [[ "$NODE_IP" == "$CURRENT_IP" ]] && continue
+        if ! ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                 -o BatchMode=yes "root@${NODE_IP}" true 2>/dev/null; then
+            warn "节点 ${NODE_IP} SSH 免密未配置"
+            SSH_FAIL=true
+        fi
+    done < "$NODES_FILE"
+
+    if [[ "$SSH_FAIL" == "true" ]]; then
+        echo ""
+        echo "  1. 自动配置免密登录（需要输入各节点密码）"
+        echo "  2. 忽略，继续同步（会跳过无法连接的节点）"
+        echo "  0. 取消"
+        read -rp "选择: " SSH_CHOICE
+        case "${SSH_CHOICE:-0}" in
+            1)
+                # 确保本机有 SSH 密钥
+                if [[ ! -f ~/.ssh/id_rsa && ! -f ~/.ssh/id_ed25519 ]]; then
+                    info "生成 SSH 密钥..."
+                    ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
+                fi
+                while IFS= read -r NODE_IP; do
+                    [[ -z "$NODE_IP" || "$NODE_IP" == "#"* ]] && continue
+                    [[ "$NODE_IP" == "$CURRENT_IP" ]] && continue
+                    info "配置 ${NODE_IP} 免密登录..."
+                    ssh-copy-id -o StrictHostKeyChecking=no "root@${NODE_IP}" || \
+                        warn "${NODE_IP} 配置失败，请手动处理。"
+                done < "$NODES_FILE"
+                ;;
+            0) return ;;
+        esac
+    fi
+
     local SYNC_OK=0 SYNC_FAIL=0
     while IFS= read -r NODE_IP; do
         [[ -z "$NODE_IP" || "$NODE_IP" == "#"* ]] && continue
         [[ "$NODE_IP" == "$CURRENT_IP" ]] && continue
 
         info "→ 同步到 ${NODE_IP}..."
-
         local FAILED=false
 
         rsync -az --delete \
-            --exclude='cache/' \
             -e "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10" \
             "$SRC_DIR/data/wp-content/themes/" \
             "root@${NODE_IP}:${DEST_DIR}/data/wp-content/themes/" \
         || FAILED=true
 
         rsync -az --delete \
-            --exclude='cache/' \
             -e "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10" \
             "$SRC_DIR/data/wp-content/plugins/" \
             "root@${NODE_IP}:${DEST_DIR}/data/wp-content/plugins/" \
         || FAILED=true
 
         if [[ "$FAILED" == "true" ]]; then
-            warn "→ ${NODE_IP} 同步失败，请检查 SSH 连通性。"
+            warn "→ ${NODE_IP} 同步失败。"
             SYNC_FAIL=$((SYNC_FAIL + 1))
         else
-            log "→ ${NODE_IP} 同步完成。"
+            log "→ ${NODE_IP} 同步完成，刷新缓存..."
+            # ── 同步后刷缓存 ──────────────────────────
+            ssh -o StrictHostKeyChecking=no "root@${NODE_IP}" \
+                "docker compose -f ${DEST_DIR}/docker-compose.yml \
+                 --env-file ${DEST_DIR}/.env \
+                 exec -T wordpress wp --allow-root cache flush" 2>/dev/null \
+            && log "→ ${NODE_IP} 缓存已刷新。" \
+            || warn "→ ${NODE_IP} 缓存刷新失败，请手动执行。"
             SYNC_OK=$((SYNC_OK + 1))
         fi
     done < "$NODES_FILE"
 
     echo ""
     log "同步结束：成功 ${SYNC_OK} 个节点，失败 ${SYNC_FAIL} 个节点。"
+
+    # ── 同时刷新源节点自身缓存 ────────────────────────
+    info "刷新本节点缓存..."
+    dc "$SRC_DIR" exec -T wordpress wp --allow-root cache flush 2>/dev/null \
+        && log "本节点缓存已刷新。" \
+        || warn "本节点缓存刷新失败。"
+
     if (( SYNC_FAIL > 0 )); then
-        warn "失败节点请确认：1) SSH 免密登录已配置  2) 目标路径存在  3) WireGuard 已连通"
+        warn "失败节点请确认：1) SSH 免密已配置  2) 目标路径存在  3) WireGuard 已连通"
     fi
 }
 
