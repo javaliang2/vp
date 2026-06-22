@@ -364,7 +364,6 @@ _wait_and_setup_plugin() {
                 log "界面语言已设为 ${LOCALE}"
             fi
 
-            fi
         else
             log "数据库已有数据，跳过安装。"
         fi
