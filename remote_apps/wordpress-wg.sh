@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署（内网 WG + S3 + Redis 闭环版）
-# v2.1 修复：DB_HOST 端口剥离 / WP_HOME 兜底 / S3_PROVIDER / 语言选择
+# v2.2 修复：换用 Media Cloud 插件支持 R2 自定义 endpoint
 # ============================================================
 set -uo pipefail
 export LANG=en_US.UTF-8
@@ -138,43 +138,32 @@ max_input_vars      = 10000
 INI
 }
 
-# ── S3 配置 PHP ──────────────────────────────────────
-# 修复：delivery-provider 按 provider 类型正确设置
+# ── Media Cloud 配置 PHP ─────────────────────────────
+# 使用 Media Cloud (ilab-media-tools) 替代 AS3CF Lite
+# AS3CF Lite 免费版不支持自定义 endpoint，无法对接 R2
+# Media Cloud 免费版原生支持 S3 兼容存储 + 自定义 endpoint
 _write_s3_config_php() {
     local DEST="$1"
     cat > "$DEST" <<'PHP'
 <?php
-$_s3_provider   = getenv('S3_PROVIDER') ?: 'aws';
-$_s3_cdn_domain = getenv('S3_CDN_DOMAIN') ?: '';
-
-// delivery-provider 合法值：
-//   aws + CDN  → 'cloudfront'
-//   其他 + CDN → 'domain'
-//   无 CDN     → 'storage'
-if ($_s3_cdn_domain !== '') {
-    $_delivery = ($_s3_provider === 'aws') ? 'cloudfront' : 'domain';
-} else {
-    $_delivery = 'storage';
-}
-
-define('AS3CF_SETTINGS', serialize([
-    'provider'                 => $_s3_provider,
-    'access-key-id'            => getenv('AWS_ACCESS_KEY_ID'),
-    'secret-access-key'        => getenv('AWS_SECRET_ACCESS_KEY'),
-    'bucket'                   => getenv('S3_BUCKET'),
-    'region'                   => getenv('S3_REGION'),
-    'endpoint'                 => getenv('S3_ENDPOINT') ?: '',
-    'copy-to-s3'               => true,
-    'serve-from-s3'            => true,
-    'remove-local-file'        => false,
-    'enable-object-prefix'     => true,
-    'object-prefix'            => 'uploads/',
-    'delivery-provider'        => $_delivery,
-    'delivery-provider-domain' => $_s3_cdn_domain,
-    'force-https'              => true,
-    'use-presigned-urls'       => false,
-    'enable-cron'              => false,
-]));
+// ── Media Cloud / ilab-media-tools 常量配置 ──────────
+// 存储驱动：s3（兼容所有 S3 协议，含 R2/MinIO）
+define('ILAB_MEDIA_S3_ACCESS_KEY',      getenv('AWS_ACCESS_KEY_ID'));
+define('ILAB_MEDIA_S3_SECRET',          getenv('AWS_SECRET_ACCESS_KEY'));
+define('ILAB_MEDIA_S3_BUCKET',          getenv('S3_BUCKET'));
+define('ILAB_MEDIA_S3_REGION',          getenv('S3_REGION') ?: 'auto');
+define('ILAB_MEDIA_S3_ENDPOINT',        getenv('S3_ENDPOINT') ?: '');
+// path-style endpoint（R2 必须为 false，使用虚拟主机风格）
+define('ILAB_MEDIA_S3_USE_PATH_STYLE',  false);
+// CDN 域名（留空则直接用 bucket endpoint）
+define('ILAB_MEDIA_S3_CDN_BASE',        getenv('S3_CDN_DOMAIN') ?: '');
+// 上传后保留本地文件
+define('ILAB_MEDIA_S3_DELETE_UPLOADS',  false);
+// 自动上传
+define('ILAB_MEDIA_S3_UPLOAD_IMAGES',   true);
+define('ILAB_MEDIA_S3_UPLOAD_VIDEOS',   true);
+define('ILAB_MEDIA_S3_UPLOAD_AUDIO',    true);
+define('ILAB_MEDIA_S3_UPLOAD_DOCS',     true);
 PHP
 }
 
@@ -344,14 +333,20 @@ _wait_and_setup_plugin() {
     info "修复文件权限..."
     dc "$DIR" exec -T wordpress chown -R www-data:www-data /var/www/html/wp-content || true
 
-    # ── S3 插件 ──
-    info "配置 S3 插件..."
+    # ── Media Cloud 插件（替代 AS3CF Lite，支持 R2 自定义 endpoint）──
+    info "配置 Media Cloud 插件..."
+    # 停用并移除旧的 AS3CF（如果存在）
     if wp_cli "$DIR" plugin is-installed amazon-s3-and-cloudfront &>/dev/null; then
-        wp_cli "$DIR" plugin activate amazon-s3-and-cloudfront \
-            || warn "S3 插件激活失败。"
+        wp_cli "$DIR" plugin deactivate amazon-s3-and-cloudfront 2>/dev/null || true
+        wp_cli "$DIR" plugin delete amazon-s3-and-cloudfront 2>/dev/null || true
+        info "已移除旧版 AS3CF 插件。"
+    fi
+    if wp_cli "$DIR" plugin is-installed ilab-media-tools &>/dev/null; then
+        wp_cli "$DIR" plugin activate ilab-media-tools \
+            || warn "Media Cloud 插件激活失败。"
     else
-        wp_cli "$DIR" plugin install amazon-s3-and-cloudfront --activate \
-            || warn "S3 插件安装失败。"
+        wp_cli "$DIR" plugin install ilab-media-tools --activate \
+            || warn "Media Cloud 插件安装失败。"
     fi
 
     # ── Redis 插件 ──
