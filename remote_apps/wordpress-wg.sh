@@ -258,9 +258,7 @@ services:
     image: wordpress-redis:php8.3-fpm-alpine
     restart: unless-stopped
     network_mode: host
-    entrypoint: >
-      sh -c "chown -R www-data:www-data /var/www/html/wp-content
-             && exec docker-entrypoint.sh php-fpm"
+    entrypoint: ["sh", "-c", "mkdir -p /var/www/html/wp-content && chown -R www-data:www-data /var/www/html/wp-content && exec docker-entrypoint.sh php-fpm"]
     environment:
       WORDPRESS_DB_HOST:      ${DB_HOST}:3306
       WORDPRESS_DB_NAME:      ${WORDPRESS_DB_NAME}
