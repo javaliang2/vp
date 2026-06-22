@@ -42,9 +42,9 @@ _install_wpcli() {
         DEST="/usr/local/bin/wp"
         URL="https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar"
         if command -v wget >/dev/null 2>&1; then
-            wget --no-check-certificate -O "$DEST" "$URL"
+            wget -4 --no-check-certificate -O "$DEST" "$URL"
         elif command -v curl >/dev/null 2>&1; then
-            curl -fsSL "$URL" -o "$DEST"
+            curl -4 -fsSL "$URL" -o "$DEST"
         else
             echo "ERROR: 容器内既无 wget 也无 curl" >&2; exit 1
         fi
