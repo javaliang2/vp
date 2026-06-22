@@ -41,10 +41,10 @@ _install_wpcli() {
         set -e
         DEST="/usr/local/bin/wp"
         URL="https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar"
-        if command -v wget >/dev/null 2>&1; then
-            wget -4 --no-check-certificate -O "$DEST" "$URL"
-        elif command -v curl >/dev/null 2>&1; then
+        if command -v curl >/dev/null 2>&1; then
             curl -4 -fsSL "$URL" -o "$DEST"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -T 15 --no-check-certificate -O "$DEST" "$URL"
         else
             echo "ERROR: 容器内既无 wget 也无 curl" >&2; exit 1
         fi
@@ -235,8 +235,10 @@ _write_dockerfile() {
     cat > "$DEST" <<'DOCKERFILE'
 FROM wordpress:php8.3-fpm-alpine
 
+# 安装 curl（BusyBox wget 不支持 -4 强制 IPv4，curl 支持）
 # 编译 Redis 扩展需要的构建工具，安装完即删除以控制镜像体积
-RUN apk add --no-cache --virtual .build-deps $PHPIZE_DEPS \
+RUN apk add --no-cache curl \
+    && apk add --no-cache --virtual .build-deps $PHPIZE_DEPS \
     && pecl install redis \
     && docker-php-ext-enable redis \
     && apk del .build-deps \
