@@ -348,12 +348,22 @@ _wait_and_setup_plugin() {
 
             if [[ "$LOCALE" != "en_US" && -n "$LOCALE" ]]; then
                 info "安装并激活语言包: ${LOCALE}..."
-                wp_cli "$DIR" language core install "$LOCALE" --activate 2>/dev/null || true
-                if ! wp_cli "$DIR" option update WPLANG "$LOCALE"; then
-                    warn "语言设置失败，可在后台手动切换。"
-                else
-                    log "界面语言已设为 ${LOCALE}"
-                fi
+                wp_cli "$DIR" language core install "$LOCALE" 2>/dev/null || true
+
+                # 同时更新 WPLANG 和 user_locale（管理员后台语言）
+                wp_cli "$DIR" option update WPLANG "$LOCALE" || true
+
+                local ADMIN_ID
+                ADMIN_ID=$(wp_cli "$DIR" user get "$ADMIN" --field=ID 2>/dev/null || echo "1")
+                wp_cli "$DIR" user meta update "$ADMIN_ID" locale "$LOCALE" 2>/dev/null || true
+
+                # 刷新缓存，否则 Redis 会缓存旧的 en_US
+                wp_cli "$DIR" cache flush 2>/dev/null || true
+                wp_cli "$DIR" rewrite flush 2>/dev/null || true
+
+                log "界面语言已设为 ${LOCALE}"
+            fi
+
             fi
         else
             log "数据库已有数据，跳过安装。"
