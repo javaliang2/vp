@@ -329,7 +329,7 @@ _wait_and_setup_plugin() {
                 wp_cli "$DIR" option update WPLANG "$LOCALE" \
                     && log "界面语言已设为 ${LOCALE}" \
                     || warn "语言设置失败，可在后台手动切换。"
-            fi
+            fi
         else
             log "数据库已有数据，跳过安装。"
         fi
