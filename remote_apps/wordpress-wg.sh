@@ -322,6 +322,14 @@ _wait_and_setup_plugin() {
             || { warn "安装失败，请查看日志。"; return 1; }
             echo -e "  站点: \e[32m${URL}\e[0m"
             echo -e "  账号: \e[32m${ADMIN}\e[0m / 密码: \e[32m${PASS}\e[0m"
+            # 安装激活语言包
+            if [[ "$LOCALE" != "en_US" && -n "$LOCALE" ]]; then
+                info "安装并激活语言包: ${LOCALE}..."
+                wp_cli "$DIR" language core install "$LOCALE" --activate 2>/dev/null || true
+                wp_cli "$DIR" option update WPLANG "$LOCALE" \
+                    && log "界面语言已设为 ${LOCALE}" \
+                    || warn "语言设置失败，可在后台手动切换。"
+            fi
         else
             log "数据库已有数据，跳过安装。"
         fi
