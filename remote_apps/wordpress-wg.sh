@@ -293,91 +293,115 @@ YAML
 _wait_and_setup_plugin() {
     local DIR="$1"
     local IS_AUTO_INSTALL="${2:-false}"
-    local URL="${3:-}" TITLE="${4:-}" ADMIN="${5:-}" PASS="${6:-}" \
-          EMAIL="${7:-}" LOCALE="${8:-zh_CN}"
+    local URL="${3:-}"
+    local TITLE="${4:-}"
+    local ADMIN="${5:-}"
+    local PASS="${6:-}"
+    local EMAIL="${7:-}"
+    local LOCALE="${8:-zh_CN}"
     local WP_CONFIG="/var/www/html/wp-config.php"
 
+    # ── 等待 wp-config.php ──
     info "等待 wp-config.php 生成..."
     local RETRIES=45
     while ! dc "$DIR" exec -T wordpress grep -q "ABSPATH" "$WP_CONFIG" 2>/dev/null; do
         sleep 2
         RETRIES=$((RETRIES - 1))
-        [[ $RETRIES -le 0 ]] && { warn "wp-config.php 超时，请检查容器日志。"; return 1; }
+        if [[ $RETRIES -le 0 ]]; then
+            warn "wp-config.php 超时，请检查容器日志。"
+            return 1
+        fi
     done
 
+    # ── 验证 WP-CLI ──
     info "验证 WP-CLI..."
     if ! dc "$DIR" exec -T wordpress test -f /usr/local/bin/wp 2>/dev/null; then
-        _install_wpcli "$DIR" || { warn "WP-CLI 安装失败。"; return 1; }
+        if ! _install_wpcli "$DIR"; then
+            warn "WP-CLI 安装失败。"
+            return 1
+        fi
     fi
 
     # ── 核心安装 ──
     if [[ "$IS_AUTO_INSTALL" == "true" ]]; then
         if ! wp_cli "$DIR" core is-installed &>/dev/null; then
             info "空数据库，安装 WordPress 核心..."
-            wp_cli "$DIR" core install \
+            if ! wp_cli "$DIR" core install \
                 --url="$URL" --title="$TITLE" \
                 --admin_user="$ADMIN" --admin_password="$PASS" \
-                --admin_email="$EMAIL" --locale="$LOCALE" --skip-email \
-            && log "WordPress 安装成功！" \
-            || { warn "安装失败，请查看日志。"; return 1; }
+                --admin_email="$EMAIL" --locale="$LOCALE" --skip-email; then
+                warn "安装失败，请查看日志。"
+                return 1
+            fi
+            log "WordPress 安装成功！"
             echo -e "  站点: \e[32m${URL}\e[0m"
             echo -e "  账号: \e[32m${ADMIN}\e[0m / 密码: \e[32m${PASS}\e[0m"
+
             # 安装激活语言包
             if [[ "$LOCALE" != "en_US" && -n "$LOCALE" ]]; then
-                info "安装并激活语言包: ${LOCALE}..."
-                wp_cli "$DIR" language core install "$LOCALE" --activate 2>/dev/null || true
-                wp_cli "$DIR" option update WPLANG "$LOCALE" \
-                    && log "界面语言已设为 ${LOCALE}" \
-                    || warn "语言设置失败，可在后台手动切换。"
+                info "安装并激活语言包: ${LOCALE}..."
+                wp_cli "$DIR" language core install "$LOCALE" --activate 2>/dev/null || true
+                if ! wp_cli "$DIR" option update WPLANG "$LOCALE"; then
+                    warn "语言设置失败，可在后台手动切换。"
+                else
+                    log "界面语言已设为 ${LOCALE}"
+                fi
             fi
         else
             log "数据库已有数据，跳过安装。"
         fi
     else
-        wp_cli "$DIR" core is-installed &>/dev/null \
-            || { warn "WordPress 未初始化，请通过菜单 1 重新部署。"; return 1; }
+        if ! wp_cli "$DIR" core is-installed &>/dev/null; then
+            warn "WordPress 未初始化，请通过菜单 1 重新部署。"
+            return 1
+        fi
     fi
 
+    # ── 修复文件权限 ──
     info "修复文件权限..."
     dc "$DIR" exec -T wordpress chown -R www-data:www-data /var/www/html/wp-content || true
 
     # ── Media Cloud 插件（替代 AS3CF Lite，支持 R2 自定义 endpoint）──
     info "配置 Media Cloud 插件..."
-    # 停用并移除旧的 AS3CF（如果存在）
     if wp_cli "$DIR" plugin is-installed amazon-s3-and-cloudfront &>/dev/null; then
         wp_cli "$DIR" plugin deactivate amazon-s3-and-cloudfront 2>/dev/null || true
         wp_cli "$DIR" plugin delete amazon-s3-and-cloudfront 2>/dev/null || true
         info "已移除旧版 AS3CF 插件。"
     fi
     if wp_cli "$DIR" plugin is-installed ilab-media-tools &>/dev/null; then
-        wp_cli "$DIR" plugin activate ilab-media-tools \
-            || warn "Media Cloud 插件激活失败。"
+        if ! wp_cli "$DIR" plugin activate ilab-media-tools; then
+            warn "Media Cloud 插件激活失败。"
+        fi
     else
-        wp_cli "$DIR" plugin install ilab-media-tools --activate \
-            || warn "Media Cloud 插件安装失败。"
+        if ! wp_cli "$DIR" plugin install ilab-media-tools --activate; then
+            warn "Media Cloud 插件安装失败。"
+        fi
     fi
 
     # ── Redis 插件 ──
     info "配置 Redis 插件..."
     if wp_cli "$DIR" plugin is-installed redis-cache &>/dev/null; then
-        wp_cli "$DIR" plugin activate redis-cache \
-            || warn "Redis 插件激活失败。"
+        if ! wp_cli "$DIR" plugin activate redis-cache; then
+            warn "Redis 插件激活失败。"
+        fi
     else
-        wp_cli "$DIR" plugin install redis-cache --activate \
-            || warn "Redis 插件安装失败。"
+        if ! wp_cli "$DIR" plugin install redis-cache --activate; then
+            warn "Redis 插件安装失败。"
+        fi
     fi
 
     # ── 探测连通性后启用对象缓存 ──
-    # 修复：alpine 无 nc，改用 PHP fsockopen 探测
+    # alpine 无 nc，改用 PHP fsockopen 探测
     info "探测 Redis 连通性..."
     local REDIS_HOST_VAL
     REDIS_HOST_VAL=$(grep '^REDIS_HOST=' "$DIR/.env" | cut -d= -f2-)
-    if dc "$DIR" exec -T wordpress php -r \
-        "\$c=@fsockopen('${REDIS_HOST_VAL}',6379,\$e,\$s,5);if(\$c){fclose(\$c);exit(0);}exit(1);" \
-        2>/dev/null; then
-        wp_cli "$DIR" redis enable \
-            && log "Redis 对象缓存已启用！" \
-            || warn "redis enable 失败，请检查密码或插件状态。"
+    local PROBE_CODE="\$c=@fsockopen('${REDIS_HOST_VAL}',6379,\$e,\$s,5);if(\$c){fclose(\$c);exit(0);}exit(1);"
+    if dc "$DIR" exec -T wordpress php -r "$PROBE_CODE" 2>/dev/null; then
+        if ! wp_cli "$DIR" redis enable; then
+            warn "redis enable 失败，请检查密码或插件状态。"
+        else
+            log "Redis 对象缓存已启用！"
+        fi
     else
         warn "无法连接 Redis (${REDIS_HOST_VAL}:6379)，跳过启用。"
     fi
