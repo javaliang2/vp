@@ -227,6 +227,23 @@ if (file_exists('/etc/wordpress/s3-config.php')) {
 PHP
 }
 
+# ── Dockerfile ──────────────────────────────────────
+# 基于官方 WordPress 镜像追加 Redis PHP 扩展，
+# 使 session.save_handler=redis 生效，同时保留对象缓存插件能力
+_write_dockerfile() {
+    local DEST="$1"
+    cat > "$DEST" <<'DOCKERFILE'
+FROM wordpress:php8.3-fpm-alpine
+
+# 编译 Redis 扩展需要的构建工具，安装完即删除以控制镜像体积
+RUN apk add --no-cache --virtual .build-deps $PHPIZE_DEPS \
+    && pecl install redis \
+    && docker-php-ext-enable redis \
+    && apk del .build-deps \
+    && rm -rf /tmp/pear
+DOCKERFILE
+}
+
 # ── docker-compose.yml ───────────────────────────────
 # entrypoint 每次容器启动时自动执行 chown，
 # 修复宿主机卷挂载后 www-data 无写权限导致主题/插件上传失败的问题
@@ -235,7 +252,10 @@ _write_docker_compose() {
     cat > "$DIR/docker-compose.yml" <<'YAML'
 services:
   wordpress:
-    image: wordpress:php8.3-fpm-alpine
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wordpress-redis:php8.3-fpm-alpine
     restart: unless-stopped
     network_mode: host
     entrypoint: >
@@ -507,6 +527,7 @@ WP_SITEURL_FALLBACK=${WP_URL}
 EOF
     chmod 600 "$DIR/.env"
 
+    _write_dockerfile      "$DIR/Dockerfile"
     _write_nginx_wp_conf   "$DIR/uploads/nginx-wp.conf" "$WG_IP"
     _write_php_uploads_ini "$DIR/uploads/php-uploads.ini"
     _write_s3_config_php   "$DIR/uploads/s3-config.php"
@@ -682,16 +703,22 @@ cmd_update() {
     read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     header "滚动更新"
-    echo "  1. WordPress  2. Nginx  3. 全部"
+    echo "  1. WordPress（拉取基础镜像并重建）"
+    echo "  2. Nginx"
+    echo "  3. 全部"
     read -rp "选择: " UP_CHOICE
     local SVC=""
     case "$UP_CHOICE" in
         1) SVC="wordpress" ;; 2) SVC="nginx" ;; 3) SVC="" ;; *) error "无效选择" ;;
     esac
-    if [[ -n "$SVC" ]]; then
+    if [[ "$SVC" == "wordpress" || -z "$SVC" ]]; then
+        info "重建 WordPress 镜像（含 Redis 扩展）..."
+        dc "$DIR" build --pull --no-cache wordpress
+    fi
+    if [[ -n "$SVC" && "$SVC" != "wordpress" ]]; then
         dc "$DIR" pull "$SVC" && dc "$DIR" up -d --force-recreate "$SVC"
     else
-        dc "$DIR" pull && dc "$DIR" up -d --force-recreate
+        dc "$DIR" up -d --force-recreate
     fi
     log "更新完成。"; dc "$DIR" ps
 }
@@ -727,12 +754,32 @@ cmd_fix_env() {
     _write_s3_config_php "$DIR/uploads/s3-config.php"
     log "s3-config.php 已更新。"
 
-    read -rp "是否立即重启容器使修改生效？[y/N]: " RESTART
-    if [[ "${RESTART,,}" == "y" ]]; then
-        dc "$DIR" up -d --force-recreate && log "容器已重启。"
-    else
-        warn "请手动执行: docker compose -f $DIR/docker-compose.yml --env-file $DIR/.env up -d --force-recreate"
+    # 同步 Dockerfile（如旧部署缺失）
+    if [[ ! -f "$DIR/Dockerfile" ]]; then
+        info "生成 Dockerfile（含 Redis 扩展）..."
+        _write_dockerfile "$DIR/Dockerfile"
+        log "Dockerfile 已生成。"
     fi
+
+    echo ""
+    echo "  1. 仅重启容器（不重建镜像）"
+    echo "  2. 重建镜像后重启（首次加 Redis 扩展时选此项）"
+    echo "  0. 暂不操作"
+    read -rp "选择 [默认: 0]: " RESTART_CHOICE
+    case "${RESTART_CHOICE:-0}" in
+        1)
+            dc "$DIR" up -d --force-recreate && log "容器已重启。"
+            ;;
+        2)
+            info "重建镜像中（首次需编译 Redis 扩展，约 1-2 分钟）..."
+            dc "$DIR" build --no-cache wordpress \
+                && dc "$DIR" up -d --force-recreate \
+                && log "镜像重建完成，容器已重启。"
+            ;;
+        *)
+            warn "请手动执行: docker compose -f $DIR/docker-compose.yml --env-file $DIR/.env up -d --force-recreate"
+            ;;
+    esac
 }
 
 # ════════════════════════════════════════════════════════
