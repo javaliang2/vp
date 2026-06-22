@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署（内网 WG + S3 + Redis 闭环版）
-# v2.2 修复：换用 Media Cloud 插件支持 R2 自定义 endpoint
+# v2.3 新增：权限自动修复（entrypoint chown）+ rsync 多节点同步
 # ============================================================
 set -uo pipefail
 export LANG=en_US.UTF-8
@@ -10,6 +10,7 @@ export LC_ALL=en_US.UTF-8
 BASE_DIR="${BASE_DIR:-/srv}"
 DEFAULT_DIR="${BASE_DIR}/wordpress"
 WG_IFACE="${WG_IFACE:-wg0}"
+NODES_FILE="${BASE_DIR}/nodes.conf"
 
 _c()     { printf "\e[%sm%s\e[0m\n" "$1" "$2"; }
 log()    { _c "32"   "[成功] $*"; }
@@ -139,27 +140,19 @@ INI
 }
 
 # ── Media Cloud 配置 PHP ─────────────────────────────
-# 使用 Media Cloud (ilab-media-tools) 替代 AS3CF Lite
-# AS3CF Lite 免费版不支持自定义 endpoint，无法对接 R2
-# Media Cloud 免费版原生支持 S3 兼容存储 + 自定义 endpoint
 _write_s3_config_php() {
     local DEST="$1"
     cat > "$DEST" <<'PHP'
 <?php
 // ── Media Cloud / ilab-media-tools 常量配置 ──────────
-// 存储驱动：s3（兼容所有 S3 协议，含 R2/MinIO）
 define('ILAB_MEDIA_S3_ACCESS_KEY',      getenv('AWS_ACCESS_KEY_ID'));
 define('ILAB_MEDIA_S3_SECRET',          getenv('AWS_SECRET_ACCESS_KEY'));
 define('ILAB_MEDIA_S3_BUCKET',          getenv('S3_BUCKET'));
 define('ILAB_MEDIA_S3_REGION',          getenv('S3_REGION') ?: 'auto');
 define('ILAB_MEDIA_S3_ENDPOINT',        getenv('S3_ENDPOINT') ?: '');
-// path-style endpoint（R2 必须为 false，使用虚拟主机风格）
 define('ILAB_MEDIA_S3_USE_PATH_STYLE',  false);
-// CDN 域名（留空则直接用 bucket endpoint）
 define('ILAB_MEDIA_S3_CDN_BASE',        getenv('S3_CDN_DOMAIN') ?: '');
-// 上传后保留本地文件
 define('ILAB_MEDIA_S3_DELETE_UPLOADS',  false);
-// 自动上传
 define('ILAB_MEDIA_S3_UPLOAD_IMAGES',   true);
 define('ILAB_MEDIA_S3_UPLOAD_VIDEOS',   true);
 define('ILAB_MEDIA_S3_UPLOAD_AUDIO',    true);
@@ -168,10 +161,6 @@ PHP
 }
 
 # ── WordPress 额外配置 PHP ───────────────────────────
-# 修复：
-#   1. 仅 WireGuard 内网段请求信任 X-Forwarded-Host
-#   2. 本地回环（REST API/wp-cron）用 WP_SITEURL_FALLBACK 兜底，
-#      防止 Gutenberg 编辑器因 WP_HOME 未定义报"意外错误"
 _write_wp_config_extra() {
     local DEST="$1"
     cat > "$DEST" <<'PHP'
@@ -189,12 +178,10 @@ if (php_sapi_name() !== 'cli') {
     $remote = $_SERVER['REMOTE_ADDR'] ?? '';
 
     if (_wp_is_trusted_proxy($remote)) {
-        // 修正 HTTPS 标志
         if (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https') {
             $_SERVER['HTTPS'] = 'on';
         }
 
-        // 用网关传来的真实 Host 动态构造站点 URL
         $fwd_host = trim(explode(',', $_SERVER['HTTP_X_FORWARDED_HOST'] ?? '')[0]);
 
         if ($fwd_host !== '') {
@@ -207,9 +194,6 @@ if (php_sapi_name() !== 'cli') {
         }
     }
 
-    // ── 兜底：本地回环请求（REST API / wp-cron 等）────
-    // REMOTE_ADDR 为 127.0.0.1 时无网关转发头，用环境变量保证
-    // WP_HOME 始终有值，防止 Gutenberg 编辑器报"意外错误"
     if (!defined('WP_HOME')) {
         $fallback = getenv('WP_SITEURL_FALLBACK') ?: '';
         if ($fallback !== '') {
@@ -244,6 +228,8 @@ PHP
 }
 
 # ── docker-compose.yml ───────────────────────────────
+# entrypoint 每次容器启动时自动执行 chown，
+# 修复宿主机卷挂载后 www-data 无写权限导致主题/插件上传失败的问题
 _write_docker_compose() {
     local DIR="$1"
     cat > "$DIR/docker-compose.yml" <<'YAML'
@@ -252,6 +238,9 @@ services:
     image: wordpress:php8.3-fpm-alpine
     restart: unless-stopped
     network_mode: host
+    entrypoint: >
+      sh -c "chown -R www-data:www-data /var/www/html/wp-content
+             && exec docker-entrypoint.sh php-fpm"
     environment:
       WORDPRESS_DB_HOST:      ${DB_HOST}:3306
       WORDPRESS_DB_NAME:      ${WORDPRESS_DB_NAME}
@@ -337,7 +326,6 @@ _wait_and_setup_plugin() {
             echo -e "  站点: \e[32m${URL}\e[0m"
             echo -e "  账号: \e[32m${ADMIN}\e[0m / 密码: \e[32m${PASS}\e[0m"
 
-            # 安装激活语言包
             if [[ "$LOCALE" != "en_US" && -n "$LOCALE" ]]; then
                 info "安装并激活语言包: ${LOCALE}..."
                 wp_cli "$DIR" language core install "$LOCALE" --activate 2>/dev/null || true
@@ -361,7 +349,7 @@ _wait_and_setup_plugin() {
     info "修复文件权限..."
     dc "$DIR" exec -T wordpress chown -R www-data:www-data /var/www/html/wp-content || true
 
-    # ── Media Cloud 插件（替代 AS3CF Lite，支持 R2 自定义 endpoint）──
+    # ── Media Cloud 插件 ──
     info "配置 Media Cloud 插件..."
     if wp_cli "$DIR" plugin is-installed amazon-s3-and-cloudfront &>/dev/null; then
         wp_cli "$DIR" plugin deactivate amazon-s3-and-cloudfront 2>/dev/null || true
@@ -391,7 +379,6 @@ _wait_and_setup_plugin() {
     fi
 
     # ── 探测连通性后启用对象缓存 ──
-    # alpine 无 nc，改用 PHP fsockopen 探测
     info "探测 Redis 连通性..."
     local REDIS_HOST_VAL
     REDIS_HOST_VAL=$(grep '^REDIS_HOST=' "$DIR/.env" | cut -d= -f2-)
@@ -444,7 +431,6 @@ cmd_deploy() {
     info "--- 数据库 ---"
     read -rp "MariaDB WireGuard IP（不含端口，如 10.10.0.2）: " DB_HOST
     [[ -z "$DB_HOST" ]] && error "数据库 IP 不能为空"
-    # 修复：剥离用户可能误输入的 :3306
     DB_HOST="${DB_HOST%%:*}"
 
     read -rp "数据库名 [默认: wordpress]: " DB_NAME
@@ -468,7 +454,6 @@ cmd_deploy() {
     echo "  2. Cloudflare R2"
     echo "  3. 其他 S3 兼容（MinIO 等）"
     read -rp "选择 [默认: 1]: " S3_CHOICE
-    # 修复：各分支明确赋值 S3_PROVIDER，否则 R2/MinIO delivery-provider 会传错
     local S3_PROVIDER="aws" S3_ENDPOINT="" S3_REGION=""
     case "${S3_CHOICE:-1}" in
         2) S3_PROVIDER="cloudflare"
@@ -528,6 +513,9 @@ EOF
     _write_wp_config_extra "$DIR/uploads/wp-config-extra.php"
     _write_docker_compose  "$DIR"
 
+    # 部署时自动注册当前节点
+    _register_node "$WG_IP"
+
     info "启动容器..."
     dc "$DIR" up -d || error "容器启动失败，请检查 Docker 环境。"
 
@@ -539,6 +527,111 @@ EOF
     echo -e "  内网访问: \e[33mhttp://${WG_IP}:${HOST_PORT}\e[0m"
     echo -e "  初始站点: \e[33m${WP_URL}\e[0m"
     echo -e "  \e[36m换域名只需改网关 X-Forwarded-Host，容器无需重启。\e[0m"
+    echo -e "  \e[36m上传主题/插件后可通过菜单 10 同步到其他节点。\e[0m"
+}
+
+# ── 注册节点 IP 到 nodes.conf ────────────────────────
+_register_node() {
+    local IP="$1"
+    touch "$NODES_FILE"
+    if ! grep -qxF "$IP" "$NODES_FILE"; then
+        echo "$IP" >> "$NODES_FILE"
+        log "节点 ${IP} 已注册到 ${NODES_FILE}"
+    fi
+}
+
+# ── 同步主题和插件到所有节点 ────────────────────────
+# 仅同步 themes/ 和 plugins/：
+#   - uploads/ 媒体文件走 R2，无需同步
+#   - cache/   各节点独立缓存，不应互相覆盖
+cmd_sync() {
+    header "同步主题 / 插件到所有节点"
+
+    read -rp "源节点目录 [默认: ${DEFAULT_DIR}]: " SRC_DIR
+    SRC_DIR="${SRC_DIR:-$DEFAULT_DIR}"
+    [[ -f "$SRC_DIR/.env" ]] || error "未找到 .env：${SRC_DIR}"
+
+    [[ -f "$NODES_FILE" ]] || error "未找到节点列表：${NODES_FILE}（每行一个 WireGuard IP）"
+
+    local CURRENT_IP
+    CURRENT_IP=$(get_wg_ip)
+
+    read -rp "目标节点部署目录 [默认: ${DEFAULT_DIR}]: " DEST_DIR
+    DEST_DIR="${DEST_DIR:-$DEFAULT_DIR}"
+
+    local SYNC_OK=0 SYNC_FAIL=0
+    while IFS= read -r NODE_IP; do
+        [[ -z "$NODE_IP" || "$NODE_IP" == "#"* ]] && continue
+        [[ "$NODE_IP" == "$CURRENT_IP" ]] && continue
+
+        info "→ 同步到 ${NODE_IP}..."
+
+        local FAILED=false
+
+        rsync -az --delete \
+            --exclude='cache/' \
+            -e "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10" \
+            "$SRC_DIR/data/wp-content/themes/" \
+            "root@${NODE_IP}:${DEST_DIR}/data/wp-content/themes/" \
+        || FAILED=true
+
+        rsync -az --delete \
+            --exclude='cache/' \
+            -e "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10" \
+            "$SRC_DIR/data/wp-content/plugins/" \
+            "root@${NODE_IP}:${DEST_DIR}/data/wp-content/plugins/" \
+        || FAILED=true
+
+        if [[ "$FAILED" == "true" ]]; then
+            warn "→ ${NODE_IP} 同步失败，请检查 SSH 连通性。"
+            SYNC_FAIL=$((SYNC_FAIL + 1))
+        else
+            log "→ ${NODE_IP} 同步完成。"
+            SYNC_OK=$((SYNC_OK + 1))
+        fi
+    done < "$NODES_FILE"
+
+    echo ""
+    log "同步结束：成功 ${SYNC_OK} 个节点，失败 ${SYNC_FAIL} 个节点。"
+    if (( SYNC_FAIL > 0 )); then
+        warn "失败节点请确认：1) SSH 免密登录已配置  2) 目标路径存在  3) WireGuard 已连通"
+    fi
+}
+
+# ── 节点列表管理 ─────────────────────────────────────
+cmd_nodes() {
+    header "节点列表管理"
+    echo "  1. 列出所有节点"
+    echo "  2. 添加节点"
+    echo "  3. 删除节点"
+    read -rp "选择: " NODE_CHOICE
+    case "$NODE_CHOICE" in
+        1)
+            if [[ ! -f "$NODES_FILE" ]] || [[ ! -s "$NODES_FILE" ]]; then
+                warn "节点列表为空：${NODES_FILE}"
+            else
+                echo ""
+                nl -ba "$NODES_FILE"
+            fi
+            ;;
+        2)
+            read -rp "节点 WireGuard IP: " NEW_IP
+            [[ -z "$NEW_IP" ]] && error "IP 不能为空"
+            _register_node "$NEW_IP"
+            ;;
+        3)
+            if [[ ! -f "$NODES_FILE" ]]; then
+                warn "节点列表不存在。"
+                return
+            fi
+            nl -ba "$NODES_FILE"
+            read -rp "输入要删除的行号: " LINE_NUM
+            [[ "$LINE_NUM" =~ ^[0-9]+$ ]] || error "无效行号"
+            sed -i "${LINE_NUM}d" "$NODES_FILE"
+            log "已删除第 ${LINE_NUM} 行。"
+            ;;
+        *) warn "无效输入" ;;
+    esac
 }
 
 cmd_status() {
@@ -603,13 +696,10 @@ cmd_update() {
     log "更新完成。"; dc "$DIR" ps
 }
 
-# ── 修复现有部署（补写 .env 缺失项）────────────────
-# 用于已部署节点的一次性修复，无需重新走完整部署流程
 cmd_fix_env() {
     read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"
     [[ -f "$DIR/.env" ]] || error "未找到 .env 文件"
 
-    # 剥离 DB_HOST 中的端口
     local CURRENT_DB_HOST
     CURRENT_DB_HOST=$(grep '^DB_HOST=' "$DIR/.env" | cut -d= -f2-)
     local CLEAN_DB_HOST="${CURRENT_DB_HOST%%:*}"
@@ -620,7 +710,6 @@ cmd_fix_env() {
         log "DB_HOST 无需修正: ${CURRENT_DB_HOST}"
     fi
 
-    # 补写 WP_SITEURL_FALLBACK（Gutenberg 编辑器兜底 URL）
     if ! grep -q '^WP_SITEURL_FALLBACK=' "$DIR/.env"; then
         read -rp "请输入站点 URL（用于 Gutenberg 兜底，如 https://example.com）: " FALLBACK_URL
         [[ -z "$FALLBACK_URL" ]] && error "URL 不能为空"
@@ -630,12 +719,10 @@ cmd_fix_env() {
         log "WP_SITEURL_FALLBACK 已存在，跳过。"
     fi
 
-    # 同步更新 wp-config-extra.php（重新生成）
     info "同步 wp-config-extra.php..."
     _write_wp_config_extra "$DIR/uploads/wp-config-extra.php"
     log "wp-config-extra.php 已更新。"
 
-    # 同步更新 s3-config.php（修复 delivery-provider）
     info "同步 s3-config.php..."
     _write_s3_config_php "$DIR/uploads/s3-config.php"
     log "s3-config.php 已更新。"
@@ -657,26 +744,34 @@ interactive_menu() {
         _c "1;35" "========================================"
         _c "1;35" "    WordPress 多节点分发管理 (host 网络)"
         _c "1;35" "========================================"
-        echo -e "  \e[32m1.\e[0m 部署新节点 (全自动建站)"
-        echo -e "  \e[32m2.\e[0m 查看状态"
-        echo -e "  \e[32m3.\e[0m 查看日志"
-        echo -e "  \e[31m4.\e[0m 停止节点"
-        echo -e "  \e[32m5.\e[0m 启动节点"
-        echo -e "  \e[33m6.\e[0m 重试插件配置"
-        echo -e "  \e[31m7.\e[0m 删除节点"
-        echo -e "  \e[36m8.\e[0m 更新镜像"
-        echo -e "  \e[33m9.\e[0m 修复现有部署 .env"
-        echo -e "  \e[36m0.\e[0m 退出"
+        echo -e "  \e[32m 1.\e[0m 部署新节点 (全自动建站)"
+        echo -e "  \e[32m 2.\e[0m 查看状态"
+        echo -e "  \e[32m 3.\e[0m 查看日志"
+        echo -e "  \e[31m 4.\e[0m 停止节点"
+        echo -e "  \e[32m 5.\e[0m 启动节点"
+        echo -e "  \e[33m 6.\e[0m 重试插件配置"
+        echo -e "  \e[31m 7.\e[0m 删除节点"
+        echo -e "  \e[36m 8.\e[0m 更新镜像"
+        echo -e "  \e[33m 9.\e[0m 修复现有部署 .env"
+        echo -e "  \e[36m10.\e[0m 同步主题 / 插件到所有节点"
+        echo -e "  \e[36m11.\e[0m 节点列表管理"
+        echo -e "  \e[36m 0.\e[0m 退出"
         echo "----------------------------------------"
         read -rp "选择: " CHOICE
         case "$CHOICE" in
-            1) cmd_deploy ;;        2) cmd_status ;;
-            3) cmd_logs ;;          4) cmd_stop ;;
-            5) cmd_start ;;         6) cmd_retry_plugins ;;
-            7) cmd_destroy ;;       8) cmd_update ;;
-            9) cmd_fix_env ;;
-            0) info "再见！"; exit 0 ;;
-            *) warn "无效输入" ;;
+            1)  cmd_deploy ;;
+            2)  cmd_status ;;
+            3)  cmd_logs ;;
+            4)  cmd_stop ;;
+            5)  cmd_start ;;
+            6)  cmd_retry_plugins ;;
+            7)  cmd_destroy ;;
+            8)  cmd_update ;;
+            9)  cmd_fix_env ;;
+            10) cmd_sync ;;
+            11) cmd_nodes ;;
+            0)  info "再见！"; exit 0 ;;
+            *)  warn "无效输入" ;;
         esac
         read -rp "按回车继续..."
         clear
