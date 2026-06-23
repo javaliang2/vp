@@ -399,7 +399,7 @@ PHP_BODY
 _write_master_dockerfile() {
     local DIR="$1"
     cat > "$DIR/Dockerfile" <<'DOCKERFILE'
-FROM php:8.3-fpm-alpine
+FROM php:8.4-fpm-alpine
 
 RUN apk add --no-cache \
         nginx supervisor curl bash less mariadb-client \
@@ -460,7 +460,7 @@ IGNORE
 _write_init_dockerfile() {
     local DIR="$1"
     cat > "$DIR/Dockerfile" <<'DOCKERFILE'
-FROM php:8.3-fpm-alpine
+FROM php:8.4-fpm-alpine
 
 RUN apk add --no-cache \
         nginx supervisor curl bash less mariadb-client \
