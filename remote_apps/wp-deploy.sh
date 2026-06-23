@@ -530,7 +530,7 @@ services:
       - ./data/uploads:/var/www/html/wp-content/uploads
       - ./data/cache:/var/www/html/wp-content/cache
       - ./conf/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./conf/nginx-wp.conf:/etc/nginx/http.d/default.conf:ro
+      - ./conf/nginx-wp.conf:/etc/nginx/http.d/default.conf
       - ./conf/php-uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
       - ./conf/opcache.ini:/usr/local/etc/php/conf.d/opcache.ini:ro
       - ./conf/php-fpm-www.conf:/usr/local/etc/php-fpm.d/www.conf:ro
