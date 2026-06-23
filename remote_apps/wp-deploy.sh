@@ -239,18 +239,29 @@ TEMPLATE
 }
 
 _write_entrypoint_script() {
-    cat > "$1" <<'ENTRYPOINT'
+    local DEST="$1"
+    cat > "$DEST" <<'ENTRYPOINT'
 #!/bin/sh
 set -e
+
 if [ -n "${WG_IP}" ]; then
-    sed -i "s/__WG_IP__/${WG_IP}/g" /etc/nginx/http.d/default.conf
-    echo "Nginx listen IP set to ${WG_IP}"
+    FILE="/etc/nginx/http.d/default.conf"
+    if grep -q '__WG_IP__' "$FILE" 2>/dev/null; then
+        # 使用临时文件 + cat 覆盖，避免 rename 导致的 busy 错误
+        sed "s/__WG_IP__/${WG_IP}/g" "$FILE" > /tmp/default.conf.tmp
+        cat /tmp/default.conf.tmp > "$FILE"
+        rm -f /tmp/default.conf.tmp
+        echo "Nginx listen IP set to ${WG_IP}"
+    else
+        echo "WG_IP already configured, skipping"
+    fi
 else
     echo "WARNING: WG_IP not set, using placeholder" >&2
 fi
+
 exec /usr/bin/supervisord -c /etc/supervisord.conf
 ENTRYPOINT
-    chmod +x "$1"
+    chmod +x "$DEST"
 }
 
 _write_php_uploads_ini() {
