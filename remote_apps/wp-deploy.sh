@@ -1002,11 +1002,7 @@ cmd_push() {
     _write_master_dockerfile "$BUILD_DIR"   # 内部会生成 .dockerignore
 
     info "构建镜像: ${IMAGE_BASE}:${IMAGE_TAG} ..."
-    docker build --no-cache \
-        -t "${IMAGE_BASE}:${IMAGE_TAG}" \
-        -t "${IMAGE_BASE}:latest" \
-        "$BUILD_DIR" \
-    || error "镜像构建失败"
+    docker build --pull --no-cache -t "${IMAGE_BASE}:${IMAGE_TAG}" -t "${IMAGE_BASE}:latest" "$BUILD_DIR" || error "镜像构建失败"
 
     local REG_USER REG_PASS
     if [[ -f "$REGISTRY_DIR/.env" ]]; then
