@@ -18,10 +18,10 @@ declare -A APPS=(
     ["tg 私聊"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/tg-call.sh"
     ["工具环境"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/huanjing.sh"
     ["远程文件传输"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/vps-rsync.sh"
-    ["wordpress节点"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/wp-deploy.sh"
+    ["wordpress多节点"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/wp-deploy.sh"
     ["证书/代理/网站"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/nginx-gateway.sh"
     ["nginx安全加固"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/nginx-harden.sh"
-    ["wordpress多端"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/wordpress-wg.sh"
+    ["rsync"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/install_rsync.sh"
     ["WireGuard安装"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/wireguard-mesh.sh"
     ["MariaDB + Redis"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/infra-shared.sh"
 )
