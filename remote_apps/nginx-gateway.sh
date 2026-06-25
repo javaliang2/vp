@@ -1022,13 +1022,28 @@ EOF
     echo "      include ${stream_dir}/*.conf;"
     echo -e "  ${BOLD}}${NC}"
     echo ""
-    if grep -q "stream.d" "${NGINX_CONF_DIR}/nginx.conf" 2>/dev/null; then
-        success "检测到 nginx.conf 中已存在 stream 块，正在重载..."
-        nginx_reload
-    else
-        warn "nginx.conf 中尚未发现 stream 块，请手动添加后执行: nginx -t && systemctl reload nginx"
+    # 自动在 nginx.conf 中插入 stream 块（若不存在）
+    if ! grep -q "stream.d" "${NGINX_CONF_DIR}/nginx.conf" 2>/dev/null; then
+        if ! grep -q "^stream" "${NGINX_CONF_DIR}/nginx.conf" 2>/dev/null; then
+            cat >> "${NGINX_CONF_DIR}/nginx.conf" <<STREAMEOF
+
+stream {
+    include ${NGINX_CONF_DIR}/stream.d/*.conf;
+}
+STREAMEOF
+            info "已在 nginx.conf 末尾追加 stream{} 块"
+        else
+            warn "nginx.conf 中已有 stream 块但未包含 stream.d，请手动确认"
+        fi
     fi
-    success "流代理 server 配置已写入: $stream_conf"
+
+    if nginx -t 2>/dev/null; then
+        systemctl reload nginx
+        success "流代理 server 配置已写入并生效: $stream_conf"
+    else
+        warn "nginx 配置检查失败，请手动检查: $stream_conf"
+        warn "并确认 nginx.conf 已包含: stream { include ${NGINX_CONF_DIR}/stream.d/*.conf; }"
+    fi
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -1188,21 +1203,47 @@ site_create_loadbalance() {
 
     [[ ${#backend_list[@]} -eq 0 ]] && die "至少需要添加一个后端节点！"
 
+    # ── 后台路径固定节点（WordPress wp-admin 等）────────────────────
+    echo ""
+    echo -e "${CYAN}── 后台路径固定节点（可选）──${NC}"
+    info "用于将 wp-admin / wp-login.php 等后台请求固定路由到指定节点"
+    info "若所有节点内容完全一致可跳过，留空则不启用"
+    local master_node=""
+    safe_read -rp "后台固定节点地址（如 10.0.0.2:80，留空跳过）: " master_node
+
+    # 自定义后台路径正则（默认覆盖 WordPress 后台）
+    local admin_regex="^/(wp-admin|wp-login\\.php|xmlrpc\\.php)"
+    if [[ -n "$master_node" ]]; then
+        local _custom_regex=""
+        safe_read -rp "自定义后台路径正则（留空使用默认 wp-admin|wp-login.php|xmlrpc.php）: " _custom_regex
+        [[ -n "$_custom_regex" ]] && admin_regex="$_custom_regex"
+    fi
+
     ask_ssl_params
     resolve_ssl_cert "$domain"
     _check_port_conflict "$_SSL_PORT"
     _ensure_upgrade_map
 
     local upstream_name="upstream_${domain//./_}"
+    local upstream_master="${upstream_name}_master"
     local conf_file="${SITES_AVAILABLE}/${domain}.conf"
 
     {
-        # 生成 upstream 块
+        # 生成通用 upstream 块
         echo "upstream ${upstream_name} {"
         [[ -n "$lb_directive" ]] && echo "$lb_directive"
         printf '%s\n' "${backend_list[@]}"
         echo "}"
         echo ""
+
+        # 生成主节点专用 upstream 块（若启用）
+        if [[ -n "$master_node" ]]; then
+            echo "# 后台请求固定节点"
+            echo "upstream ${upstream_master} {"
+            echo "    server ${master_node};"
+            echo "}"
+            echo ""
+        fi
 
         # 生成 301 强转块
         [[ "$_SSL_MODE" != "none" && "$_SSL_301" == "yes" ]] && \
@@ -1217,7 +1258,7 @@ site_create_loadbalance() {
             echo "    listen ${_SSL_PORT};"
             echo "    listen [::]:${_SSL_PORT};"
         fi
-        
+
         cat <<CONF
     server_name ${domain};
     client_max_body_size 0;
@@ -1227,6 +1268,25 @@ site_create_loadbalance() {
 CONF
 
         [[ "$_SSL_MODE" != "none" ]] && ssl_block "$_SSL_CERT" "$_SSL_KEY" && echo ""
+
+        # 后台路径固定 location（精确匹配，优先于 location /）
+        if [[ -n "$master_node" ]]; then
+            cat <<CONF
+
+    # 后台路径固定到主节点: ${master_node}
+    location ~* ${admin_regex} {
+        proxy_pass          http://${upstream_master};
+        proxy_http_version  1.1;
+        proxy_set_header    Host              \$host;
+        proxy_set_header    X-Real-IP         \$remote_addr;
+        proxy_set_header    X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header    X-Forwarded-Proto \$scheme;
+        proxy_set_header    X-Forwarded-Host  \$host;
+        proxy_read_timeout  300s;
+        proxy_send_timeout  300s;
+    }
+CONF
+        fi
 
         cat <<CONF
     location / {
@@ -1239,7 +1299,7 @@ CONF
         proxy_set_header    X-Forwarded-For   \$proxy_add_x_forwarded_for;
         proxy_set_header    X-Forwarded-Proto \$scheme;
         proxy_set_header    X-Forwarded-Host  \$host;
-        
+
         # 核心：当主节点返回 502/504/超时时，立即无感将请求转给下一个健康的节点
         proxy_next_upstream error timeout invalid_header http_502 http_503 http_504;
         proxy_next_upstream_timeout 5s;
@@ -1253,6 +1313,13 @@ CONF
     } > "$conf_file"
 
     _site_activate "$domain"
+
+    if [[ -n "$master_node" ]]; then
+        echo ""
+        success "后台路径已固定到: ${master_node}"
+        info "匹配规则: ${admin_regex}"
+        info "如需修改固定节点，执行: site edit ${domain}"
+    fi
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -1318,8 +1385,31 @@ site_lb_node() {
             fi
 
             local target="${nodes[$(( _idx - 1 ))]}"
-            sed -i "/^\s\+server ${target//./\\.} max_fails/d" "$conf"
-            success "节点 ${target} 已删除"
+            # 只删除通用 upstream 块中的节点，不碰 _master upstream
+            # 使用 python3 做精确块级删除，避免误删主节点 upstream 中同 IP 的行
+            if python3 - "$conf" "$target" <<'PYDEL'
+import sys, re
+path, target = sys.argv[1], sys.argv[2]
+txt = open(path).read()
+# 找到第一个不含 _master 的 upstream 块，在其中删除匹配行
+def del_in_main_upstream(m):
+    block = m.group(0)
+    lines = block.splitlines(keepends=True)
+    filtered = [l for l in lines if not re.search(
+        r'\s+server\s+' + re.escape(target) + r'\s', l)]
+    return ''.join(filtered)
+new_txt = re.sub(
+    r'upstream [^_][^{]*\{[^}]*\}',
+    del_in_main_upstream, txt, count=1, flags=re.DOTALL)
+open(path, 'w').write(new_txt)
+PYDEL
+            then
+                success "节点 ${target} 已删除"
+            else
+                # fallback: 兼容无 python3 的环境
+                sed -i "/[[:space:]]\+server[[:space:]]\+${target//./\.}[[:space:]]/d" "$conf"
+                success "节点 ${target} 已删除（fallback）"
+            fi
             ;;
 
         3)
@@ -1534,16 +1624,36 @@ _acl_inject_include() {
         return
     fi
 
-    # 在第一个 location / 块中插入 include
-    if grep -q 'location\s*/\s*{' "$conf"; then
-        # 使用 sed 在第一个匹配行的下一行插入，并添加缩进
-        sed -i "0,/location\s*\/\s*{/ s//&\n    ${marker//\//\\/}/" "$conf"
-        success "已将 include 指令注入到 location / 块"
+    # 用 python3 精确匹配第一个 "location / {" 整行并注入
+    # 避免 sed 误匹配 "location ~* /wp-admin" 等后台路径 location
+    if command -v python3 &>/dev/null; then
+        python3 - "$conf" "$marker" <<'PYINJECT'
+import sys, re
+path, marker = sys.argv[1], sys.argv[2]
+txt = open(path).read()
+# 只匹配独立的 location / { 行（/ 两侧只允许空白）
+pattern = r'([ \t]*location\s+/\s*\{)'
+new_txt, n = re.subn(pattern, r'\1' + '\n        ' + marker, txt, count=1)
+if n:
+    open(path, 'w').write(new_txt)
+    sys.exit(0)
+sys.exit(1)
+PYINJECT
+        if [[ $? -eq 0 ]]; then
+            success "已将 include 指令注入到 location / 块"
+            return
+        fi
+    fi
+
+    # fallback：python3 不可用，用 sed 处理（仅限简单单 location / 场景）
+    if grep -qE '^[[:space:]]*location[[:space:]]*/[[:space:]]*\{' "$conf"; then
+        sed -i "0,/^[[:space:]]*location[[:space:]]*\/[[:space:]]*{/ \
+            s//&\n        ${marker//\//\\/}/" "$conf"
+        success "已将 include 指令注入到 location / 块（sed fallback）"
     else
-        # 如果没有 location /，则在 server 块的末尾前插入一个完整的 location / 块
-        # 这里假设配置文件中只有一个 server { }，且 } 是 server 的结束符
-        sed -i '/^}/i\    location / {\n        '"${marker//\//\\/}"'\n    }' "$conf"
-        success "未找到 location /，已在 server 块中自动创建并注入 include"
+        # 没有 location /，在最后一个 } 前追加
+        printf '\n    location / {\n        %s\n    }\n' "$marker" >> "$conf"
+        success "未找到 location /，已在配置末尾追加 location / 块"
     fi
 }
 
@@ -1654,13 +1764,20 @@ limit_req_status 429;
 EOF
     success "限流 zone 配置写入: $rl_conf"
 
-    echo ""
-    success "请将以下指令添加到站点 location / 块中："
-    echo "────────────────────────────────"
-    echo "    limit_req zone=${zone_name} burst=${_burst}${nodelay_flag};"
-    echo "────────────────────────────────"
-    warn "使用 $0 site edit ${domain} 打开编辑器添加上述指令"
-    warn "并确认 nginx.conf 的 http{} 中已 include /etc/nginx/conf.d/*.conf"
+    # 自动将 limit_req 注入到站点 location / 块（避免手动编辑）
+    local limit_req_line="limit_req zone=${zone_name} burst=${_burst}${nodelay_flag};"
+    local marker="limit_req zone=${zone_name}"
+    if grep -qF "$marker" "$conf"; then
+        info "limit_req 指令已存在，跳过注入"
+    elif grep -q 'location[[:space:]]*/[[:space:]]*{' "$conf"; then
+        sed -i "0,/location[[:space:]]*\/[[:space:]]*{/ s//&\n        ${limit_req_line}/" "$conf"
+        success "已自动注入 limit_req 到 location / 块"
+    else
+        warn "未找到 location / 块，请手动添加: ${limit_req_line}"
+    fi
+
+    warn "请确认 nginx.conf 的 http{} 中已 include /etc/nginx/conf.d/*.conf"
+    nginx_reload
 }
 
 # ──────────────────────────────────────────────────────────
@@ -1764,6 +1881,101 @@ config_backup_list() {
 # ──────────────────────────────────────────────────────────
 # 站点生命周期
 # ──────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
+# 裸 IP 访问拦截（每次建站后自动确保存在）
+# 原理：nginx 匹配无 server_name 的请求时，优先使用标记了
+#       default_server 的 vhost；本函数确保该 vhost 始终存在
+#       且文件名 00- 排在所有站点配置之前。
+# ──────────────────────────────────────────────────────────
+_ensure_block_ip() {
+    local block_conf="${SITES_AVAILABLE}/00-block-ip.conf"
+    local block_link="${SITES_DIR}/00-block-ip.conf"
+
+    # 检测 nginx 是否支持 ssl_reject_handshake（1.19.4+）
+    local support_reject=true
+    if nginx -V 2>&1 | grep -qE "nginx/1\.(1[0-8]|[0-9])\."; then
+        support_reject=false
+    fi
+
+    # 若文件已存在，检查内容是否与当前 nginx 能力匹配，不匹配则重新生成
+    if [[ -f "$block_conf" ]] && [[ -L "$block_link" ]]; then
+        if $support_reject && grep -q "ssl_reject_handshake" "$block_conf"; then
+            return 0
+        elif ! $support_reject && ! grep -q "ssl_reject_handshake" "$block_conf"; then
+            return 0
+        fi
+        info "检测到裸 IP 拦截配置需要更新（nginx 版本变化），重新生成..."
+    fi
+
+    # 自签名证书目录（旧版 nginx 兜底用）
+    local fallback_cert="${SELF_CERT_DIR}/_default/fullchain.pem"
+    local fallback_key="${SELF_CERT_DIR}/_default/privkey.pem"
+
+    if $support_reject; then
+        # 新版：ssl_reject_handshake，无需证书
+        cat > "$block_conf" <<BLOCKEOF
+# 自动生成 — 拦截裸 IP 访问，勿手动删除
+# 生成时间: $(date)
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 444;
+}
+
+server {
+    listen 443 default_server ssl;
+    listen [::]:443 default_server ssl;
+    server_name _;
+    ssl_reject_handshake on;
+}
+BLOCKEOF
+    else
+        # 旧版：生成自签名证书兜底，让 443 能启动
+        warn "当前 Nginx 版本不支持 ssl_reject_handshake，将使用自签名证书兜底"
+        if [[ ! -f "$fallback_cert" ]]; then
+            mkdir -p "${SELF_CERT_DIR}/_default"
+            openssl req -x509 -nodes -days 3650 -newkey rsa:2048                 -keyout "$fallback_key"                 -out    "$fallback_cert"                 -subj   "/CN=_default/O=Block/C=CN" 2>/dev/null             && info "已生成兜底自签名证书: $fallback_cert"             || { warn "自签名证书生成失败，跳过 443 拦截块"; fallback_cert=""; }
+        fi
+
+        if [[ -n "$fallback_cert" ]]; then
+            cat > "$block_conf" <<BLOCKEOF
+# 自动生成 — 拦截裸 IP 访问，勿手动删除
+# 生成时间: $(date)
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 444;
+}
+
+server {
+    listen 443 default_server ssl;
+    listen [::]:443 default_server ssl;
+    server_name _;
+    ssl_certificate     ${fallback_cert};
+    ssl_certificate_key ${fallback_key};
+    return 444;
+}
+BLOCKEOF
+        else
+            cat > "$block_conf" <<BLOCKEOF
+# 自动生成 — 拦截裸 IP 访问，勿手动删除
+# 生成时间: $(date)
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 444;
+}
+BLOCKEOF
+        fi
+    fi
+
+    ln -sf "$block_conf" "$block_link"
+    info "已生成裸 IP 拦截配置: $block_conf"
+}
+
 _site_activate() {
     local domain="$1"
     local avail="${SITES_AVAILABLE}/${domain}.conf"
@@ -1773,6 +1985,9 @@ _site_activate() {
         rm -f "${SITES_DIR}/default"
         info "已移除默认站点 default"
     fi
+
+    # 确保裸 IP 拦截始终存在
+    _ensure_block_ip
 
     ln -sf "$avail" "$enabled"
     success "配置已写入: $avail"
@@ -1808,7 +2023,23 @@ site_delete() {
     local domain="${1:-}"
     [[ -z "$domain" ]] && safe_read -rp "域名: " domain
     confirm "确认删除站点 ${domain} 的配置？" || { info "已取消"; return; }
-    rm -f "${SITES_DIR}/${domain}.conf" "${SITES_AVAILABLE}/${domain}.conf"
+
+    # 主配置文件（普通站点 / redirect）
+    rm -f "${SITES_DIR}/${domain}.conf"           "${SITES_AVAILABLE}/${domain}.conf"           "${SITES_DIR}/${domain}-redirect.conf"           "${SITES_AVAILABLE}/${domain}-redirect.conf"
+
+    # ACL 附属文件
+    local acl_conf="${NGINX_CONF_DIR}/conf.d/acl-${domain}.conf"
+    local acl_snippet="${SNIPPET_DIR}/acl-location-${domain}.conf"
+    local acl_snippet_old="${NGINX_CONF_DIR}/conf.d/acl-location-${domain}.conf"
+    local auth_file="${NGINX_CONF_DIR}/.htpasswd-${domain}"
+    for f in "$acl_conf" "$acl_snippet" "$acl_snippet_old" "$auth_file"; do
+        [[ -f "$f" ]] && { rm -f "$f"; info "已清理: $f"; }
+    done
+
+    # 限流附属文件
+    local rl_conf="${NGINX_CONF_DIR}/conf.d/ratelimit-${domain}.conf"
+    [[ -f "$rl_conf" ]] && { rm -f "$rl_conf"; info "已清理: $rl_conf"; }
+
     if confirm "是否同时删除网站文件（${WEBROOT_BASE}/${domain}）？"; then
         if [[ -d "${WEBROOT_BASE:?}/${domain:?}" ]]; then
             validate_safe_path "${WEBROOT_BASE}/${domain}"
@@ -1846,13 +2077,26 @@ site_list() {
         grep -q "proxy_pass"  "$conf" 2>/dev/null && [[ "$type" == "静态文件" ]] && type="反向代理"
         grep -q "stream {"    "$conf" 2>/dev/null && type="流代理"
         [[ "$name" == forward-proxy-* ]]           && type="正向代理"
-        grep -qE "return [0-9]{3}" "$conf" 2>/dev/null \
-            && ! grep -q "proxy_pass\|root " "$conf" 2>/dev/null \
-            && type="跳转重定向"
+        grep -qE "return [0-9]{3}" "$conf" 2>/dev/null             && ! grep -q "proxy_pass\|root " "$conf" 2>/dev/null             && type="跳转重定向"
         grep -q "ssl_certificate" "$conf" 2>/dev/null && type+=" [SSL]"
 
-        printf "${BOLD}║${NC}  %-28s ${status_color}%-4s${NC}  %-14s  ${BOLD}║${NC}\n" \
-            "$name" "$status_text" "$type"
+        printf "${BOLD}║${NC}  %-28s ${status_color}%-4s${NC}  %-14s  ${BOLD}║${NC}
+"             "$name" "$status_text" "$type"
+
+        # 负载均衡：显示节点列表和后台固定节点
+        if grep -q "^upstream" "$conf" 2>/dev/null; then
+            # 通用节点
+            while IFS= read -r line; do
+                local addr; addr=$(echo "$line" | awk '{print $2}')
+                printf "${BOLD}║${NC}    %-26s %-4s  %-14s  ${BOLD}║${NC}
+"                     "  ↳ $addr" "" "节点"
+            done < <(grep -E "^[[:space:]]+server .+ max_fails" "$conf" 2>/dev/null || true)
+            # 后台固定节点
+            local master_addr
+            master_addr=$(grep -A2 "_master" "$conf" 2>/dev/null                 | grep -E "^[[:space:]]+server " | awk '{print $2}' | head -1 || true)
+            [[ -n "$master_addr" ]] &&                 printf "${BOLD}║${NC}    %-26s %-4s  %-14s  ${BOLD}║${NC}
+"                     "  ⭐ $master_addr" "" "后台固定"
+        fi
     done
     $found || echo "  暂无站点配置"
     echo -e "${BOLD}╚══════════════════════════════════════════════════╝${NC}\n"
