@@ -160,14 +160,25 @@ cmd_uninstall() {
     # 1. 停止并禁用服务
     _stop_iface_safe
 
-    # 2. 手动清除 iptables 残留（PostDown 若未成功执行需兜底）
+    # 2. 手动清除 iptables / ip6tables 残留
     local default_iface
     default_iface=$(ip route show default | awk '/default/{print $5}' | head -1 || echo "")
+    
+    # 清理 IPv4 残留
+    iptables -D INPUT -p udp --dport "${WG_PORT}" -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -i "${WG_IFACE}" -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -o "${WG_IFACE}" -j ACCEPT 2>/dev/null || true
     if [[ -n "$default_iface" ]]; then
-        # [FIX] -t nat 在子命令之前
         iptables -t nat -D POSTROUTING -o "${default_iface}" -j MASQUERADE 2>/dev/null || true
+    fi
+
+    # 清理 IPv6 残留
+    if command -v ip6tables &>/dev/null; then
+        ip6tables -D FORWARD -i "${WG_IFACE}" -j ACCEPT 2>/dev/null || true
+        ip6tables -D FORWARD -o "${WG_IFACE}" -j ACCEPT 2>/dev/null || true
+        if [[ -n "$default_iface" ]]; then
+            ip6tables -t nat -D POSTROUTING -o "${default_iface}" -j MASQUERADE 2>/dev/null || true
+        fi
     fi
 
     # 3. sysctl 持久化配置
