@@ -1,749 +1,774 @@
 #!/usr/bin/env bash
 # ============================================================
-# infra-shared.sh — 共享 MariaDB + Redis（仅监听 WireGuard 网口）
-#
-# 用法：
-#   bash infra-shared.sh <子命令> [参数...]
-#
-# 子命令：
-#   deploy  [DIR] [WG_IP]   部署 MariaDB + Redis
-#   add-db  [DIR] <DB> <USER> <PW>
-#                           在运行中的 MariaDB 新建库和用户
-#   del-db  [DIR] <DB> <USER>
-#                           删除库和用户
-#   list-db [DIR]           列出所有业务库和用户
-#   passwd  [DIR] <USER> <NEW_PW>
-#                           修改用户密码
-#   status  [DIR]           显示运行状态
-#   backup  [DIR] [DEST]    备份所有库到本地目录
-#   restore [DIR] <SQL文件>  恢复单个库
-#   stop    [DIR]           停止服务
-#   start   [DIR]           启动服务
-#   logs    [DIR] <db|redis> 查看日志
-#
-# 前置条件：
-#   - WireGuard 已启动（wg0 接口存在）
-#   - docker compose v2 已安装
-#
-# WG_IP 默认读取 wg0 接口当前地址，也可显式传入
+# wireguard-mesh.sh — WireGuard 纯交互式组网管理面板 v3.2
 # ============================================================
 set -euo pipefail
-export LANG=en_US.UTF-8
-export LC_ALL=en_US.UTF-8
 
-# ── 默认值 ──────────────────────────────────────────────────
-DEFAULT_DIR="${BASE_DIR:-/srv}/infra"
-WG_IFACE="${WG_IFACE:-wg0}"
-MARIADB_PORT="${MARIADB_PORT:-3306}"
-REDIS_PORT="${REDIS_PORT:-6379}"
-MARIADB_IMAGE="${MARIADB_IMAGE:-mariadb:11}"
-REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine}"
+# ── 常量 ────────────────────────────────────────────────────
+readonly WG_IFACE="${WG_IFACE:-wg0}"
+readonly WG_PORT="${WG_PORT:-51820}"
+readonly WG_DIR="/etc/wireguard"
+readonly WG_CONF="${WG_DIR}/${WG_IFACE}.conf"
+readonly WG_KEY_DIR="${WG_DIR}/keys"
+readonly PRIV_KEY_FILE="${WG_KEY_DIR}/privatekey"
+readonly PUB_KEY_FILE="${WG_KEY_DIR}/publickey"
+readonly BACKUP_DIR="/root/wg-backups"
 
 # ── 颜色输出 ────────────────────────────────────────────────
-_c() { printf "\e[${1}m${2}\e[0m\n"; }
-log()    { _c "32" "[OK]  $*"; }
-info()   { _c "36" "[..] $*"; }
-warn()   { _c "33" "[!!] $*"; }
-error()  { _c "31" "[EE] $*"; exit 1; }
-header() { echo; _c "1;34" "══ $* ══"; }
+if [[ -t 1 ]] && command -v tput &>/dev/null && tput colors &>/dev/null; then
+    C_OK="\e[32m"; C_INFO="\e[36m"; C_WARN="\e[33m"; C_ERR="\e[31m"
+    C_BOLD="\e[1;34m"; C_RESET="\e[0m"
+else
+    C_OK=""; C_INFO=""; C_WARN=""; C_ERR=""; C_BOLD=""; C_RESET=""
+fi
 
-randpw() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32; true; }
+log()    { printf "${C_OK}[OK]  %s${C_RESET}\n" "$*"; }
+info()   { printf "${C_INFO}[..] %s${C_RESET}\n" "$*"; }
+warn()   { printf "${C_WARN}[!!] %s${C_RESET}\n" "$*" >&2; }
+error()  { printf "${C_ERR}[EE] %s${C_RESET}\n" "$*" >&2; exit 1; }
+header() { printf "\n${C_BOLD}══ %s ══${C_RESET}\n" "$*"; }
 
-# ── 获取 WireGuard 接口 IP ──────────────────────────────────
-get_wg_ip() {
-    local IP
-    IP=$(ip addr show "${WG_IFACE}" 2>/dev/null \
-        | awk '/inet /{gsub(/\/.*/, "", $2); print $2; exit}')
-    [[ -n "$IP" ]] || error "无法获取 ${WG_IFACE} IP，请确认 WireGuard 已启动"
-    echo "$IP"
+# ── 前置检查 ────────────────────────────────────────────────
+require_root() {
+    [[ $EUID -eq 0 ]] || error "需要 root 权限，请用 sudo 执行"
 }
 
-# ── 读取 .env 中的变量 ──────────────────────────────────────
-load_env() {
-    local DIR="$1"
-    [[ -f "$DIR/.env" ]] || error ".env 不存在: $DIR/.env"
-    # shellcheck disable=SC1090
-    set -a; source "$DIR/.env"; set +a
+require_conf() {
+    [[ -f "$WG_CONF" ]] || error "配置文件不存在: $WG_CONF，请先执行初始化"
 }
 
-# ── compose 快捷执行 ────────────────────────────────────────
-dc() {
-    local DIR="$1"; shift
-    docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" "$@"
+require_key() {
+    [[ -f "$PRIV_KEY_FILE" && -f "$PUB_KEY_FILE" ]] || error "密钥不存在，请先生成密钥对"
 }
 
-# ── MariaDB 执行 SQL ────────────────────────────────────────
-mariadb_exec() {
-    local DIR="$1"; shift
-    load_env "$DIR"
-    dc "$DIR" exec -T db \
-        mariadb -uroot -p"${MARIADB_ROOT_PASSWORD}" "$@"
-}
-
-# ── 等待 MariaDB 就绪 ───────────────────────────────────────
-wait_db_ready() {
-    local DIR="$1"
-    local RETRIES="${2:-20}"
-    info "等待 MariaDB 就绪..."
-    load_env "$DIR"
-    while ! dc "$DIR" exec -T db \
-            mariadb-admin -uroot -p"${MARIADB_ROOT_PASSWORD}" \
-            ping --silent 2>/dev/null; do
-        sleep 3
-        (( RETRIES-- ))
-        [[ $RETRIES -gt 0 ]] || error "MariaDB 启动超时"
+# ── 输入校验 ─────────────────────────────────────────────────
+is_valid_ipv4() {
+    local ip="${1%%/*}"
+    local IFS='.'
+    read -ra octets <<< "$ip"
+    [[ ${#octets[@]} -eq 4 ]] || return 1
+    for o in "${octets[@]}"; do
+        [[ "$o" =~ ^[0-9]+$ ]] || return 1
+        (( 10#$o >= 0 && 10#$o <= 255 )) || return 1
     done
-    log "MariaDB 就绪"
+    return 0
 }
 
-# ════════════════════════════════════════════════════════════
-# deploy [DIR] [WG_IP]
-# ════════════════════════════════════════════════════════════
-cmd_deploy() {
-    local DIR="${1:-$DEFAULT_DIR}"
-    local WG_IP="${2:-$(get_wg_ip)}"
+is_valid_ipv6() {
+    local ip="${1%%/*}"
+    [[ "$ip" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]] || return 1
+    return 0
+}
 
-    header "部署共享基础设施 → ${DIR}  (监听 ${WG_IP})"
-    [[ $EUID -eq 0 ]] || error "需要 root 权限"
+is_valid_cidr() {
+    local ips
+    IFS=',' read -ra ips <<< "$1"
+    for current_ip in "${ips[@]}"; do
+        local addr="${current_ip%%/*}"
+        local mask="${current_ip##*/}"
+        if [[ "$current_ip" == *:* ]]; then
+            is_valid_ipv6 "$addr" || return 1
+            [[ "$mask" =~ ^[0-9]+$ ]] && (( 10#$mask >= 0 && 10#$mask <= 128 )) || return 1
+        else
+            is_valid_ipv4 "$addr" || return 1
+            [[ "$mask" =~ ^[0-9]+$ ]] && (( 10#$mask >= 0 && 10#$mask <= 32 )) || return 1
+        fi
+    done
+    return 0
+}
 
-    # WireGuard 接口必须存在
-    ip link show "${WG_IFACE}" &>/dev/null || \
-        error "${WG_IFACE} 接口不存在，请先启动 WireGuard"
+is_valid_endpoint() {
+    local ep="$1"
+    [[ "$ep" =~ ^.+:[0-9]{1,5}$ ]] || return 1
+    local port="${ep##*:}"
+    (( 10#$port >= 1 && 10#$port <= 65535 )) || return 1
+    return 0
+}
 
-    mkdir -p "${DIR}"/{db,redis,backup}
+is_valid_pubkey() {
+    [[ "${#1}" -eq 44 ]] && [[ "$1" =~ ^[A-Za-z0-9+/]{43}=$ ]]
+}
 
-    # 生成随机密码（已有 .env 则跳过，避免覆盖）
-    if [[ ! -f "${DIR}/.env" ]]; then
-        local ROOT_PW DB_PW REDIS_PW
-        ROOT_PW=$(randpw)
-        DB_PW=$(randpw)
-        REDIS_PW=$(randpw)
+# ── systemd 可用性检测 ──────────────────────────────────────
+_has_systemd() {
+    # 修复：仅通过目录判断 systemd 接管状态，规避 degraded 误判
+    [[ -d /run/systemd/system ]] && command -v systemctl &>/dev/null
+}
 
-        cat > "${DIR}/.env" <<EOF
-# 共享基础设施凭据 — 保密，分发给各 WordPress 节点
-MARIADB_ROOT_PASSWORD=${ROOT_PW}
-MARIADB_DATABASE=wordpress
-MARIADB_USER=wpuser
-MARIADB_PASSWORD=${DB_PW}
-REDIS_PASSWORD=${REDIS_PW}
-WG_IP=${WG_IP}
+# ═══════════════════════════════════════════════════════════
+# 核心功能函数
+# ═══════════════════════════════════════════════════════════
+
+cmd_install() {
+    header "安装 WireGuard"
+    if command -v wg &>/dev/null; then
+        log "WireGuard 已安装: $(wg --version 2>&1 | head -1)"
+        return 0
+    fi
+
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard wireguard-tools iptables
+    elif command -v dnf &>/dev/null; then
+        dnf install -y wireguard-tools iptables
+    elif command -v yum &>/dev/null; then
+        yum install -y epel-release
+        yum install -y wireguard-tools iptables
+    elif command -v pacman &>/dev/null; then
+        pacman -Sy --noconfirm wireguard-tools iptables
+    else
+        error "不支持的包管理器，请手动安装 wireguard-tools 和 iptables"
+    fi
+
+    modprobe wireguard 2>/dev/null || warn "wireguard 内核模块加载失败（非特权容器环境可忽略）"
+    log "WireGuard 安装完成: $(wg --version 2>&1 | head -1)"
+}
+
+cmd_update() {
+    header "更新 WireGuard"
+    command -v wg &>/dev/null || { warn "WireGuard 未安装，请先执行安装"; return 1; }
+
+    local was_up=false
+    _iface_is_up && was_up=true && info "接口运行中，更新前将临时停止"
+    $was_up && _stop_iface_safe || true
+
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y wireguard wireguard-tools
+    elif command -v dnf &>/dev/null; then
+        dnf upgrade -y wireguard-tools
+    elif command -v yum &>/dev/null; then
+        yum update -y wireguard-tools
+    elif command -v pacman &>/dev/null; then
+        pacman -Sy --noconfirm wireguard-tools
+    else
+        error "不支持的包管理器"
+    fi
+
+    log "更新完成: $(wg --version 2>&1 | head -1)"
+    if $was_up; then
+        info "正在重新启动接口..."
+        cmd_up
+    fi
+}
+
+cmd_uninstall() {
+    header "卸载 WireGuard"
+    warn "此操作将停止接口、删除配置、密钥、sysctl 规则"
+    local _confirm
+    read -r -t 30 -p "  确认卸载? 输入 YES 继续: " _confirm || true
+    [[ "$_confirm" == "YES" ]] || { info "已取消"; return 0; }
+
+    _stop_iface_safe
+
+    local default_iface
+    default_iface=$(ip route show default | awk '/default/{print $5}' | head -1 || echo "")
+
+    iptables -D INPUT   -p udp --dport "${WG_PORT}" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i "${WG_IFACE}" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -o "${WG_IFACE}" -j ACCEPT 2>/dev/null || true
+    if [[ -n "$default_iface" ]]; then
+        iptables -t nat -D POSTROUTING -o "${default_iface}" -j MASQUERADE 2>/dev/null || true
+    fi
+
+    if which ip6tables >/dev/null 2>&1; then
+        ip6tables -D FORWARD -i "${WG_IFACE}" -j ACCEPT 2>/dev/null || true
+        ip6tables -D FORWARD -o "${WG_IFACE}" -j ACCEPT 2>/dev/null || true
+        if [[ -n "$default_iface" ]]; then
+            ip6tables -t nat -D POSTROUTING -o "${default_iface}" -j MASQUERADE 2>/dev/null || true
+        fi
+    fi
+
+    rm -f /etc/sysctl.d/99-wireguard.conf
+    sysctl -p -q 2>/dev/null || true
+
+    rm -f "$WG_CONF" "${WG_KEY_DIR}/privatekey" "${WG_KEY_DIR}/publickey"
+    rmdir "$WG_KEY_DIR" 2>/dev/null || true
+
+    local _pkg
+    read -r -t 30 -p "  同时卸载 wireguard-tools 软件包? [y/N] " _pkg || true
+    if [[ "${_pkg,,}" == "y" ]]; then
+        if command -v apt-get &>/dev/null; then
+            apt-get remove -y wireguard wireguard-tools
+        elif command -v dnf &>/dev/null; then
+            dnf remove -y wireguard-tools
+        elif command -v yum &>/dev/null; then
+            yum remove -y wireguard-tools
+        elif command -v pacman &>/dev/null; then
+            pacman -R --noconfirm wireguard-tools
+        fi
+    fi
+
+    log "卸载完成"
+}
+
+cmd_genkey() {
+    header "生成密钥对"
+    mkdir -p "$WG_KEY_DIR"
+    chmod 700 "$WG_KEY_DIR"
+
+    if [[ -f "$PRIV_KEY_FILE" ]]; then
+        warn "密钥已存在，如需重新生成请手动删除 ${WG_KEY_DIR}/ 下的文件"
+        return 0
+    fi
+
+    local tmp_priv tmp_pub
+    tmp_priv=$(mktemp "${WG_KEY_DIR}/privatekey.XXXXXX")
+    tmp_pub=$(mktemp  "${WG_KEY_DIR}/publickey.XXXXXX")
+
+    wg genkey > "$tmp_priv"
+    wg pubkey < "$tmp_priv" > "$tmp_pub"
+
+    chmod 600 "$tmp_priv"
+    chmod 640 "$tmp_pub"
+    mv "$tmp_priv" "$PRIV_KEY_FILE"
+    mv "$tmp_pub"  "$PUB_KEY_FILE"
+
+    log "私钥与公钥生成完毕"
+    info "公钥: $(cat "$PUB_KEY_FILE")"
+}
+
+cmd_init() {
+    require_key
+    local RAW_IP="$1"
+    local WG_ADDR=""
+
+    # 修复：安全解析双栈 IP (10.0.0.1,fd00::1) 分别补全 CIDR
+    local ips
+    IFS=',' read -ra ips <<< "$RAW_IP"
+    for ip in "${ips[@]}"; do
+        if [[ "$ip" != */* ]]; then
+            if [[ "$ip" == *:* ]]; then
+                ip="${ip}/128"
+            else
+                ip="${ip}/24"
+            fi
+        fi
+        WG_ADDR+="${ip},"
+    done
+    WG_ADDR="${WG_ADDR%,}" # 移除末尾逗号
+
+    header "初始化 ${WG_IFACE} (${WG_ADDR})"
+
+    if [[ -f "$WG_CONF" ]]; then
+        warn "配置文件已存在: $WG_CONF"
+        local CONFIRM
+        read -rp "  覆盖? [y/N] " CONFIRM || true
+        [[ "${CONFIRM,,}" == "y" ]] || return 0
+        _stop_iface_safe
+    fi
+
+    local default_iface
+    default_iface=$(ip route show default | awk '/default/ {print $5}' | head -1)
+    if [[ -z "$default_iface" ]]; then
+        warn "未找到默认出网网卡，路由转发规则可能失效"
+        default_iface="eth0"
+    fi
+
+    mkdir -p "$WG_DIR"
+    chmod 700 "$WG_DIR"
+
+    cat > /etc/sysctl.d/99-wireguard.conf <<EOF
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
 EOF
-        chmod 600 "${DIR}/.env"
-        log ".env 已生成: ${DIR}/.env"
-    else
-        warn ".env 已存在，跳过生成密码（使用已有凭据）"
-        # 更新 WG_IP（接口 IP 可能变化）
-        sed -i "s|^WG_IP=.*|WG_IP=${WG_IP}|" "${DIR}/.env"
+    sysctl -p /etc/sysctl.d/99-wireguard.conf -q
+    info "双栈 ip_forward 已持久化至 /etc/sysctl.d/99-wireguard.conf"
+
+    local tmp
+    tmp=$(mktemp "${WG_DIR}/.wg_conf.XXXXXX")
+    chmod 600 "$tmp"
+
+    cat > "$tmp" <<EOF
+[Interface]
+Address = ${WG_ADDR}
+PrivateKey = $(cat "$PRIV_KEY_FILE")
+ListenPort = ${WG_PORT}
+
+PostUp   = iptables -C INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${WG_PORT} -j ACCEPT
+PostDown = iptables -D INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || true
+
+PostUp   = iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %i -j ACCEPT
+PostUp   = iptables -C FORWARD -o %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -o %i -j ACCEPT
+PostUp   = iptables -t nat -C POSTROUTING -o ${default_iface} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o ${default_iface} -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true
+PostDown = iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null || true
+PostDown = iptables -t nat -D POSTROUTING -o ${default_iface} -j MASQUERADE 2>/dev/null || true
+
+PostUp   = which ip6tables >/dev/null 2>&1 && (ip6tables -C FORWARD -i %i -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i %i -j ACCEPT) || true
+PostUp   = which ip6tables >/dev/null 2>&1 && (ip6tables -C FORWARD -o %i -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -o %i -j ACCEPT) || true
+PostUp   = which ip6tables >/dev/null 2>&1 && (ip6tables -t nat -C POSTROUTING -o ${default_iface} -j MASQUERADE 2>/dev/null || ip6tables -t nat -A POSTROUTING -o ${default_iface} -j MASQUERADE) || true
+PostDown = which ip6tables >/dev/null 2>&1 && ip6tables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true
+PostDown = which ip6tables >/dev/null 2>&1 && ip6tables -D FORWARD -o %i -j ACCEPT 2>/dev/null || true
+PostDown = which ip6tables >/dev/null 2>&1 && ip6tables -t nat -D POSTROUTING -o ${default_iface} -j MASQUERADE 2>/dev/null || true
+EOF
+
+    mv "$tmp" "$WG_CONF"
+    log "双栈配置已生成 (出站网卡: ${default_iface})"
+}
+
+cmd_add_peer() {
+    require_conf
+    local PUB_KEY="$1" ALLOWED_IPS="$2" ENDPOINT="${3:-}"
+
+    header "添加 Peer: ${ALLOWED_IPS}"
+
+    if ! is_valid_pubkey "$PUB_KEY"; then
+        warn "公钥格式不合法（需 44 位 Base64）"; return 1
+    fi
+    # 修复：加入 is_valid_ipv6，防止合法的纯 IPv6 被错误拒绝
+    if ! is_valid_cidr "$ALLOWED_IPS" && ! is_valid_ipv4 "$ALLOWED_IPS" && ! is_valid_ipv6 "$ALLOWED_IPS"; then
+        warn "AllowedIPs 格式不合法: $ALLOWED_IPS"; return 1
+    fi
+    if [[ -n "$ENDPOINT" ]] && ! is_valid_endpoint "$ENDPOINT"; then
+        warn "Endpoint 格式不合法: $ENDPOINT（应为 host:port）"; return 1
     fi
 
-    load_env "${DIR}"
+    if [[ "$ALLOWED_IPS" == "0.0.0.0/0" || "$ALLOWED_IPS" == "::/0" || "$ALLOWED_IPS" == "0.0.0.0/0,::/0" ]]; then
+        warn "AllowedIPs 设置为全路由 (${ALLOWED_IPS})，该 Peer 将接管本机所有出站流量！"
+        local _fullroute_confirm
+        read -r -t 30 -p "  确认继续? [y/N] " _fullroute_confirm || { echo; warn "输入超时，已取消"; return 1; }
+        [[ "${_fullroute_confirm,,}" == "y" ]] || { info "已取消"; return 0; }
+    fi
 
-    # ── MariaDB 配置 ──────────────────────────────────────
-    mkdir -p "${DIR}/mariadb-conf"
-    cat > "${DIR}/mariadb-conf/custom.cnf" <<INI
-[mysqld]
-# 性能
-innodb_buffer_pool_size  = 512M
-innodb_log_file_size     = 128M
-innodb_flush_log_at_trx_commit = 2
-max_connections          = 200
-query_cache_type         = 0
+    if grep -qF "PublicKey = ${PUB_KEY}" "$WG_CONF"; then
+        warn "该 Peer 公钥已存在"; return 0
+    fi
 
-# 字符集
-character-set-server     = utf8mb4
-collation-server         = utf8mb4_unicode_ci
+    _backup_conf
+    {
+        printf '\n[Peer]\n'
+        printf 'PublicKey = %s\n' "$PUB_KEY"
+        printf 'AllowedIPs = %s\n' "$ALLOWED_IPS"
+        if [[ -n "$ENDPOINT" ]]; then
+            printf 'Endpoint = %s\n' "$ENDPOINT"
+            printf 'PersistentKeepalive = 25\n'
+        fi
+    } >> "$WG_CONF"
 
-# 只监听 WireGuard 接口
-bind-address             = ${WG_IP}
-
-# 慢查询日志
-slow_query_log           = 1
-slow_query_log_file      = /var/lib/mysql/slow.log
-long_query_time          = 2
-INI
-
-    # ── Redis 配置 ────────────────────────────────────────
-    mkdir -p "${DIR}/redis-conf"
-    cat > "${DIR}/redis-conf/redis.conf" <<CONF
-# 只监听 WireGuard 接口 + 本地回环
-bind ${WG_IP} 127.0.0.1
-port ${REDIS_PORT}
-
-# 认证
-requirepass ${REDIS_PASSWORD}
-
-# 持久化
-save 900 1
-save 300 10
-save 60  10000
-appendonly yes
-appendfsync everysec
-
-# 内存
-maxmemory 512mb
-maxmemory-policy allkeys-lru
-
-# 日志
-loglevel notice
-logfile ""
-CONF
-
-    # ── docker-compose.yml ────────────────────────────────
-    # 修复：network_mode: host 与 ports: 不能共存
-    # 使用 host 网络模式，由配置文件 bind-address 控制监听接口，删除 ports: 块
-    cat > "${DIR}/docker-compose.yml" <<YAML
-services:
-  db:
-    image: ${MARIADB_IMAGE}
-    restart: unless-stopped
-    environment:
-      MARIADB_ROOT_PASSWORD: \${MARIADB_ROOT_PASSWORD}
-      MARIADB_DATABASE:      \${MARIADB_DATABASE}
-      MARIADB_USER:          \${MARIADB_USER}
-      MARIADB_PASSWORD:      \${MARIADB_PASSWORD}
-    volumes:
-      - ./db:/var/lib/mysql
-      - ./mariadb-conf/custom.cnf:/etc/mysql/conf.d/custom.cnf:ro
-    network_mode: host
-    healthcheck:
-      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-
-  redis:
-    image: ${REDIS_IMAGE}
-    restart: unless-stopped
-    volumes:
-      - ./redis:/data
-      - ./redis-conf/redis.conf:/etc/redis/redis.conf:ro
-    command: redis-server /etc/redis/redis.conf
-    network_mode: host
-    healthcheck:
-      test: ["CMD", "redis-cli", "-a", "\${REDIS_PASSWORD}", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-YAML
-
-    info "启动容器..."
-    # 修复 Redis 内存警告
-    sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 || true
-    grep -q 'vm.overcommit_memory' /etc/sysctl.conf || echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf
-    dc "${DIR}" up -d 2>&1 || error "docker compose up 失败，请检查上方错误信息"
-
-    wait_db_ready "${DIR}"
-
-    # 授权 WireGuard 网段远程访问
-    _grant_wg_access "${DIR}" "${MARIADB_DATABASE}" "${MARIADB_USER}" "${MARIADB_PASSWORD}"
-
-    echo ""
-    dc "${DIR}" ps
-    log "共享基础设施部署完成"
-    _print_credentials "${DIR}"
+    log "Peer 已追加"
+    if _iface_is_up; then
+        local -a args=(set "${WG_IFACE}" peer "${PUB_KEY}" allowed-ips "${ALLOWED_IPS}")
+        [[ -n "$ENDPOINT" ]] && args+=(endpoint "${ENDPOINT}" persistent-keepalive 25)
+        wg "${args[@]}" && log "热更新成功"
+    fi
 }
 
-# ── 授权 WG 网段访问（内部使用）──────────────────────────────
-_grant_wg_access() {
-    local DIR="$1" DB="$2" USER="$3" PW="$4"
-    load_env "$DIR"
-    local WG_SUBNET="${WG_IP%.*}.%"
-    mariadb_exec "$DIR" <<SQL
-GRANT ALL PRIVILEGES ON \`${DB}\`.* TO '${USER}'@'${WG_SUBNET}' IDENTIFIED BY '${PW}';
-FLUSH PRIVILEGES;
-SQL
-    log "已授权 ${USER}@${WG_SUBNET} 访问 ${DB}"
-}
+cmd_edit_peer() {
+    require_conf
+    header "编辑 Peer"
 
-# ── 打印凭据摘要 ─────────────────────────────────────────────
-_print_credentials() {
-    local DIR="$1"
-    load_env "$DIR"
-    echo ""
-    echo "┌─────────────────────────────────────────────┐"
-    echo "│           共享基础设施连接信息                │"
-    echo "├─────────────────────────────────────────────┤"
-    printf "│  MariaDB  %-34s│\n" "${WG_IP}:${MARIADB_PORT}"
-    printf "│    用户   %-34s│\n" "${MARIADB_USER} / ${MARIADB_PASSWORD}"
-    printf "│    库名   %-34s│\n" "${MARIADB_DATABASE}"
-    echo "├─────────────────────────────────────────────┤"
-    printf "│  Redis    %-34s│\n" "${WG_IP}:${REDIS_PORT}"
-    printf "│    密码   %-34s│\n" "${REDIS_PASSWORD}"
-    echo "├─────────────────────────────────────────────┤"
-    printf "│  凭据文件 %-34s│\n" "${DIR}/.env"
-    echo "└─────────────────────────────────────────────┘"
-    echo ""
-    warn "请将 .env 安全传输到各 WordPress 节点（scp over WireGuard）"
-    echo "  scp -i /etc/wireguard/keys/id_ed25519 ${DIR}/.env root@<节点WG_IP>:/srv/wordpress/.env-infra"
-}
+    local -a keys
+    mapfile -t keys < <(awk '
+        BEGIN { in_peer=0 }
+        /^\[Peer\]/ { in_peer=1; next }
+        /^\[/       { in_peer=0 }
+        in_peer && /^[[:space:]]*PublicKey[[:space:]]*=/ {
+            split($0, kv, /[[:space:]]*=[[:space:]]*/); print kv[2]
+        }
+    ' "$WG_CONF")
 
-# ════════════════════════════════════════════════════════════
-# add-db [DIR] <DB_NAME> <USER> [PASSWORD]
-# ════════════════════════════════════════════════════════════
-cmd_add_db() {
-    local DIR="${1:-$DEFAULT_DIR}"
-    local DB_NAME="${2:?用法: add-db [DIR] <DB名> <用户名> [密码]}"
-    local USER="${3:?}"
-    local PW="${4:-$(randpw)}"
+    if [[ ${#keys[@]} -eq 0 ]]; then
+        warn "当前无 Peer 节点"; return 0
+    fi
 
-    load_env "$DIR"
-    header "新建数据库: ${DB_NAME} / 用户: ${USER}"
-
-    mariadb_exec "$DIR" <<SQL
-CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${USER}'@'${WG_IP%.*}.%' IDENTIFIED BY '${PW}';
-FLUSH PRIVILEGES;
-SQL
-
-    log "数据库 ${DB_NAME} 已创建"
-    log "用户: ${USER}  密码: ${PW}"
-    log "主机: ${WG_IP}:${MARIADB_PORT}"
-}
-
-# ════════════════════════════════════════════════════════════
-# del-db [DIR] <DB_NAME> <USER>
-# ════════════════════════════════════════════════════════════
-cmd_del_db() {
-    local DIR="${1:-$DEFAULT_DIR}"
-    local DB_NAME="${2:?用法: del-db [DIR] <DB名> <用户名>}"
-    local USER="${3:?}"
-
-    load_env "$DIR"
-    warn "即将删除数据库 ${DB_NAME} 和用户 ${USER}，此操作不可逆！"
-    read -rp "确认删除? 输入库名确认: " CONFIRM
-    [[ "$CONFIRM" == "$DB_NAME" ]] || { info "已取消"; return; }
-
-    mariadb_exec "$DIR" <<SQL
-DROP DATABASE IF EXISTS \`${DB_NAME}\`;
-DROP USER IF EXISTS '${USER}'@'${WG_IP%.*}.%';
-FLUSH PRIVILEGES;
-SQL
-    log "数据库 ${DB_NAME} 和用户 ${USER} 已删除"
-}
-
-# ════════════════════════════════════════════════════════════
-# list-db [DIR]
-# ════════════════════════════════════════════════════════════
-cmd_list_db() {
-    local DIR="${1:-$DEFAULT_DIR}"
-    load_env "$DIR"
-    header "数据库列表"
-    mariadb_exec "$DIR" -e \
-        "SELECT schema_name AS '数据库', \
-                default_character_set_name AS '字符集' \
-         FROM information_schema.schemata \
-         WHERE schema_name NOT IN ('mysql','information_schema','performance_schema','sys');"
-    echo ""
-    header "用户列表"
-    mariadb_exec "$DIR" -e \
-        "SELECT user AS '用户', host AS '来源', \
-                GROUP_CONCAT(DISTINCT db) AS '可访问库' \
-         FROM mysql.db GROUP BY user, host;"
-}
-
-# ════════════════════════════════════════════════════════════
-# passwd [DIR] <USER> <NEW_PW>
-# ════════════════════════════════════════════════════════════
-cmd_passwd() {
-    local DIR="${1:-$DEFAULT_DIR}"
-    local USER="${2:?用法: passwd [DIR] <用户名> <新密码>}"
-    local NEW_PW="${3:?}"
-
-    load_env "$DIR"
-    mariadb_exec "$DIR" -e \
-        "ALTER USER '${USER}'@'${WG_IP%.*}.%' IDENTIFIED BY '${NEW_PW}'; FLUSH PRIVILEGES;"
-    log "用户 ${USER} 密码已更新"
-}
-
-# ════════════════════════════════════════════════════════════
-# backup [DIR] [DEST]
-# ════════════════════════════════════════════════════════════
-cmd_backup() {
-    local DIR="${1:-$DEFAULT_DIR}"
-    local DEST="${2:-${DIR}/backup}"
-    local TS
-    TS=$(date +%Y%m%d_%H%M%S)
-
-    load_env "$DIR"
-    mkdir -p "$DEST"
-    header "备份所有数据库 → ${DEST}"
-
-    local DBS
-    DBS=$(mariadb_exec "$DIR" -sN -e \
-        "SELECT schema_name FROM information_schema.schemata \
-         WHERE schema_name NOT IN ('mysql','information_schema','performance_schema','sys');")
-
-    for DB in $DBS; do
-        local OUT="${DEST}/${DB}_${TS}.sql.gz"
-        info "备份 ${DB} → ${OUT}"
-        dc "$DIR" exec -T db \
-            mariadb-dump \
-                -uroot -p"${MARIADB_ROOT_PASSWORD}" \
-                --single-transaction \
-                --routines \
-                --triggers \
-                "${DB}" \
-            | gzip > "$OUT"
-        log "✓ ${DB} ($(du -sh "$OUT" | cut -f1))"
+    local i=1
+    for k in "${keys[@]}"; do
+        printf "  %d. %s...\n" "$i" "${k:0:24}"
+        (( i++ ))
     done
+    echo
 
-    log "备份完成: ${DEST}"
+    local sel
+    _ask "选择序号" sel ""
+    [[ "$sel" =~ ^[0-9]+$ ]] && (( 10#$sel >= 1 && 10#$sel <= ${#keys[@]} )) || { warn "无效序号"; return 1; }
+    local target_key="${keys[$((10#$sel-1))]}"
+
+    info "当前公钥: ${target_key}"
+    local new_ips new_ep
+    _ask "新 AllowedIPs (回车保留原值)" new_ips ""
+    _ask "新 Endpoint   (回车保留原值)" new_ep  ""
+
+    if [[ -z "$new_ips" && -z "$new_ep" ]]; then
+        info "无修改"; return 0
+    fi
+
+    _backup_conf
+
+    awk -v target="$target_key" -v new_ips="$new_ips" -v new_ep="$new_ep" '
+        BEGIN { in_target=0; in_peer=0 }
+        /^\[/ { in_target=0; in_peer=0 }
+        /^\[Peer\]/ { in_peer=1; print; next }
+        in_peer && /^[[:space:]]*PublicKey[[:space:]]*=/ {
+            split($0, kv, /[[:space:]]*=[[:space:]]*/);
+            gsub(/[[:space:]]/, "", kv[2])
+            if (kv[2] == target) in_target=1
+            print; next
+        }
+        in_target && /^[[:space:]]*AllowedIPs/ && new_ips != "" {
+            print "AllowedIPs = " new_ips; next
+        }
+        in_target && /^[[:space:]]*Endpoint/ && new_ep != "" {
+            print "Endpoint = " new_ep; next
+        }
+        { print }
+    ' "$WG_CONF" > "${WG_CONF}.tmp" && mv "${WG_CONF}.tmp" "$WG_CONF"
+
+    log "Peer 已更新"
+    if _iface_is_up; then
+        local -a args=(set "${WG_IFACE}" peer "$target_key")
+        [[ -n "$new_ips" ]] && args+=(allowed-ips "$new_ips")
+        [[ -n "$new_ep"  ]] && args+=(endpoint "$new_ep")
+        wg "${args[@]}" && log "热更新成功"
+    fi
 }
 
-# ════════════════════════════════════════════════════════════
-# restore [DIR] <SQL文件>
-# ════════════════════════════════════════════════════════════
+cmd_remove_peer() {
+    require_conf
+    local PUB_KEY="$1"
+
+    header "移除 Peer"
+
+    if ! is_valid_pubkey "$PUB_KEY"; then
+        warn "公钥格式不合法（需 44 位 Base64）"; return 1
+    fi
+
+    if ! grep -qF "PublicKey = ${PUB_KEY}" "$WG_CONF"; then
+        warn "未找到该 Peer"; return 1
+    fi
+
+    _backup_conf
+
+    awk -v target="$PUB_KEY" '
+        BEGIN { in_peer=0; block=""; found=0 }
+        /^\[Peer\]/ {
+            if (in_peer && !found) printf "%s", block;
+            in_peer=1; block=$0 "\n"; found=0; next
+        }
+        /^\[/ && !/^\[Peer\]/ {
+            if (in_peer && !found) printf "%s", block;
+            in_peer=0; print; next
+        }
+        in_peer {
+            block = block $0 "\n"
+            split($0, kv, /[[:space:]]*=[[:space:]]*/);
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", kv[1])
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", kv[2])
+            if (kv[1] == "PublicKey" && kv[2] == target) found=1
+        }
+        !in_peer { print }
+        END { if (in_peer && !found) printf "%s", block }
+    ' "$WG_CONF" > "${WG_CONF}.tmp" && mv "${WG_CONF}.tmp" "$WG_CONF"
+
+    log "Peer 已从配置移除"
+    if _iface_is_up; then
+        wg set "${WG_IFACE}" peer "$PUB_KEY" remove 2>/dev/null && log "热移除成功"
+    fi
+}
+
+cmd_up() {
+    require_conf
+    header "启动 ${WG_IFACE}"
+
+    _stop_iface_safe
+
+    if _has_systemd; then
+        systemctl enable --now "wg-quick@${WG_IFACE}"
+    else
+        wg-quick up "$WG_CONF"
+    fi
+
+    if _iface_is_up; then
+        log "${WG_IFACE} 已成功启动（已设开机自启）"
+    else
+        error "启动失败，请检查配置或内核支持"
+    fi
+}
+
+cmd_down() {
+    header "停止 ${WG_IFACE}"
+    _stop_iface_safe
+    log "${WG_IFACE} 已停止（已取消开机自启）"
+}
+
+cmd_restart() {
+    require_conf
+    header "重启 ${WG_IFACE}"
+    _stop_iface_safe
+    cmd_up
+}
+
+cmd_export() {
+    require_conf
+    require_key
+    header "导出本机节点信息"
+
+    local pub_key wg_addr pub_ip
+    pub_key=$(cat "$PUB_KEY_FILE")
+    wg_addr=$(awk '/^[[:space:]]*Address[[:space:]]*=/{print $3}' "$WG_CONF")
+    pub_ip=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || \
+             curl -sf --max-time 5 https://ifconfig.me  2>/dev/null || \
+             echo "（获取失败，请手动填写）")
+
+    printf "\n"
+    printf "  ┌─────────────────────────────────────────────────────┐\n"
+    printf "  │  本机节点信息（提供给对端以添加此节点）             │\n"
+    printf "  ├─────────────────────────────────────────────────────┤\n"
+    printf "  │  PublicKey : %s\n" "$pub_key"
+    printf "  │  WG Addr   : %s\n" "$wg_addr"
+    printf "  │  Endpoint  : %s:%s\n" "$pub_ip" "$WG_PORT"
+    printf "  └─────────────────────────────────────────────────────┘\n\n"
+
+    printf "  对端添加此节点的配置模板：\n\n"
+    printf "  [Peer]\n"
+    printf "  PublicKey           = %s\n" "$pub_key"
+    printf "  AllowedIPs          = %s\n" "$wg_addr"
+    printf "  Endpoint            = %s:%s\n" "$pub_ip" "$WG_PORT"
+    printf "  PersistentKeepalive = 25\n\n"
+
+    if command -v qrencode &>/dev/null; then
+        info "生成二维码（移动端扫码用）..."
+        printf "[Peer]\nPublicKey = %s\nAllowedIPs = %s\nEndpoint = %s:%s\nPersistentKeepalive = 25\n" \
+            "$pub_key" "$wg_addr" "$pub_ip" "$WG_PORT" | qrencode -t ansiutf8
+    else
+        info "提示: 安装 qrencode 后可生成二维码 (apt install qrencode)"
+    fi
+}
+
+cmd_backup() {
+    header "备份配置"
+    mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR"
+
+    local outfile="${BACKUP_DIR}/wg-backup-$(date +%Y%m%d_%H%M%S).tar.gz"
+    local files=()
+    [[ -d "$WG_DIR" ]] && files+=("etc/wireguard")
+    [[ -f /etc/sysctl.d/99-wireguard.conf ]] && files+=("etc/sysctl.d/99-wireguard.conf")
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        warn "没有可备份的内容"; return 1
+    fi
+
+    tar -czf "$outfile" -C / "${files[@]}" 2>/dev/null || true
+    chmod 600 "$outfile"
+    log "备份完成: $outfile"
+    info "备份目录: $BACKUP_DIR"
+}
+
 cmd_restore() {
-    local DIR="${1:-$DEFAULT_DIR}"
-    local SQL_FILE="${2:?用法: restore [DIR] <SQL文件(.sql 或 .sql.gz)>}"
+    header "恢复配置"
+    mkdir -p "$BACKUP_DIR"
 
-    load_env "$DIR"
-    [[ -f "$SQL_FILE" ]] || error "文件不存在: ${SQL_FILE}"
+    local -a backups
+    mapfile -t backups < <(ls -t "${BACKUP_DIR}"/wg-backup-*.tar.gz 2>/dev/null || true)
 
-    local DB_NAME
-    DB_NAME=$(basename "$SQL_FILE" | sed 's/_[0-9]\{8\}_[0-9]\{6\}\.sql\.gz$//' | sed 's/\.sql\.gz$//' | sed 's/\.sql$//')
-    warn "将恢复到库: ${DB_NAME}"
-    read -rp "确认? [y/N] " CONFIRM
-    [[ "${CONFIRM,,}" == "y" ]] || { info "已取消"; return; }
-
-    mariadb_exec "$DIR" -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-
-    if [[ "$SQL_FILE" == *.gz ]]; then
-        zcat "$SQL_FILE" | dc "$DIR" exec -T db \
-            mariadb -uroot -p"${MARIADB_ROOT_PASSWORD}" "${DB_NAME}"
+    if [[ ${#backups[@]} -eq 0 ]]; then
+        warn "未找到备份文件 (${BACKUP_DIR}/wg-backup-*.tar.gz)"
+        local custom
+        _ask "请手动输入备份文件路径" custom ""
+        [[ -f "$custom" ]] || { warn "文件不存在: $custom"; return 1; }
+        backups=("$custom")
     else
-        dc "$DIR" exec -T db \
-            mariadb -uroot -p"${MARIADB_ROOT_PASSWORD}" "${DB_NAME}" < "$SQL_FILE"
+        local i=1
+        for f in "${backups[@]}"; do
+            printf "  %d. %s\n" "$i" "$(basename "$f")"
+            (( i++ ))
+        done
+        echo
+        local sel
+        _ask "选择序号" sel "1"
+        [[ "$sel" =~ ^[0-9]+$ ]] && (( 10#$sel >= 1 && 10#$sel <= ${#backups[@]} )) || { warn "无效序号"; return 1; }
+        backups=("${backups[$((10#$sel-1))]}")
     fi
 
-    log "恢复完成: ${DB_NAME}"
+    local target="${backups[0]}"
+    warn "将从 $(basename "$target") 恢复，当前配置将被覆盖"
+    local _confirm
+    read -r -t 30 -p "  确认? [y/N] " _confirm || true
+    [[ "${_confirm,,}" == "y" ]] || { info "已取消"; return 0; }
+
+    _stop_iface_safe
+    tar -xzf "$target" -C /
+    log "恢复完成"
+    info "请执行「启动接口」使配置生效"
 }
 
-# ════════════════════════════════════════════════════════════
-# status [DIR]
-# ════════════════════════════════════════════════════════════
-cmd_status() {
-    local DIR="${1:-$DEFAULT_DIR}"
-    load_env "$DIR"
-    header "服务状态"
-
-    dc "$DIR" ps
-
-    echo ""
-    header "MariaDB 连通性"
-    if dc "$DIR" exec -T db \
-            mariadb-admin -uroot -p"${MARIADB_ROOT_PASSWORD}" ping --silent 2>/dev/null; then
-        log "✓ MariaDB 响应正常"
-        mariadb_exec "$DIR" -e "SHOW STATUS LIKE 'Threads_connected';"
+cmd_monitor() {
+    require_conf
+    _iface_is_up || { warn "接口未运行，请先启动"; return 1; }
+    header "实时监控 ${WG_IFACE}（Ctrl+C 退出）"
+    if command -v watch &>/dev/null; then
+        watch -n 2 "wg show ${WG_IFACE}"
     else
-        warn "✗ MariaDB 无响应"
-    fi
-
-    echo ""
-    header "Redis 连通性"
-    if dc "$DIR" exec -T redis \
-            redis-cli -a "${REDIS_PASSWORD}" ping 2>/dev/null | grep -q PONG; then
-        log "✓ Redis 响应正常"
-        dc "$DIR" exec -T redis \
-            redis-cli -a "${REDIS_PASSWORD}" info server 2>/dev/null \
-            | grep -E "redis_version|used_memory_human|connected_clients"
-    else
-        warn "✗ Redis 无响应"
+        while true; do
+            clear
+            header "实时监控 ${WG_IFACE}"
+            wg show "${WG_IFACE}" || true
+            sleep 2
+        done
     fi
 }
 
-# ════════════════════════════════════════════════════════════
-# stop / start / logs
-# ════════════════════════════════════════════════════════════
-cmd_stop()  { dc "${1:-$DEFAULT_DIR}" stop; }
-cmd_start() { dc "${1:-$DEFAULT_DIR}" up -d; }
-cmd_logs()  {
-    local DIR="${1:-$DEFAULT_DIR}"
-    local SVC="${2:?用法: logs [DIR] <db|redis>}"
-    dc "$DIR" logs -f --tail=100 "$SVC"
+# ═══════════════════════════════════════════════════════════
+# 辅助工具函数
+# ═══════════════════════════════════════════════════════════
+
+_iface_is_up() {
+    ip link show "${WG_IFACE}" &>/dev/null
 }
 
-# ════════════════════════════════════════════════════════════
-# 交互菜单
-# ════════════════════════════════════════════════════════════
+_stop_iface_safe() {
+    if _has_systemd; then
+        systemctl disable --now "wg-quick@${WG_IFACE}" 2>/dev/null || true
+        systemctl reset-failed "wg-quick@${WG_IFACE}" 2>/dev/null || true
+    fi
+    if ip link show "${WG_IFACE}" &>/dev/null; then
+        wg-quick down "${WG_IFACE}" 2>/dev/null || ip link delete "${WG_IFACE}" 2>/dev/null || true
+    fi
+}
 
-_pause() { echo; read -rp "  按 Enter 返回菜单..." _; }
+_backup_conf() {
+    local bak="${WG_CONF}.bak.$(date +%Y%m%d_%H%M%S).$$"
+    cp "$WG_CONF" "$bak"
+    chmod 600 "$bak"
+    info "配置已备份: $bak"
+}
 
 _ask() {
-    local PROMPT="$1" VAR="$2" DEFAULT="${3:-}"
-    local HINT=""
-    [[ -n "$DEFAULT" ]] && HINT=" [默认: ${DEFAULT}]"
-    read -rp "  ${PROMPT}${HINT}: " "$VAR"
-    if [[ -z "${!VAR}" && -n "$DEFAULT" ]]; then
-        printf -v "$VAR" '%s' "$DEFAULT"
+    local prompt="$1" varname="$2" default="${3:-}" val hint=""
+    [[ -n "$default" ]] && hint=" [默认: ${default}]"
+    if ! read -r -t 120 -p "  ${prompt}${hint}: " val; then
+        echo
+        error "输入超时（120s），已退出"
     fi
+    printf -v "$varname" '%s' "${val:-$default}"
 }
+
+_pause() { echo; read -r -t 300 -p "  按 Enter 返回主菜单..." _ || true; }
+
+# ═══════════════════════════════════════════════════════════
+# 交互菜单
+# ═══════════════════════════════════════════════════════════
 
 _menu_header() {
     clear
-    echo
-    _c "1;34" "╔══════════════════════════════════════════════════╗"
-    _c "1;34" "║      infra-shared  —  共享 MariaDB + Redis       ║"
-    _c "1;34" "╚══════════════════════════════════════════════════╝"
-    echo
+    printf "\n${C_BOLD}"
+    echo "  ╔══════════════════════════════════════════════════════╗"
+    echo "  ║      WireGuard Mesh Panel v3.2 - 交互式管控台       ║"
+    echo "  ╚══════════════════════════════════════════════════════╝"
+    printf "${C_RESET}\n"
+
+    local key_disp conf_disp wg_disp peer_count
+    [[ -f "$PUB_KEY_FILE" ]] && key_disp="$(cut -c1-20 "$PUB_KEY_FILE")..." || key_disp="（未生成）"
+    if [[ -f "$WG_CONF" ]]; then
+        peer_count=$(grep -c '^\[Peer\]' "$WG_CONF" 2>/dev/null || echo 0)
+        conf_disp="${WG_CONF} (${peer_count} peers)"
+    else
+        conf_disp="（未初始化）"
+    fi
+    _iface_is_up && wg_disp="${C_OK}运行中 ✓${C_RESET}" || wg_disp="${C_WARN}已停止${C_RESET}"
+
+    printf "  本机公钥: ${C_INFO}%s${C_RESET}\n" "$key_disp"
+    printf "  配置文件: ${C_INFO}%s${C_RESET}\n" "$conf_disp"
+    printf "  接口状态: %b\n\n" "$wg_disp"
+}
+
+_run() {
+    local title="$1"; shift
+    _menu_header
+    printf "  ${C_WARN}▶ %s${C_RESET}\n\n" "$title"
+    "$@" || true
+    _pause
 }
 
 menu_main() {
+    require_root
     while true; do
         _menu_header
-        echo "  1)  部署共享基础设施（MariaDB + Redis）"
-        echo "  2)  查看服务状态"
-        echo "  3)  启动服务"
-        echo "  4)  停止服务"
-        echo "  ─────────────────────────────────────────"
-        echo "  5)  数据库管理 ▶"
-        echo "  6)  备份 / 恢复 ▶"
-        echo "  7)  查看日志"
-        echo "  ─────────────────────────────────────────"
-        echo "  0)  退出"
+        echo "  [ 安装管理 ]"
+        echo "  1.  安装 WireGuard"
+        echo "  2.  更新 WireGuard"
+        echo "  3.  卸载 WireGuard"
+        echo "  "
+        echo "  [ 本机配置 ]"
+        echo "  4.  生成密钥对"
+        echo "  5.  初始化网络配置"
+        echo "  6.  查看/导出本机节点信息"
+        echo "  "
+        echo "  [ 节点管控 ]"
+        echo "  7.  添加对端节点"
+        echo "  8.  编辑对端节点"
+        echo "  9.  移除对端节点"
+        echo "  10. 列出所有节点"
+        echo "  "
+        echo "  [ 启停控制 ]"
+        echo "  11. 启动接口"
+        echo "  12. 重启接口"
+        echo "  13. 停止接口"
+        echo "  14. 实时流量监控"
+        echo "  "
+        echo "  [ 备份恢复 ]"
+        echo "  15. 备份配置"
+        echo "  16. 恢复配置"
+        echo "  "
+        echo "  0.  退出面板"
         echo
-        read -rp "  请选择 [0-7]: " CHOICE
+        local CHOICE
+        read -r -t 300 -p "  请输入序号选择: " CHOICE || { echo; continue; }
         case "$CHOICE" in
-            1) menu_deploy   ;;
-            2) menu_status   ;;
-            3) menu_start    ;;
-            4) menu_stop     ;;
-            5) menu_db       ;;
-            6) menu_backup   ;;
-            7) menu_logs     ;;
-            0) echo; info "再见！"; exit 0 ;;
-            *) warn "无效选项，请重新输入"; sleep 1 ;;
+            1)  _run "安装 WireGuard"     cmd_install ;;
+            2)  _run "更新 WireGuard"     cmd_update ;;
+            3)  _run "卸载 WireGuard"     cmd_uninstall ;;
+            4)  _run "生成密钥对"         cmd_genkey ;;
+            5)
+                _menu_header
+                local MY_IP
+                _ask "请输入本机 WG IP (如 10.10.0.1/24 或 fd00::1/64)" MY_IP ""
+                # 修复：加入 is_valid_ipv6
+                if is_valid_cidr "$MY_IP" || is_valid_ipv4 "$MY_IP" || is_valid_ipv6 "$MY_IP"; then
+                    cmd_init "$MY_IP"
+                else
+                    warn "IP 格式错误: $MY_IP"
+                fi
+                _pause
+                ;;
+            6)  _run "导出本机节点信息"   cmd_export ;;
+            7)
+                _menu_header
+                local P_PK P_IP P_EP
+                _ask "对端公钥 (44字符 Base64)"                          P_PK ""
+                _ask "对端内网 IP/CIDR (如 10.10.0.2/32 或 fd00::2/128)" P_IP ""
+                _ask "对端 Endpoint (如 1.2.3.4:51820，无则回车跳过)"    P_EP ""
+                if [[ -n "$P_PK" && -n "$P_IP" ]]; then
+                    cmd_add_peer "$P_PK" "$P_IP" "$P_EP"
+                else
+                    warn "公钥和 IP 不能为空"
+                fi
+                _pause
+                ;;
+            8)  _run "编辑对端节点"       cmd_edit_peer ;;
+            9)
+                _menu_header
+                local RM_PK
+                _ask "要移除的对端公钥" RM_PK ""
+                if [[ -n "$RM_PK" ]]; then
+                    cmd_remove_peer "$RM_PK"
+                else
+                    warn "公钥不能为空"
+                fi
+                _pause
+                ;;
+            10) _run "节点列表"           wg show "${WG_IFACE}" ;;
+            11) _run "启动接口"           cmd_up ;;
+            12) _run "重启接口"           cmd_restart ;;
+            13) _run "停止接口"           cmd_down ;;
+            14) _run "实时流量监控"       cmd_monitor ;;
+            15) _run "备份配置"           cmd_backup ;;
+            16) _run "恢复配置"           cmd_restore ;;
+            0)  echo; exit 0 ;;
+            *)  ;;
         esac
     done
 }
 
-menu_deploy() {
-    _menu_header
-    _c "1;33" "  ▶ 部署共享基础设施"
-    echo
-
-    local AUTO_IP=""
-    if ip link show "${WG_IFACE}" &>/dev/null; then
-        AUTO_IP=$(ip addr show "${WG_IFACE}" \
-            | awk '/inet /{gsub(/\/.*/, "", $2); print $2; exit}')
-    fi
-
-    if [[ -z "$AUTO_IP" ]]; then
-        warn "${WG_IFACE} 接口未检测到，请确认 WireGuard 已启动"
-        warn "也可手动输入 WireGuard IP 强制继续"
-        echo
-    fi
-
-    _ask "部署目录" DIR "$DEFAULT_DIR"
-    _ask "WireGuard IP" WG_IP "${AUTO_IP}"
-
-    if [[ -z "$WG_IP" ]]; then
-        warn "WireGuard IP 不能为空，已取消"
-        _pause; return
-    fi
-
-    echo
-    warn "即将部署到 ${DIR}，WireGuard IP: ${WG_IP}"
-    read -rp "  确认继续? [y/N] " C
-    [[ "${C,,}" == "y" ]] || { info "已取消"; _pause; return; }
-    echo
-    cmd_deploy "$DIR" "$WG_IP"
-    _pause
-}
-
-menu_status() {
-    _menu_header
-    _ask "部署目录" DIR "$DEFAULT_DIR"
-    echo
-    cmd_status "$DIR"
-    _pause
-}
-
-menu_start() {
-    _menu_header
-    _ask "部署目录" DIR "$DEFAULT_DIR"
-    echo
-    cmd_start "$DIR"
-    _pause
-}
-
-menu_stop() {
-    _menu_header
-    _ask "部署目录" DIR "$DEFAULT_DIR"
-    echo
-    warn "即将停止 ${DIR} 下的所有服务"
-    read -rp "  确认? [y/N] " C
-    [[ "${C,,}" == "y" ]] || { info "已取消"; _pause; return; }
-    cmd_stop "$DIR"
-    _pause
-}
-
-menu_logs() {
-    _menu_header
-    _c "1;33" "  ▶ 查看日志"
-    echo
-    _ask "部署目录" DIR "$DEFAULT_DIR"
-    echo "  1) MariaDB 日志"
-    echo "  2) Redis 日志"
-    echo
-    read -rp "  请选择 [1-2]: " C
-    local SVC
-    case "$C" in
-        1) SVC="db"    ;;
-        2) SVC="redis" ;;
-        *) warn "无效选项"; _pause; return ;;
-    esac
-    info "Ctrl+C 退出日志查看"
-    echo
-    cmd_logs "$DIR" "$SVC" || true
-    _pause
-}
-
-menu_db() {
-    while true; do
-        _menu_header
-        _c "1;33" "  ▶ 数据库管理"
-        echo
-        echo "  1)  新建数据库和用户"
-        echo "  2)  删除数据库和用户"
-        echo "  3)  列出所有数据库 / 用户"
-        echo "  4)  修改用户密码"
-        echo "  0)  ← 返回上级"
-        echo
-        read -rp "  请选择 [0-4]: " C
-        case "$C" in
-            1) menu_db_add    ;;
-            2) menu_db_del    ;;
-            3) menu_db_list   ;;
-            4) menu_db_passwd ;;
-            0) return ;;
-            *) warn "无效选项"; sleep 1 ;;
-        esac
-    done
-}
-
-menu_db_add() {
-    _menu_header
-    _c "1;33" "  ▶ 新建数据库和用户"
-    echo
-    _ask "部署目录" DIR "$DEFAULT_DIR"
-    _ask "数据库名称" DB_NAME ""
-    [[ -n "$DB_NAME" ]] || { warn "数据库名不能为空"; _pause; return; }
-    _ask "用户名" DB_USER ""
-    [[ -n "$DB_USER" ]] || { warn "用户名不能为空"; _pause; return; }
-    local AUTO_PW; AUTO_PW=$(randpw)
-    _ask "密码" DB_PW "$AUTO_PW"
-    echo
-    cmd_add_db "$DIR" "$DB_NAME" "$DB_USER" "$DB_PW"
-    _pause
-}
-
-menu_db_del() {
-    _menu_header
-    _c "1;33" "  ▶ 删除数据库和用户"
-    echo
-    _ask "部署目录" DIR "$DEFAULT_DIR"
-    info "当前数据库列表："
-    cmd_list_db "$DIR" 2>/dev/null || true
-    echo
-    _ask "要删除的数据库名" DB_NAME ""
-    _ask "要删除的用户名"   DB_USER ""
-    [[ -n "$DB_NAME" && -n "$DB_USER" ]] || { warn "名称不能为空"; _pause; return; }
-    echo
-    cmd_del_db "$DIR" "$DB_NAME" "$DB_USER"
-    _pause
-}
-
-menu_db_list() {
-    _menu_header
-    _ask "部署目录" DIR "$DEFAULT_DIR"
-    echo
-    cmd_list_db "$DIR"
-    _pause
-}
-
-menu_db_passwd() {
-    _menu_header
-    _c "1;33" "  ▶ 修改用户密码"
-    echo
-    _ask "部署目录" DIR "$DEFAULT_DIR"
-    _ask "用户名"   DB_USER ""
-    _ask "新密码（留空自动生成）" NEW_PW "$(randpw)"
-    [[ -n "$DB_USER" ]] || { warn "用户名不能为空"; _pause; return; }
-    echo
-    cmd_passwd "$DIR" "$DB_USER" "$NEW_PW"
-    _pause
-}
-
-menu_backup() {
-    while true; do
-        _menu_header
-        _c "1;33" "  ▶ 备份 / 恢复"
-        echo
-        echo "  1)  备份所有数据库"
-        echo "  2)  恢复单个库（从 .sql/.sql.gz 文件）"
-        echo "  0)  ← 返回上级"
-        echo
-        read -rp "  请选择 [0-2]: " C
-        case "$C" in
-            1) menu_backup_run  ;;
-            2) menu_restore_run ;;
-            0) return ;;
-            *) warn "无效选项"; sleep 1 ;;
-        esac
-    done
-}
-
-menu_backup_run() {
-    _menu_header
-    _c "1;33" "  ▶ 备份所有数据库"
-    echo
-    _ask "部署目录" DIR "$DEFAULT_DIR"
-    _ask "备份输出目录" DEST "${DIR}/backup"
-    echo
-    cmd_backup "$DIR" "$DEST"
-    _pause
-}
-
-menu_restore_run() {
-    _menu_header
-    _c "1;33" "  ▶ 恢复数据库"
-    echo
-    _ask "部署目录" DIR "$DEFAULT_DIR"
-    _ask "SQL 文件路径（.sql 或 .sql.gz）" SQL_FILE ""
-    [[ -n "$SQL_FILE" ]] || { warn "路径不能为空"; _pause; return; }
-    echo
-    cmd_restore "$DIR" "$SQL_FILE"
-    _pause
-}
-
-# ── 入口（唯一） ─────────────────────────────────────────────
-main() {
-    if [[ $# -eq 0 ]]; then
-        menu_main
-        return
-    fi
-
-    local CMD="$1"; shift
-
-    case "$CMD" in
-        deploy)   cmd_deploy  "$@" ;;
-        add-db)   cmd_add_db  "$@" ;;
-        del-db)   cmd_del_db  "$@" ;;
-        list-db)  cmd_list_db "$@" ;;
-        passwd)   cmd_passwd  "$@" ;;
-        backup)   cmd_backup  "$@" ;;
-        restore)  cmd_restore "$@" ;;
-        status)   cmd_status  "$@" ;;
-        stop)     cmd_stop    "$@" ;;
-        start)    cmd_start   "$@" ;;
-        logs)     cmd_logs    "$@" ;;
-        help|--help|-h)
-            grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \{0,2\}//'
-            ;;
-        *) error "未知子命令: ${CMD}，执行 help 查看用法" ;;
-    esac
-}
-
-main "$@"
+menu_main
