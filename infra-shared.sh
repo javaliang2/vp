@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# wireguard-mesh.sh — WireGuard 纯交互式组网管理面板 v3.3
-# 修复：
-#   - 配置注入防护（sanitize_wg_value）
-#   - IPv6 缩写支持（重写 is_valid_ipv6）
-#   - 逗号分隔 IP 的空格处理
-#   - 导出双栈 Address 完整性
-#   - 编辑 Peer 时的输入校验
+# wireguard-mesh.sh — WireGuard 纯交互式组网管理面板 v3.4
 # ============================================================
 set -euo pipefail
 
@@ -52,9 +46,9 @@ sanitize_wg_value() {
     local val="$1"
     # 移除所有换行、回车、制表符
     val="${val//[$'\n'$'\r'$'\t']/}"
-    # 拒绝含段标记和等号注入的输入（安全边界）
-    if [[ "$val" =~ [\[\]=] ]]; then
-        warn "输入包含非法字符 [ ] = ，已拒绝"
+    # 拒绝含段标记注入的输入（安全边界，放行等号 = 避免误伤 Base64 密钥）
+    if [[ "$val" =~ [\[\]] ]]; then
+        warn "输入包含非法字符 [ 或 ]，已拒绝"
         return 1
     fi
     printf '%s' "$val"
@@ -135,7 +129,7 @@ is_valid_pubkey() {
 
 # ── systemd 可用性检测 ──────────────────────────────────────
 _has_systemd() {
-    # 修复：仅通过目录判断 systemd 接管状态，规避 degraded 误判
+    # 仅通过目录判断 systemd 接管状态，规避 degraded 误判
     [[ -d /run/systemd/system ]] && command -v systemctl &>/dev/null
 }
 
@@ -282,7 +276,7 @@ cmd_init() {
 
     local WG_ADDR=""
 
-    # 修复：安全解析双栈 IP (10.0.0.1,fd00::1) 分别补全 CIDR
+    # 安全解析双栈 IP 分别补全 CIDR
     local ips
     IFS=',' read -ra ips <<< "$RAW_IP"
     for ip in "${ips[@]}"; do
@@ -292,7 +286,7 @@ cmd_init() {
         [[ -z "$ip" ]] && continue
         if [[ "$ip" != */* ]]; then
             if [[ "$ip" == *:* ]]; then
-                ip="${ip}/128"
+                ip="${ip}/64"   # 调整为 /64 以适配 Mesh 网段路由
             else
                 ip="${ip}/24"
             fi
@@ -375,7 +369,6 @@ cmd_add_peer() {
     if ! is_valid_pubkey "$PUB_KEY"; then
         warn "公钥格式不合法（需 44 位 Base64）"; return 1
     fi
-    # 修复：加入 is_valid_ipv6，防止合法的纯 IPv6 被错误拒绝
     if ! is_valid_cidr "$ALLOWED_IPS" && ! is_valid_ipv4 "$ALLOWED_IPS" && ! is_valid_ipv6 "$ALLOWED_IPS"; then
         warn "AllowedIPs 格式不合法: $ALLOWED_IPS"; return 1
     fi
@@ -551,11 +544,11 @@ cmd_up() {
     _stop_iface_safe
 
     if _has_systemd; then
-        # 检查服务文件是否存在，防止容器等环境误用
-        if systemctl list-unit-files 'wg-quick@.service' &>/dev/null; then
+        # 通过 systemctl cat 探测模板或实例是否存在，比 list-unit-files 兼容性更好
+        if systemctl cat "wg-quick@${WG_IFACE}" &>/dev/null; then
             systemctl enable --now "wg-quick@${WG_IFACE}"
         else
-            warn "未检测到 wg-quick@.service，使用 wg-quick up 启动（可能无法开机自启）"
+            warn "未检测到对应 systemd 服务单元，使用 wg-quick up 启动（可能无法开机自启）"
             wg-quick up "$WG_CONF"
         fi
     else
@@ -589,7 +582,6 @@ cmd_export() {
 
     local pub_key wg_addr pub_ip
     pub_key=$(cat "$PUB_KEY_FILE")
-    # 修复：完整提取 Address 值（支持双栈逗号分隔）
     wg_addr=$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*Address/{print $2; exit}' "$WG_CONF")
     pub_ip=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || \
              curl -sf --max-time 5 https://ifconfig.me  2>/dev/null || \
@@ -739,7 +731,7 @@ _menu_header() {
     clear
     printf "\n${C_BOLD}"
     echo "  ╔══════════════════════════════════════════════════════╗"
-    echo "  ║      WireGuard Mesh Panel v3.3 - 交互式管控台       ║"
+    echo "  ║      WireGuard Mesh Panel v3.4 - 交互式管控台       ║"
     echo "  ╚══════════════════════════════════════════════════════╝"
     printf "${C_RESET}\n"
 
@@ -809,7 +801,6 @@ menu_main() {
                 _menu_header
                 local MY_IP
                 _ask "请输入本机 WG IP (如 10.10.0.1/24 或 fd00::1/64)" MY_IP ""
-                # 修复：加入 is_valid_ipv6
                 if is_valid_cidr "$MY_IP" || is_valid_ipv4 "$MY_IP" || is_valid_ipv6 "$MY_IP"; then
                     cmd_init "$MY_IP"
                 else
