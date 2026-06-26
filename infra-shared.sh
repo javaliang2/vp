@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # ============================================================
-# wireguard-mesh.sh — WireGuard 纯交互式组网管理面板 v3.2
+# wireguard-mesh.sh — WireGuard 纯交互式组网管理面板 v3.3
+# 修复：
+#   - 配置注入防护（sanitize_wg_value）
+#   - IPv6 缩写支持（重写 is_valid_ipv6）
+#   - 逗号分隔 IP 的空格处理
+#   - 导出双栈 Address 完整性
+#   - 编辑 Peer 时的输入校验
 # ============================================================
 set -euo pipefail
 
@@ -41,6 +47,20 @@ require_key() {
     [[ -f "$PRIV_KEY_FILE" && -f "$PUB_KEY_FILE" ]] || error "密钥不存在，请先生成密钥对"
 }
 
+# ── 输入净化（防配置注入） ─────────────────────────────────
+sanitize_wg_value() {
+    local val="$1"
+    # 移除所有换行、回车、制表符
+    val="${val//[$'\n'$'\r'$'\t']/}"
+    # 拒绝含段标记和等号注入的输入（安全边界）
+    if [[ "$val" =~ [\[\]=] ]]; then
+        warn "输入包含非法字符 [ ] = ，已拒绝"
+        return 1
+    fi
+    printf '%s' "$val"
+    return 0
+}
+
 # ── 输入校验 ─────────────────────────────────────────────────
 is_valid_ipv4() {
     local ip="${1%%/*}"
@@ -55,8 +75,28 @@ is_valid_ipv4() {
 }
 
 is_valid_ipv6() {
-    local ip="${1%%/*}"
-    [[ "$ip" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]] || return 1
+    local ip="${1%%/*}"   # 去除可能的 /cidr
+    # 必须仅含十六进制字符、冒号，且格式基本合法
+    [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] || return 1
+    # 检查缩写的合法性：:: 最多一次，总段数不超过 8
+    local colons
+    colons=$(tr -cd ':' <<< "$ip")
+    if [[ "$ip" == *::* ]]; then
+        # 包含缩写，允许冒号数为 2~7 且 :: 只出现一次
+        [[ "$ip" == *::*::* ]] && return 1
+        [[ ${#colons} -ge 2 && ${#colons} -le 7 ]] || return 1
+    else
+        # 无缩写，必须正好 7 个冒号
+        [[ ${#colons} -eq 7 ]] || return 1
+    fi
+    # 每段不超过 4 位十六进制（检查非空段长度）
+    local IFS=':'
+    read -ra parts <<< "$ip"
+    for p in "${parts[@]}"; do
+        if [[ -n "$p" ]]; then
+            [[ ${#p} -le 4 ]] || return 1
+        fi
+    done
     return 0
 }
 
@@ -64,6 +104,10 @@ is_valid_cidr() {
     local ips
     IFS=',' read -ra ips <<< "$1"
     for current_ip in "${ips[@]}"; do
+        # Trim 前后空格
+        current_ip="${current_ip#"${current_ip%%[![:space:]]*}"}"
+        current_ip="${current_ip%"${current_ip##*[![:space:]]}"}"
+        [[ -z "$current_ip" ]] && continue
         local addr="${current_ip%%/*}"
         local mask="${current_ip##*/}"
         if [[ "$current_ip" == *:* ]]; then
@@ -187,7 +231,7 @@ cmd_uninstall() {
 
     local _pkg
     read -r -t 30 -p "  同时卸载 wireguard-tools 软件包? [y/N] " _pkg || true
-    if [[ "${_pkg,,}" == "y" ]]; then
+    if [[ "${_pkg}" =~ ^[Yy]$ ]]; then
         if command -v apt-get &>/dev/null; then
             apt-get remove -y wireguard wireguard-tools
         elif command -v dnf &>/dev/null; then
@@ -231,12 +275,21 @@ cmd_genkey() {
 cmd_init() {
     require_key
     local RAW_IP="$1"
+
+    # 净化输入（防换行注入）
+    RAW_IP=$(sanitize_wg_value "$RAW_IP") || { warn "IP 地址包含非法字符"; return 1; }
+    [[ -n "$RAW_IP" ]] || { warn "IP 地址不能为空"; return 1; }
+
     local WG_ADDR=""
 
     # 修复：安全解析双栈 IP (10.0.0.1,fd00::1) 分别补全 CIDR
     local ips
     IFS=',' read -ra ips <<< "$RAW_IP"
     for ip in "${ips[@]}"; do
+        # Trim 空格
+        ip="${ip#"${ip%%[![:space:]]*}"}"
+        ip="${ip%"${ip##*[![:space:]]}"}"
+        [[ -z "$ip" ]] && continue
         if [[ "$ip" != */* ]]; then
             if [[ "$ip" == *:* ]]; then
                 ip="${ip}/128"
@@ -247,6 +300,7 @@ cmd_init() {
         WG_ADDR+="${ip},"
     done
     WG_ADDR="${WG_ADDR%,}" # 移除末尾逗号
+    [[ -n "$WG_ADDR" ]] || { warn "解析后的 IP 地址为空"; return 1; }
 
     header "初始化 ${WG_IFACE} (${WG_ADDR})"
 
@@ -310,6 +364,11 @@ EOF
 cmd_add_peer() {
     require_conf
     local PUB_KEY="$1" ALLOWED_IPS="$2" ENDPOINT="${3:-}"
+
+    # 净化所有输入
+    PUB_KEY=$(sanitize_wg_value "$PUB_KEY") || return 1
+    ALLOWED_IPS=$(sanitize_wg_value "$ALLOWED_IPS") || return 1
+    [[ -n "$ENDPOINT" ]] && ENDPOINT=$(sanitize_wg_value "$ENDPOINT") || true
 
     header "添加 Peer: ${ALLOWED_IPS}"
 
@@ -389,8 +448,27 @@ cmd_edit_peer() {
     _ask "新 AllowedIPs (回车保留原值)" new_ips ""
     _ask "新 Endpoint   (回车保留原值)" new_ep  ""
 
+    # 净化并校验新值
+    [[ -n "$new_ips" ]] && new_ips=$(sanitize_wg_value "$new_ips") || true
+    [[ -n "$new_ep"  ]] && new_ep=$(sanitize_wg_value "$new_ep")   || true
+
     if [[ -z "$new_ips" && -z "$new_ep" ]]; then
         info "无修改"; return 0
+    fi
+
+    if [[ -n "$new_ips" ]]; then
+        if ! is_valid_cidr "$new_ips" && ! is_valid_ipv4 "$new_ips" && ! is_valid_ipv6 "$new_ips"; then
+            warn "新 AllowedIPs 格式不合法: $new_ips"; return 1
+        fi
+        if [[ "$new_ips" == "0.0.0.0/0" || "$new_ips" == "::/0" || "$new_ips" == "0.0.0.0/0,::/0" ]]; then
+            warn "AllowedIPs 设置为全路由，该 Peer 将接管本机所有出站流量！"
+            local _edit_confirm
+            read -r -t 30 -p "  确认继续? [y/N] " _edit_confirm || { echo; warn "输入超时，已取消"; return 1; }
+            [[ "${_edit_confirm,,}" == "y" ]] || { info "已取消"; return 0; }
+        fi
+    fi
+    if [[ -n "$new_ep" ]] && ! is_valid_endpoint "$new_ep"; then
+        warn "新 Endpoint 格式不合法: $new_ep"; return 1
     fi
 
     _backup_conf
@@ -473,7 +551,13 @@ cmd_up() {
     _stop_iface_safe
 
     if _has_systemd; then
-        systemctl enable --now "wg-quick@${WG_IFACE}"
+        # 检查服务文件是否存在，防止容器等环境误用
+        if systemctl list-unit-files 'wg-quick@.service' &>/dev/null; then
+            systemctl enable --now "wg-quick@${WG_IFACE}"
+        else
+            warn "未检测到 wg-quick@.service，使用 wg-quick up 启动（可能无法开机自启）"
+            wg-quick up "$WG_CONF"
+        fi
     else
         wg-quick up "$WG_CONF"
     fi
@@ -505,7 +589,8 @@ cmd_export() {
 
     local pub_key wg_addr pub_ip
     pub_key=$(cat "$PUB_KEY_FILE")
-    wg_addr=$(awk '/^[[:space:]]*Address[[:space:]]*=/{print $3}' "$WG_CONF")
+    # 修复：完整提取 Address 值（支持双栈逗号分隔）
+    wg_addr=$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*Address/{print $2; exit}' "$WG_CONF")
     pub_ip=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || \
              curl -sf --max-time 5 https://ifconfig.me  2>/dev/null || \
              echo "（获取失败，请手动填写）")
@@ -654,7 +739,7 @@ _menu_header() {
     clear
     printf "\n${C_BOLD}"
     echo "  ╔══════════════════════════════════════════════════════╗"
-    echo "  ║      WireGuard Mesh Panel v3.2 - 交互式管控台       ║"
+    echo "  ║      WireGuard Mesh Panel v3.3 - 交互式管控台       ║"
     echo "  ╚══════════════════════════════════════════════════════╝"
     printf "${C_RESET}\n"
 
