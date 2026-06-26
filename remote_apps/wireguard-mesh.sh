@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# wireguard-mesh.sh — WireGuard 纯交互式组网管理面板 v3.0
+# wireguard-mesh.sh — WireGuard 纯交互式组网管理面板 v3.1
 # ============================================================
 set -euo pipefail
 
@@ -49,7 +49,6 @@ is_valid_ipv4() {
     [[ ${#octets[@]} -eq 4 ]] || return 1
     for o in "${octets[@]}"; do
         [[ "$o" =~ ^[0-9]+$ ]] || return 1
-        # [FIX] 10# 强制十进制，避免 08/09 被当八进制导致语法错误
         (( 10#$o >= 0 && 10#$o <= 255 )) || return 1
     done
     return 0
@@ -57,19 +56,18 @@ is_valid_ipv4() {
 
 is_valid_ipv6() {
     local ip="${1%%/*}"
-    # 简单的 IPv6 格式检查（包含冒号且为合法的十六进制字符）
+    # 覆盖 ::、::1、fd00::1 等常见缩写形式
     [[ "$ip" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]] || return 1
     return 0
 }
 
 is_valid_cidr() {
-    # 支持双栈逗号分隔格式，例如 10.0.0.1/24,fd00::1/64
+    # 支持双栈逗号分隔，如 10.0.0.1/24,fd00::1/64
     local ips
     IFS=',' read -ra ips <<< "$1"
     for current_ip in "${ips[@]}"; do
         local addr="${current_ip%%/*}"
         local mask="${current_ip##*/}"
-        
         if [[ "$current_ip" == *:* ]]; then
             is_valid_ipv6 "$addr" || return 1
             [[ "$mask" =~ ^[0-9]+$ ]] && (( 10#$mask >= 0 && 10#$mask <= 128 )) || return 1
@@ -91,6 +89,13 @@ is_valid_endpoint() {
 
 is_valid_pubkey() {
     [[ "${#1}" -eq 44 ]] && [[ "$1" =~ ^[A-Za-z0-9+/]{43}=$ ]]
+}
+
+# ── systemd 可用性检测（供 cmd_up/_stop_iface_safe 共用）──────
+_has_systemd() {
+    # [FIX] 不用 --quiet+grep 管道（--quiet 无输出导致 grep 永远匹配）
+    # is-system-running 在 running/degraded 返回 0，offline/unknown 返回非零
+    command -v systemctl &>/dev/null && systemctl is-system-running &>/dev/null
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -163,17 +168,15 @@ cmd_uninstall() {
     # 2. 手动清除 iptables / ip6tables 残留
     local default_iface
     default_iface=$(ip route show default | awk '/default/{print $5}' | head -1 || echo "")
-    
-    # 清理 IPv4 残留
-    iptables -D INPUT -p udp --dport "${WG_PORT}" -j ACCEPT 2>/dev/null || true
+
+    iptables -D INPUT   -p udp --dport "${WG_PORT}" -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -i "${WG_IFACE}" -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -o "${WG_IFACE}" -j ACCEPT 2>/dev/null || true
     if [[ -n "$default_iface" ]]; then
         iptables -t nat -D POSTROUTING -o "${default_iface}" -j MASQUERADE 2>/dev/null || true
     fi
 
-    # 清理 IPv6 残留
-    if command -v ip6tables &>/dev/null; then
+    if which ip6tables >/dev/null 2>&1; then
         ip6tables -D FORWARD -i "${WG_IFACE}" -j ACCEPT 2>/dev/null || true
         ip6tables -D FORWARD -o "${WG_IFACE}" -j ACCEPT 2>/dev/null || true
         if [[ -n "$default_iface" ]]; then
@@ -236,10 +239,15 @@ cmd_genkey() {
 cmd_init() {
     require_key
     local RAW_IP="$1"
-    local WG_ADDR="$RAW_IP"
-    # 若输入未带子网掩码，默认补充 /24 (若包含 IPv6 则必须自带掩码)
-    if [[ "$RAW_IP" != */* && "$RAW_IP" != *:* ]]; then
-        WG_ADDR="${RAW_IP}/24"
+    local WG_ADDR
+
+    # [FIX] IPv4/IPv6 分别补默认掩码，避免 wg-quick 因无掩码报错
+    if [[ "$RAW_IP" == */* ]]; then
+        WG_ADDR="$RAW_IP"
+    elif [[ "$RAW_IP" == *:* ]]; then
+        WG_ADDR="${RAW_IP}/128"   # IPv6 单主机
+    else
+        WG_ADDR="${RAW_IP}/24"    # IPv4 默认 /24
     fi
 
     header "初始化 ${WG_IFACE} (${WG_ADDR})"
@@ -262,7 +270,7 @@ cmd_init() {
     mkdir -p "$WG_DIR"
     chmod 700 "$WG_DIR"
 
-    # ip_forward 开启双栈持久化
+    # 双栈 ip_forward 持久化
     cat > /etc/sysctl.d/99-wireguard.conf <<EOF
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
@@ -274,7 +282,7 @@ EOF
     tmp=$(mktemp "${WG_DIR}/.wg_conf.XXXXXX")
     chmod 600 "$tmp"
 
-    # 写入配置：包含 INPUT 放行、IPv4 转发、IPv6 转发兜底
+    # [FIX] PostUp/PostDown 中 IPv6 检测改用 which，兼容 wg-quick 的 /bin/sh 执行环境
     cat > "$tmp" <<EOF
 [Interface]
 Address = ${WG_ADDR}
@@ -293,13 +301,13 @@ PostDown = iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true
 PostDown = iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null || true
 PostDown = iptables -t nat -D POSTROUTING -o ${default_iface} -j MASQUERADE 2>/dev/null || true
 
-# 3. IPv6 转发与 NAT (如果系统支持 ip6tables)
-PostUp   = command -v ip6tables &>/dev/null && (ip6tables -C FORWARD -i %i -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i %i -j ACCEPT) || true
-PostUp   = command -v ip6tables &>/dev/null && (ip6tables -C FORWARD -o %i -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -o %i -j ACCEPT) || true
-PostUp   = command -v ip6tables &>/dev/null && (ip6tables -t nat -C POSTROUTING -o ${default_iface} -j MASQUERADE 2>/dev/null || ip6tables -t nat -A POSTROUTING -o ${default_iface} -j MASQUERADE) || true
-PostDown = command -v ip6tables &>/dev/null && ip6tables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true
-PostDown = command -v ip6tables &>/dev/null && ip6tables -D FORWARD -o %i -j ACCEPT 2>/dev/null || true
-PostDown = command -v ip6tables &>/dev/null && ip6tables -t nat -D POSTROUTING -o ${default_iface} -j MASQUERADE 2>/dev/null || true
+# 3. IPv6 转发与 NAT（which 兼容 /bin/sh，command -v 不可靠）
+PostUp   = which ip6tables >/dev/null 2>&1 && (ip6tables -C FORWARD -i %i -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i %i -j ACCEPT) || true
+PostUp   = which ip6tables >/dev/null 2>&1 && (ip6tables -C FORWARD -o %i -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -o %i -j ACCEPT) || true
+PostUp   = which ip6tables >/dev/null 2>&1 && (ip6tables -t nat -C POSTROUTING -o ${default_iface} -j MASQUERADE 2>/dev/null || ip6tables -t nat -A POSTROUTING -o ${default_iface} -j MASQUERADE) || true
+PostDown = which ip6tables >/dev/null 2>&1 && ip6tables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true
+PostDown = which ip6tables >/dev/null 2>&1 && ip6tables -D FORWARD -o %i -j ACCEPT 2>/dev/null || true
+PostDown = which ip6tables >/dev/null 2>&1 && ip6tables -t nat -D POSTROUTING -o ${default_iface} -j MASQUERADE 2>/dev/null || true
 EOF
 
     mv "$tmp" "$WG_CONF"
@@ -329,7 +337,6 @@ cmd_add_peer() {
         [[ "${_fullroute_confirm,,}" == "y" ]] || { info "已取消"; return 0; }
     fi
 
-    # [FIX] grep -F 固定字符串，公钥中的 +/= 不被正则解释
     if grep -qF "PublicKey = ${PUB_KEY}" "$WG_CONF"; then
         warn "该 Peer 公钥已存在"; return 0
     fi
@@ -357,9 +364,9 @@ cmd_edit_peer() {
     require_conf
     header "编辑 Peer"
 
-    # 列出所有 Peer 公钥
     local -a keys
     mapfile -t keys < <(awk '
+        BEGIN { in_peer=0 }
         /^\[Peer\]/ { in_peer=1; next }
         /^\[/       { in_peer=0 }
         in_peer && /^[[:space:]]*PublicKey[[:space:]]*=/ {
@@ -394,10 +401,10 @@ cmd_edit_peer() {
 
     _backup_conf
 
-    # awk 原地修改目标 Peer 块，字符串比较避免正则特殊字符问题
+    # [FIX] BEGIN 初始化 in_peer，字符串比较规避公钥特殊字符
     awk -v target="$target_key" -v new_ips="$new_ips" -v new_ep="$new_ep" '
-        BEGIN { in_target=0 }
-        /^\[/ { in_target=0 }
+        BEGIN { in_target=0; in_peer=0 }
+        /^\[/ { in_target=0; in_peer=0 }
         /^\[Peer\]/ { in_peer=1; print; next }
         in_peer && /^[[:space:]]*PublicKey[[:space:]]*=/ {
             split($0, kv, /[[:space:]]*=[[:space:]]*/);
@@ -429,20 +436,16 @@ cmd_remove_peer() {
 
     header "移除 Peer"
 
-    # [FIX] 加入公钥格式校验，防止空字符串误匹配删除任意 Peer
     if ! is_valid_pubkey "$PUB_KEY"; then
         warn "公钥格式不合法（需 44 位 Base64）"; return 1
     fi
 
-    # [FIX] grep -F 固定字符串匹配，公钥中 +/= 不被正则解释
     if ! grep -qF "PublicKey = ${PUB_KEY}" "$WG_CONF"; then
         warn "未找到该 Peer"; return 1
     fi
 
     _backup_conf
 
-    # [FIX] awk 改用字符串比较（split），彻底规避正则特殊字符
-    # [FIX] /^\[/ 匹配所有 section 头，不仅限于 [Interface]
     awk -v target="$PUB_KEY" '
         BEGIN { in_peer=0; block=""; found=0 }
         /^\[Peer\]/ {
@@ -476,7 +479,8 @@ cmd_up() {
 
     _stop_iface_safe
 
-    if command -v systemctl &>/dev/null && systemctl --quiet is-system-running 2>/dev/null | grep -qv "offline"; then
+    # [FIX] 用 _has_systemd() 判断，避免 --quiet+grep 管道导致永远走 systemctl 分支
+    if _has_systemd; then
         systemctl enable --now "wg-quick@${WG_IFACE}"
     else
         wg-quick up "$WG_CONF"
@@ -523,7 +527,6 @@ cmd_export() {
     printf "  │  Endpoint  : %s:%s\n" "$pub_ip" "$WG_PORT"
     printf "  └─────────────────────────────────────────────────────┘\n\n"
 
-    # 对端配置模板
     printf "  对端添加此节点的配置模板：\n\n"
     printf "  [Peer]\n"
     printf "  PublicKey           = %s\n" "$pub_key"
@@ -547,7 +550,7 @@ cmd_backup() {
 
     local outfile="${BACKUP_DIR}/wg-backup-$(date +%Y%m%d_%H%M%S).tar.gz"
     local files=()
-    [[ -d "$WG_DIR"  ]] && files+=("etc/wireguard")
+    [[ -d "$WG_DIR" ]] && files+=("etc/wireguard")
     [[ -f /etc/sysctl.d/99-wireguard.conf ]] && files+=("etc/sysctl.d/99-wireguard.conf")
 
     if [[ ${#files[@]} -eq 0 ]]; then
@@ -564,7 +567,6 @@ cmd_restore() {
     header "恢复配置"
     mkdir -p "$BACKUP_DIR"
 
-    # 列出可用备份
     local -a backups
     mapfile -t backups < <(ls -t "${BACKUP_DIR}"/wg-backup-*.tar.gz 2>/dev/null || true)
 
@@ -606,7 +608,6 @@ cmd_monitor() {
     if command -v watch &>/dev/null; then
         watch -n 2 "wg show ${WG_IFACE}"
     else
-        # 无 watch 时轮询
         while true; do
             clear
             header "实时监控 ${WG_IFACE}"
@@ -625,7 +626,8 @@ _iface_is_up() {
 }
 
 _stop_iface_safe() {
-    if command -v systemctl &>/dev/null; then
+    # [FIX] 统一用 _has_systemd() 检测
+    if _has_systemd; then
         systemctl disable --now "wg-quick@${WG_IFACE}" 2>/dev/null || true
         systemctl reset-failed "wg-quick@${WG_IFACE}" 2>/dev/null || true
     fi
@@ -635,14 +637,12 @@ _stop_iface_safe() {
 }
 
 _backup_conf() {
-    # [FIX] 加入 PID ($$) 防止同一秒内两次备份互相覆盖
     local bak="${WG_CONF}.bak.$(date +%Y%m%d_%H%M%S).$$"
     cp "$WG_CONF" "$bak"
     chmod 600 "$bak"
     info "配置已备份: $bak"
 }
 
-# _ask：带超时的交互输入，120s 无操作退出
 _ask() {
     local prompt="$1" varname="$2" default="${3:-}" val hint=""
     [[ -n "$default" ]] && hint=" [默认: ${default}]"
@@ -663,7 +663,7 @@ _menu_header() {
     clear
     printf "\n${C_BOLD}"
     echo "  ╔══════════════════════════════════════════════════════╗"
-    echo "  ║      WireGuard Mesh Panel v3.0 - 交互式管控台       ║"
+    echo "  ║      WireGuard Mesh Panel v3.1 - 交互式管控台       ║"
     echo "  ╚══════════════════════════════════════════════════════╝"
     printf "${C_RESET}\n"
 
@@ -725,14 +725,14 @@ menu_main() {
         local CHOICE
         read -r -t 300 -p "  请输入序号选择: " CHOICE || { echo; continue; }
         case "$CHOICE" in
-            1)  _run "安装 WireGuard"       cmd_install ;;
-            2)  _run "更新 WireGuard"       cmd_update ;;
-            3)  _run "卸载 WireGuard"       cmd_uninstall ;;
-            4)  _run "生成密钥对"           cmd_genkey ;;
+            1)  _run "安装 WireGuard"     cmd_install ;;
+            2)  _run "更新 WireGuard"     cmd_update ;;
+            3)  _run "卸载 WireGuard"     cmd_uninstall ;;
+            4)  _run "生成密钥对"         cmd_genkey ;;
             5)
                 _menu_header
                 local MY_IP
-                _ask "请输入本机 WG IP (如 10.10.0.1/24)" MY_IP ""
+                _ask "请输入本机 WG IP (如 10.10.0.1/24 或 fd00::1/64)" MY_IP ""
                 if is_valid_cidr "$MY_IP" || is_valid_ipv4 "$MY_IP"; then
                     cmd_init "$MY_IP"
                 else
@@ -740,13 +740,13 @@ menu_main() {
                 fi
                 _pause
                 ;;
-            6)  _run "导出本机节点信息"     cmd_export ;;
+            6)  _run "导出本机节点信息"   cmd_export ;;
             7)
                 _menu_header
                 local P_PK P_IP P_EP
-                _ask "对端公钥 (44字符 Base64)"              P_PK ""
-                _ask "对端内网 IP/CIDR (如 10.10.0.2/32)"   P_IP ""
-                _ask "对端 Endpoint (如 1.2.3.4:51820，无则回车跳过)" P_EP ""
+                _ask "对端公钥 (44字符 Base64)"                          P_PK ""
+                _ask "对端内网 IP/CIDR (如 10.10.0.2/32 或 fd00::2/128)" P_IP ""
+                _ask "对端 Endpoint (如 1.2.3.4:51820，无则回车跳过)"    P_EP ""
                 if [[ -n "$P_PK" && -n "$P_IP" ]]; then
                     cmd_add_peer "$P_PK" "$P_IP" "$P_EP"
                 else
@@ -754,7 +754,7 @@ menu_main() {
                 fi
                 _pause
                 ;;
-            8)  _run "编辑对端节点"         cmd_edit_peer ;;
+            8)  _run "编辑对端节点"       cmd_edit_peer ;;
             9)
                 _menu_header
                 local RM_PK
@@ -766,13 +766,13 @@ menu_main() {
                 fi
                 _pause
                 ;;
-            10) _run "节点列表"             wg show "${WG_IFACE}" ;;
-            11) _run "启动接口"             cmd_up ;;
-            12) _run "重启接口"             cmd_restart ;;
-            13) _run "停止接口"             cmd_down ;;
-            14) _run "实时流量监控"         cmd_monitor ;;
-            15) _run "备份配置"             cmd_backup ;;
-            16) _run "恢复配置"             cmd_restore ;;
+            10) _run "节点列表"           wg show "${WG_IFACE}" ;;
+            11) _run "启动接口"           cmd_up ;;
+            12) _run "重启接口"           cmd_restart ;;
+            13) _run "停止接口"           cmd_down ;;
+            14) _run "实时流量监控"       cmd_monitor ;;
+            15) _run "备份配置"           cmd_backup ;;
+            16) _run "恢复配置"           cmd_restore ;;
             0)  echo; exit 0 ;;
             *)  ;;
         esac
