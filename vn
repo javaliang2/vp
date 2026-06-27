@@ -33,6 +33,7 @@ MODULES_LIST=(
     "logs.sh"
     "backups.sh"
     "app_store.sh"
+    "docker-mgr.sh"
 
 )
 
@@ -172,6 +173,7 @@ main_menu() {
         echo -e " 8. 远程SSH跳转(输入exit退出)"
         echo -e " 9. 远程应用"
         echo -e "10. 备份/还原"
+        echo -e "11. docker安装/管理"
         echo -e "--------------------------------------------"
         echo -e "u. 更新全部       x. 卸载       0. 退出"
         echo -e "--------------------------------------------"
@@ -188,6 +190,7 @@ main_menu() {
             8) run_module "remote_jump.sh" ;;
             9) run_module "app_store.sh" ;;
             10) run_module "backups.sh" ;;
+            11) run_module "docker-mgr.sh" ;;
             u) update_all ;;
             x) uninstall_script ;;
             0) exit 0 ;;
