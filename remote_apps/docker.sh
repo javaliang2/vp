@@ -1785,31 +1785,62 @@ deploy_alist() {
     NET=$(net_name "$DIR")
     header "开始部署 AList"
 
-    # ── 媒体库映射逻辑（完美保留并规范化原版特性） ────────────────────
+    # ── [FIX #9] 提前确保目录存在并可进入 ────────────────────────────
+    mkdir -p "$DIR" || { error "无法创建目录: $DIR"; return 1; }
+
+    # ── [FIX #7] PUID/PGID 强制转整数，默认改为非 root ─────────────
+    local puid pgid
+    puid=$(( ${PUID:-1000} + 0 ))
+    pgid=$(( ${PGID:-1000} + 0 ))
+
+    # ── 媒体库映射逻辑 ──────────────────────────────────────────────
     local MEDIA_MOUNT=""
     echo -ne "${YELLOW}[?] 是否需要映射宿主机本地媒体库/存储目录到容器？(y/n): ${NC}"
     read -r map_media
     if [[ "$map_media" =~ ^[Yy]$ ]]; then
         echo -ne "${YELLOW}[?] 请输入宿主机媒体目录的绝对路径 (例如 /mnt/media): ${NC}"
         read -r host_path
-        if [[ -d "$host_path" ]]; then
-            # 动态生成挂载行，注意严格保持 YAML 的 6 空格缩进
-            MEDIA_MOUNT="      - ${host_path}:/media"
+
+        # [FIX #2] 路径黑名单校验，阻止挂载关键系统目录
+        local -a FORBIDDEN=("/" "/etc" "/root" "/sys" "/proc" "/dev" "/boot" "/run")
+        local is_forbidden=0
+        for f in "${FORBIDDEN[@]}"; do
+            if [[ "$host_path" == "$f" ]]; then
+                is_forbidden=1
+                break
+            fi
+        done
+
+        if [[ $is_forbidden -eq 1 ]]; then
+            warn "禁止挂载系统保护目录: ${host_path}，已跳过媒体库映射。"
+        elif [[ ! "$host_path" =~ ^/ ]]; then
+            warn "路径必须为绝对路径（以 / 开头），已跳过媒体库映射。"
+        elif [[ -d "$host_path" ]]; then
+            # [FIX #1] 用双引号包裹路径，防止含空格/特殊字符的路径破坏 YAML
+            MEDIA_MOUNT="      - \"${host_path}:/media\""
             log "已成功添加媒体库映射: ${host_path} -> /media"
         else
             warn "输入的路径不存在，将跳过本地媒体库映射。"
         fi
     fi
 
-    # ── 生成 docker-compose.yml（采用安全的端口长格式语法） ────────────────────
+    # ── 生成 docker-compose.yml ──────────────────────────────────────
+    # [FIX #8] NET/HOST_PORT 写入 YAML 前校验格式，防止特殊字符注入
+    if ! [[ "$NET" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        error "网络名称含非法字符: $NET"; return 1
+    fi
+    if ! [[ "$HOST_PORT" =~ ^[0-9]+$ ]]; then
+        error "端口号非法: $HOST_PORT"; return 1
+    fi
+
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   alist:
     image: xhofe/alist:latest
     restart: unless-stopped
     environment:
-      - PUID=${PUID:-0}
-      - PGID=${PGID:-0}
+      - PUID=${puid}
+      - PGID=${pgid}
       - UMASK=022
     volumes:
       - ./data:/opt/alist/data
@@ -1830,46 +1861,72 @@ networks:
     driver: bridge
 YAML
 
-    # ── 启动容器 ──────────────────────────────────────────────────
-    cd "$DIR"
+    # ── [FIX #9] 使用绝对路径 cd，并做错误处理 ──────────────────────
+    cd "$DIR" || { error "无法进入目录: $DIR"; return 1; }
     docker compose up -d
 
-    local cid
+    # ── [FIX #3] 检查容器运行状态而非仅检查 ID ───────────────────────
+    local cid=""
     cid=$(docker compose ps -q alist 2>/dev/null || true)
+
     if [[ -z "$cid" ]]; then
         error "AList 容器启动失败，请使用 'docker compose logs' 检查错误原因。"
+        return 1
     fi
 
-    # ── 提取初始密码（加固版：双重检索机制） ────────────────────────────
-    info "等待 AList 初始化并提取初始密码..."
-    sleep 5
+    local container_state
+    container_state=$(docker inspect --format='{{.State.Status}}' "$cid" 2>/dev/null || true)
+    if [[ "$container_state" != "running" ]]; then
+        error "AList 容器未处于运行状态（当前状态: ${container_state:-未知}），请执行 'docker compose logs' 排查。"
+        return 1
+    fi
+
+    # ── [FIX #4] 用健康检查轮询替代 sleep 5 ─────────────────────────
+    info "等待 AList 服务就绪（最长等待 60 秒）..."
+    local retries=12
+    local health_status=""
+    while [[ $retries -gt 0 ]]; do
+        health_status=$(docker inspect --format='{{.State.Health.Status}}' "$cid" 2>/dev/null || true)
+        [[ "$health_status" == "healthy" ]] && break
+        sleep 5
+        (( retries-- )) || true
+    done
+    if [[ "$health_status" != "healthy" ]]; then
+        warn "健康检查超时（状态: ${health_status:-未知}），服务可能尚未完全就绪，继续尝试获取初始密码..."
+    fi
+
+    # ── 提取初始密码 ─────────────────────────────────────────────────
     local init_pw=""
 
-    # 方案 A：尝试从标准容器日志捞取
+    # [FIX #5] 方案 A：统一使用 grep -oE + awk，兼容 BusyBox
     init_pw=$(docker logs "$cid" 2>&1 \
-        | grep -o 'password: [^ ]*' \
+        | grep -oE 'password: [^ ]+' \
         | awk '{print $2}' \
         | tail -1 || true)
 
-    # 方案 B：若日志未记，直接进入容器内核对/提取（适配新版 AList 行为）
+    # [FIX #5/6] 方案 B：使用绝对路径，避免依赖容器工作目录
     if [[ -z "$init_pw" ]]; then
         info "日志中未检索到密码，尝试进入容器主动获取..."
-        init_pw=$(docker exec -i "$cid" ./alist admin 2>/dev/null | grep -oP '(?<=password: ).*' || true)
+        init_pw=$(docker exec -i "$cid" /opt/alist/alist admin 2>/dev/null \
+            | grep -oE 'password: [^ ]+' \
+            | awk '{print $2}' \
+            | tail -1 || true)
     fi
 
     log "AList 服务已成功拉起 → http://127.0.0.1:${HOST_PORT}"
 
     if [[ -n "${init_pw:-}" ]]; then
-        # 剥离可能混入的 ANSI 终端颜色控制字符，确保存入 .env 的是纯文本
-        init_pw=$(echo "$init_pw" | sed -r "s/\x1B\[([0-9]{1,3}(;[0-9]{1,2})?)?[mGK]//g")
+        # 剥离 ANSI 控制字符，确保写入 .env 的是纯文本
+        init_pw=$(printf '%s' "$init_pw" | sed -r "s/\x1B\[([0-9]{1,3}(;[0-9]{1,2})?)?[mGK]//g")
         log "初始管理员密码: ${init_pw}"
         echo "ALIST_INIT_PASSWORD=${init_pw}" >> "$DIR/.env"
         log "凭据已安全备份至 $DIR/.env"
     else
         warn "未能自动捕获到初始密码（可能由于非首次部署或存储卷已有数据）。"
-        warn "如果需要手动重置或清空密码，请执行以下命令："
-        warn "  随机新密码: docker exec -it ${cid} ./alist admin random"
-        warn "  指定新密码: docker exec -it ${cid} ./alist admin set <你的新密码>"
+        warn "如需手动重置密码，请执行以下命令："
+        # [FIX #10] 改用服务名，避免 cid 为空时提示无效
+        warn "  随机新密码: docker compose exec alist /opt/alist/alist admin random"
+        warn "  指定新密码: docker compose exec alist /opt/alist/alist admin set <你的新密码>"
     fi
 }
 
