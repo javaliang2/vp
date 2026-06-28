@@ -56,13 +56,11 @@ is_valid_ipv4() {
 
 is_valid_ipv6() {
     local ip="${1%%/*}"
-    # 覆盖 ::、::1、fd00::1 等常见缩写形式
     [[ "$ip" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]] || return 1
     return 0
 }
 
 is_valid_cidr() {
-    # 支持双栈逗号分隔，如 10.0.0.1/24,fd00::1/64
     local ips
     IFS=',' read -ra ips <<< "$1"
     for current_ip in "${ips[@]}"; do
@@ -91,11 +89,23 @@ is_valid_pubkey() {
     [[ "${#1}" -eq 44 ]] && [[ "$1" =~ ^[A-Za-z0-9+/]{43}=$ ]]
 }
 
-# ── systemd 可用性检测（供 cmd_up/_stop_iface_safe 共用）──────
+# ── systemd 可用性检测 ────────────────────────────────────────
 _has_systemd() {
-    # [FIX] 不用 --quiet+grep 管道（--quiet 无输出导致 grep 永远匹配）
-    # is-system-running 在 running/degraded 返回 0，offline/unknown 返回非零
     command -v systemctl &>/dev/null && systemctl is-system-running &>/dev/null
+}
+
+# ── 配置文件安全写入（tmp 失败自动清理）────────────────────────
+# 用法: awk_cmd | _safe_rewrite_conf
+_safe_rewrite_conf() {
+    local tmp
+    tmp=$(mktemp "${WG_CONF}.tmp.XXXXXX")
+    chmod 600 "$tmp"
+    if cat > "$tmp"; then
+        mv "$tmp" "$WG_CONF"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -162,10 +172,8 @@ cmd_uninstall() {
     read -r -t 30 -p "  确认卸载? 输入 YES 继续: " _confirm || true
     [[ "$_confirm" == "YES" ]] || { info "已取消"; return 0; }
 
-    # 1. 停止并禁用服务
     _stop_iface_safe
 
-    # 2. 手动清除 iptables / ip6tables 残留
     local default_iface
     default_iface=$(ip route show default | awk '/default/{print $5}' | head -1 || echo "")
 
@@ -184,15 +192,12 @@ cmd_uninstall() {
         fi
     fi
 
-    # 3. sysctl 持久化配置
     rm -f /etc/sysctl.d/99-wireguard.conf
     sysctl -p -q 2>/dev/null || true
 
-    # 4. 配置与密钥（保留备份目录供恢复）
     rm -f "$WG_CONF" "${WG_KEY_DIR}/privatekey" "${WG_KEY_DIR}/publickey"
     rmdir "$WG_KEY_DIR" 2>/dev/null || true
 
-    # 5. 可选：卸载软件包
     local _pkg
     read -r -t 30 -p "  同时卸载 wireguard-tools 软件包? [y/N] " _pkg || true
     if [[ "${_pkg,,}" == "y" ]]; then
@@ -241,13 +246,12 @@ cmd_init() {
     local RAW_IP="$1"
     local WG_ADDR
 
-    # [FIX] IPv4/IPv6 分别补默认掩码，避免 wg-quick 因无掩码报错
     if [[ "$RAW_IP" == */* ]]; then
         WG_ADDR="$RAW_IP"
     elif [[ "$RAW_IP" == *:* ]]; then
-        WG_ADDR="${RAW_IP}/128"   # IPv6 单主机
+        WG_ADDR="${RAW_IP}/128"
     else
-        WG_ADDR="${RAW_IP}/24"    # IPv4 默认 /24
+        WG_ADDR="${RAW_IP}/24"
     fi
 
     header "初始化 ${WG_IFACE} (${WG_ADDR})"
@@ -270,7 +274,6 @@ cmd_init() {
     mkdir -p "$WG_DIR"
     chmod 700 "$WG_DIR"
 
-    # 双栈 ip_forward 持久化
     cat > /etc/sysctl.d/99-wireguard.conf <<EOF
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
@@ -282,7 +285,6 @@ EOF
     tmp=$(mktemp "${WG_DIR}/.wg_conf.XXXXXX")
     chmod 600 "$tmp"
 
-    # [FIX] PostUp/PostDown 中 IPv6 检测改用 which，兼容 wg-quick 的 /bin/sh 执行环境
     cat > "$tmp" <<EOF
 [Interface]
 Address = ${WG_ADDR}
@@ -357,6 +359,8 @@ cmd_add_peer() {
         local -a args=(set "${WG_IFACE}" peer "${PUB_KEY}" allowed-ips "${ALLOWED_IPS}")
         [[ -n "$ENDPOINT" ]] && args+=(endpoint "${ENDPOINT}" persistent-keepalive 25)
         wg "${args[@]}" && log "热更新成功"
+    else
+        info "接口未运行，配置已更新，启动后生效"
     fi
 }
 
@@ -401,10 +405,16 @@ cmd_edit_peer() {
 
     _backup_conf
 
-    # [FIX] BEGIN 初始化 in_peer，字符串比较规避公钥特殊字符
+    # [FIX] 新增 Endpoint 时同步写入 PersistentKeepalive（若原块中已有则替换，否则在 Endpoint 行后追加）
     awk -v target="$target_key" -v new_ips="$new_ips" -v new_ep="$new_ep" '
-        BEGIN { in_target=0; in_peer=0 }
-        /^\[/ { in_target=0; in_peer=0 }
+        BEGIN { in_target=0; in_peer=0; added_ka=0 }
+        /^\[/ {
+            # 离开 target 块时：若刚写入了新 Endpoint 且 KA 未写过，补写 KA
+            if (in_target && added_ka == 0 && new_ep != "") {
+                print "PersistentKeepalive = 25"
+            }
+            in_target=0; in_peer=0; added_ka=0
+        }
         /^\[Peer\]/ { in_peer=1; print; next }
         in_peer && /^[[:space:]]*PublicKey[[:space:]]*=/ {
             split($0, kv, /[[:space:]]*=[[:space:]]*/);
@@ -415,18 +425,32 @@ cmd_edit_peer() {
         in_target && /^[[:space:]]*AllowedIPs/ && new_ips != "" {
             print "AllowedIPs = " new_ips; next
         }
-        in_target && /^[[:space:]]*Endpoint/ && new_ep != "" {
-            print "Endpoint = " new_ep; next
+        in_target && /^[[:space:]]*Endpoint/ {
+            if (new_ep != "") { print "Endpoint = " new_ep } else { print }
+            next
+        }
+        in_target && /^[[:space:]]*PersistentKeepalive/ {
+            # 已有 KA 行：若有新 Endpoint 则顺手保持，否则原样输出
+            print "PersistentKeepalive = 25"
+            added_ka=1; next
         }
         { print }
-    ' "$WG_CONF" > "${WG_CONF}.tmp" && mv "${WG_CONF}.tmp" "$WG_CONF"
+        END {
+            # 最后一个块是 target 且 KA 未写过（新增 Endpoint 场景）
+            if (in_target && added_ka == 0 && new_ep != "") {
+                print "PersistentKeepalive = 25"
+            }
+        }
+    ' "$WG_CONF" | _safe_rewrite_conf || { warn "配置写入失败，已保留备份"; return 1; }
 
     log "Peer 已更新"
     if _iface_is_up; then
         local -a args=(set "${WG_IFACE}" peer "$target_key")
         [[ -n "$new_ips" ]] && args+=(allowed-ips "$new_ips")
-        [[ -n "$new_ep"  ]] && args+=(endpoint "$new_ep")
+        [[ -n "$new_ep"  ]] && args+=(endpoint "$new_ep" persistent-keepalive 25)
         wg "${args[@]}" && log "热更新成功"
+    else
+        info "接口未运行，配置已更新，启动后生效"
     fi
 }
 
@@ -441,7 +465,7 @@ cmd_remove_peer() {
     fi
 
     if ! grep -qF "PublicKey = ${PUB_KEY}" "$WG_CONF"; then
-        warn "未找到该 Peer"; return 1
+        warn "未找到该 Peer（配置文件中不存在）"; return 1
     fi
 
     _backup_conf
@@ -465,11 +489,19 @@ cmd_remove_peer() {
         }
         !in_peer { print }
         END { if (in_peer && !found) printf "%s", block }
-    ' "$WG_CONF" > "${WG_CONF}.tmp" && mv "${WG_CONF}.tmp" "$WG_CONF"
+    ' "$WG_CONF" | _safe_rewrite_conf || { warn "配置写入失败，已保留备份"; return 1; }
 
     log "Peer 已从配置移除"
+
+    # [FIX] 热移除前先确认运行时确实存在该 peer，避免误判
     if _iface_is_up; then
-        wg set "${WG_IFACE}" peer "$PUB_KEY" remove 2>/dev/null && log "热移除成功"
+        if wg show "${WG_IFACE}" peers 2>/dev/null | grep -qF "$PUB_KEY"; then
+            wg set "${WG_IFACE}" peer "$PUB_KEY" remove && log "热移除成功"
+        else
+            info "运行时未找到该 Peer（可能从未激活），配置已清理"
+        fi
+    else
+        info "接口未运行，配置已更新，启动后生效"
     fi
 }
 
@@ -479,7 +511,6 @@ cmd_up() {
 
     _stop_iface_safe
 
-    # [FIX] 用 _has_systemd() 判断，避免 --quiet+grep 管道导致永远走 systemctl 分支
     if _has_systemd; then
         systemctl enable --now "wg-quick@${WG_IFACE}"
     else
@@ -626,7 +657,6 @@ _iface_is_up() {
 }
 
 _stop_iface_safe() {
-    # [FIX] 统一用 _has_systemd() 检测
     if _has_systemd; then
         systemctl disable --now "wg-quick@${WG_IFACE}" 2>/dev/null || true
         systemctl reset-failed "wg-quick@${WG_IFACE}" 2>/dev/null || true
@@ -663,7 +693,7 @@ _menu_header() {
     clear
     printf "\n${C_BOLD}"
     echo "  ╔══════════════════════════════════════════════════════╗"
-    echo "  ║      WireGuard Mesh Panel v3.1 - 交互式管控台       ║"
+    echo "  ║      WireGuard Mesh Panel v3.2 - 交互式管控台       ║"
     echo "  ╚══════════════════════════════════════════════════════╝"
     printf "${C_RESET}\n"
 
