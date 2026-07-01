@@ -18,6 +18,18 @@ pause() { read -rp $'\n按 Enter 返回...' _; }
 
 hr() { echo -e "${BLD}────────────────────────────────────────────────────${RST}"; }
 
+# 检测源是否可用
+check_repo_speed() {
+    info "正在检测 Docker 官方源连接状态..."
+    # 尝试连接官方源，超时设置为 3 秒
+    if curl -fsSL --connect-timeout 3 https://download.docker.com/linux/static/stable/x86_64/ > /dev/null 2>&1; then
+        echo "official"
+    else
+        echo "aliyun"
+    fi
+}
+
+
 # ─── Docker 安装 ──────────────────────────────────────────────────────────────
 install_docker() {
     need_root
@@ -27,23 +39,36 @@ install_docker() {
         return
     fi
 
+    # --- 自动检测安装源 ---
+    local repo_type
+    repo_type=$(check_repo_speed)
+    local base_url
+    
+    if [[ "$repo_type" == "official" ]]; then
+        info "官方源连接正常，使用官方仓库。"
+        base_url="https://download.docker.com"
+    else
+        warn "检测到官方源连接缓慢，已自动切换至阿里云镜像站。"
+        base_url="https://mirrors.aliyun.com/docker-ce"
+    fi
+    # -----------------------
+
     info "检测发行版..."
     local os
     os=$(. /etc/os-release && echo "$ID")
-    info "发行版: $os"
-
+    
     case "$os" in
         ubuntu|debian)
             apt-get update -qq
             apt-get install -y -qq ca-certificates curl
             install -m 0755 -d /etc/apt/keyrings
-            # 使用现代 Docker 官方推荐的 asc 格式，避免 gpg 覆盖确认的问题
-            curl -fsSL "https://download.docker.com/linux/${os}/gpg" -o /etc/apt/keyrings/docker.asc
+            
+            # 使用 base_url 动态配置下载路径
+            curl -fsSL "${base_url}/linux/${os}/gpg" -o /etc/apt/keyrings/docker.asc
             chmod a+r /etc/apt/keyrings/docker.asc
             
-            # 引入 VERSION_CODENAME 替代 lsb_release，减少依赖
             . /etc/os-release
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${os} ${VERSION_CODENAME} stable" \
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] ${base_url}/linux/${os} ${VERSION_CODENAME} stable" \
                 > /etc/apt/sources.list.d/docker.list
             
             apt-get update -qq
@@ -51,11 +76,12 @@ install_docker() {
             ;;
         centos|rhel|fedora|rocky|almalinux)
             dnf -y install dnf-plugins-core
-            dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+            # 针对 CentOS 替换 Repo 内容
+            dnf config-manager --add-repo "${base_url}/linux/centos/docker-ce.repo"
             dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
             ;;
         *)
-            info "未匹配到原生包管理器，尝试通用脚本安装..."
+            warn "未匹配到原生包管理器，尝试通用脚本安装..."
             curl -fsSL https://get.docker.com | sh
             ;;
     esac
@@ -63,7 +89,6 @@ install_docker() {
     systemctl enable --now docker
     ok "Docker 安装完成: $(docker --version)"
 
-    # 加当前用户到 docker 组
     if [[ -n "${SUDO_USER:-}" ]]; then
         usermod -aG docker "$SUDO_USER"
         ok "已将 $SUDO_USER 加入 docker 组 (重新登录后生效)"
