@@ -1355,7 +1355,7 @@ site_lb_node() {
                 die "节点 ${node} 已存在"
             fi
 
-            sed -i "/^upstream ${upstream_name}/,/^}/ {
+            sed -i "/^upstream ${upstream_name} {/,/^}/ {
                 /^}/ i\\    server ${node} max_fails=2 fail_timeout=10s;
             }" "$conf"
 
