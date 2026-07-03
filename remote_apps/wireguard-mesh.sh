@@ -364,12 +364,11 @@ cmd_add_peer() {
     fi
 }
 
-cmd_edit_peer() {
-    require_conf
-    header "编辑 Peer"
 
-    local -a keys
-    mapfile -t keys < <(awk '
+# ── 读取当前所有 Peer 公钥到全局数组 _PEER_KEYS ────────────────
+_list_peer_keys() {
+    require_conf
+    mapfile -t _PEER_KEYS < <(awk '
         BEGIN { in_peer=0 }
         /^\[Peer\]/ { in_peer=1; next }
         /^\[/       { in_peer=0 }
@@ -377,13 +376,18 @@ cmd_edit_peer() {
             split($0, kv, /[[:space:]]*=[[:space:]]*/); print kv[2]
         }
     ' "$WG_CONF")
+}
 
-    if [[ ${#keys[@]} -eq 0 ]]; then
-        warn "当前无 Peer 节点"; return 0
+# ── 交互式列表选择一个 Peer 公钥，结果写入全局变量 _PICKED_PEER ──
+# 返回 1 表示无 Peer 或用户输入无效
+_pick_peer_key() {
+    _list_peer_keys
+    if [[ ${#_PEER_KEYS[@]} -eq 0 ]]; then
+        warn "当前无 Peer 节点"; return 1
     fi
 
     local i=1
-    for k in "${keys[@]}"; do
+    for k in "${_PEER_KEYS[@]}"; do
         printf "  %d. %s...\n" "$i" "${k:0:24}"
         (( i++ ))
     done
@@ -391,22 +395,62 @@ cmd_edit_peer() {
 
     local sel
     _ask "选择序号" sel ""
-    [[ "$sel" =~ ^[0-9]+$ ]] && (( 10#$sel >= 1 && 10#$sel <= ${#keys[@]} )) || { warn "无效序号"; return 1; }
-    local target_key="${keys[$((10#$sel-1))]}"
+    [[ "$sel" =~ ^[0-9]+$ ]] && (( 10#$sel >= 1 && 10#$sel <= ${#_PEER_KEYS[@]} )) || { warn "无效序号"; return 1; }
+    _PICKED_PEER="${_PEER_KEYS[$((10#$sel-1))]}"
+}
+
+# ── 提取指定 Peer 当前的 AllowedIPs / Endpoint（用于换公钥时热更新）──
+_get_peer_field() {
+    local target="$1" field="$2"
+    awk -v target="$target" -v field="$field" '
+        /^\[Peer\]/ { in_peer=1; pk=""; next }
+        /^\[/       { in_peer=0 }
+        in_peer && /^[[:space:]]*PublicKey/ {
+            split($0, a, /=/); gsub(/[[:space:]]/, "", a[2]); pk=a[2]
+        }
+        in_peer && pk==target && $0 ~ ("^[[:space:]]*" field) {
+            split($0, a, /=/); gsub(/^[[:space:]]+|[[:space:]]+$/, "", a[2]); print a[2]
+        }
+    ' "$WG_CONF"
+}
+
+cmd_edit_peer() {
+    require_conf
+    header "编辑 Peer"
+
+    _pick_peer_key || return 1
+    local target_key="$_PICKED_PEER"
+
+    local cur_ips cur_ep
+    cur_ips="$(_get_peer_field "$target_key" "AllowedIPs")"
+    cur_ep="$(_get_peer_field "$target_key" "Endpoint")"
 
     info "当前公钥: ${target_key}"
-    local new_ips new_ep
+    local new_pk new_ips new_ep
+    _ask "新公钥        (回车保留原值)" new_pk  ""
     _ask "新 AllowedIPs (回车保留原值)" new_ips ""
     _ask "新 Endpoint   (回车保留原值)" new_ep  ""
 
-    if [[ -z "$new_ips" && -z "$new_ep" ]]; then
+    if [[ -n "$new_pk" ]]; then
+        if ! is_valid_pubkey "$new_pk"; then
+            warn "公钥格式不合法（需 44 位 Base64）"; return 1
+        fi
+        if [[ "$new_pk" == "$target_key" ]]; then
+            new_pk=""
+        elif grep -qF "PublicKey = ${new_pk}" "$WG_CONF"; then
+            warn "该公钥已被其他 Peer 使用"; return 1
+        fi
+    fi
+
+    if [[ -z "$new_pk" && -z "$new_ips" && -z "$new_ep" ]]; then
         info "无修改"; return 0
     fi
 
     _backup_conf
 
     # [FIX] 新增 Endpoint 时同步写入 PersistentKeepalive（若原块中已有则替换，否则在 Endpoint 行后追加）
-    awk -v target="$target_key" -v new_ips="$new_ips" -v new_ep="$new_ep" '
+    # [NEW] 支持替换 PublicKey 本身
+    awk -v target="$target_key" -v new_pk="$new_pk" -v new_ips="$new_ips" -v new_ep="$new_ep" '
         BEGIN { in_target=0; in_peer=0; added_ka=0 }
         /^\[/ {
             # 离开 target 块时：若刚写入了新 Endpoint 且 KA 未写过，补写 KA
@@ -419,7 +463,10 @@ cmd_edit_peer() {
         in_peer && /^[[:space:]]*PublicKey[[:space:]]*=/ {
             split($0, kv, /[[:space:]]*=[[:space:]]*/);
             gsub(/[[:space:]]/, "", kv[2])
-            if (kv[2] == target) in_target=1
+            if (kv[2] == target) {
+                in_target=1
+                if (new_pk != "") { print "PublicKey = " new_pk; next }
+            }
             print; next
         }
         in_target && /^[[:space:]]*AllowedIPs/ && new_ips != "" {
@@ -445,10 +492,23 @@ cmd_edit_peer() {
 
     log "Peer 已更新"
     if _iface_is_up; then
-        local -a args=(set "${WG_IFACE}" peer "$target_key")
-        [[ -n "$new_ips" ]] && args+=(allowed-ips "$new_ips")
-        [[ -n "$new_ep"  ]] && args+=(endpoint "$new_ep" persistent-keepalive 25)
-        wg "${args[@]}" && log "热更新成功"
+        if [[ -n "$new_pk" ]]; then
+            # WireGuard 运行时以公钥标识 Peer，换公钥必须先移除旧条目再以新公钥添加
+            wg set "${WG_IFACE}" peer "$target_key" remove 2>/dev/null || true
+            local final_ips="${new_ips:-$cur_ips}" final_ep="${new_ep:-$cur_ep}"
+            if [[ -z "$final_ips" ]]; then
+                warn "无法确定 AllowedIPs，热更新已跳过，请手动重启接口生效"
+            else
+                local -a args=(set "${WG_IFACE}" peer "$new_pk" allowed-ips "$final_ips")
+                [[ -n "$final_ep" ]] && args+=(endpoint "$final_ep" persistent-keepalive 25)
+                wg "${args[@]}" && log "热更新成功（公钥已切换）"
+            fi
+        else
+            local -a args=(set "${WG_IFACE}" peer "$target_key")
+            [[ -n "$new_ips" ]] && args+=(allowed-ips "$new_ips")
+            [[ -n "$new_ep"  ]] && args+=(endpoint "$new_ep" persistent-keepalive 25)
+            wg "${args[@]}" && log "热更新成功"
+        fi
     else
         info "接口未运行，配置已更新，启动后生效"
     fi
@@ -787,12 +847,9 @@ menu_main() {
             8)  _run "编辑对端节点"       cmd_edit_peer ;;
             9)
                 _menu_header
-                local RM_PK
-                _ask "要移除的对端公钥" RM_PK ""
-                if [[ -n "$RM_PK" ]]; then
-                    cmd_remove_peer "$RM_PK"
-                else
-                    warn "公钥不能为空"
+                header "移除对端节点"
+                if _pick_peer_key; then
+                    cmd_remove_peer "$_PICKED_PEER"
                 fi
                 _pause
                 ;;
