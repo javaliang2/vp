@@ -1231,6 +1231,7 @@ site_create_loadbalance() {
     {
         # 生成通用 upstream 块
         echo "upstream ${upstream_name} {"
+        echo "    zone ${upstream_name} 64k;"
         [[ -n "$lb_directive" ]] && echo "$lb_directive"
         printf '%s\n' "${backend_list[@]}"
         echo "}"
@@ -1240,6 +1241,7 @@ site_create_loadbalance() {
         if [[ -n "$master_node" ]]; then
             echo "# 后台请求固定节点"
             echo "upstream ${upstream_master} {"
+            echo "    zone ${upstream_master} 64k;"
             echo "    server ${master_node};"
             echo "}"
             echo ""
@@ -2256,7 +2258,7 @@ interactive_menu() {
              5) site_create_stream_proxy ;;
              6) site_create_redirect ;;
              7) site_create_loadbalance ;;
-             8) site_list; safe_read -rp "按回车继续..." _ ;;
+             8) site_list ;;
              9) site_enable ;;
             10) site_disable ;;
             11) site_delete ;;
@@ -2265,26 +2267,26 @@ interactive_menu() {
                 safe_read -rp "选择 [v/e]: " _act
                 safe_read -rp "域名: " _d
                 [[ "${_act,,}" == "e" ]] && site_edit "$_d" || site_info "$_d"
-                safe_read -rp "按回车继续..." _
                 ;;
             13) site_add_acl ;;
             14) site_add_ratelimit ;;
             15) cmd_cert_issue ;;
             16) cmd_cert_self_signed ;;
             17) safe_read -rp "域名（留空续期全部）: " _d; cmd_cert_renew "${_d:-}" ;;
-            18) cmd_cert_list; safe_read -rp "按回车继续..." _ ;;
+            18) cmd_cert_list ;;
             19) cmd_cert_auto_renew ;;
             20) config_backup ;;
             21) config_restore ;;
-            22) config_backup_list; safe_read -rp "按回车继续..." _ ;;
+            22) config_backup_list ;;
             23) nginx_reload ;;
             24) nginx_restart ;;
             25) site_remove_acl ;;
             26) site_lb_node ;;
-            27) nginx_status; safe_read -rp "按回车继续..." _ ;;
+            27) nginx_status ;;
              0) echo "再见！"; exit 0 ;;
              *) warn "无效选项，请重试" ;;
         esac
+        safe_read -rp "按回车继续..." _
         echo ""
     done
 }
