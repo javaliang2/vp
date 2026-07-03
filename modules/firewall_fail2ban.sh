@@ -1,5 +1,5 @@
 #!/bin/bash
-# 防火墙与 Fail2Ban 模块 (修复优化版)
+# 防火墙与 Fail2Ban 模块 (修复优化版 v2 - 增强开机自启)
 
 if [ -z "$VPS_COMMON_LOADED" ]; then
     source /usr/local/share/vn_modules/common.sh 2>/dev/null || {
@@ -146,15 +146,17 @@ open_ports() {
     if command -v ufw &>/dev/null; then
         for port in $ports; do
             if [[ $port == *:* ]]; then
-                ufw allow proto tcp to any port ${port/:/:}
+                ufw allow proto tcp to any port "$port"
             else
                 ufw allow $port
             fi
         done
         printf "${GREEN}UFW 规则已添加${NC}\n"
     elif command -v firewall-cmd &>/dev/null; then
-        for port in $ports; do 
-            firewall-cmd --zone=public --add-port="${port}/tcp" --permanent
+        for port in $ports; do
+            # 修复：firewalld 端口范围用短横线而非冒号，需转换否则范围端口开放失败
+            local fw_port="${port/:/-}"
+            firewall-cmd --zone=public --add-port="${fw_port}/tcp" --permanent
         done
         firewall-cmd --reload
         printf "${GREEN}firewalld 端口已开放${NC}\n"
@@ -175,10 +177,21 @@ close_ports() {
     read -p "请输入要关闭的端口（多个用空格分隔）：" ports
     [[ -z "$ports" ]] && printf "${RED}未输入任何端口${NC}\n" && return
     if command -v ufw &>/dev/null; then
-        for port in $ports; do ufw deny $port; done
+        for port in $ports; do
+            # 修复：范围端口需用完整语法+协议，否则 ufw 会报错拒绝执行，导致关不掉
+            if [[ $port == *:* ]]; then
+                ufw deny proto tcp to any port "$port"
+            else
+                ufw deny "$port"
+            fi
+        done
         printf "${GREEN}UFW 拒绝规则已添加${NC}\n"
     elif command -v firewall-cmd &>/dev/null; then
-        for port in $ports; do firewall-cmd --zone=public --remove-port="${port}/tcp" --permanent; done
+        for port in $ports; do
+            # 修复：同步转换端口范围格式（冒号→短横线），与 open_ports 保持一致
+            local fw_port="${port/:/-}"
+            firewall-cmd --zone=public --remove-port="${fw_port}/tcp" --permanent
+        done
         firewall-cmd --reload
         printf "${GREEN}firewalld 端口已关闭${NC}\n"
     elif command -v iptables &>/dev/null; then
@@ -215,15 +228,63 @@ show_firewall_status() {
 }
 
 # -------- Fail2Ban --------
+# 优化：状态检测同时显示运行状态与开机自启状态，避免"装完忘启用"
 detect_fail2ban() {
     if command -v fail2ban-client &>/dev/null; then
+        local run_txt enable_txt
         if pgrep -x fail2ban-server &>/dev/null; then
-            printf "${GREEN}已安装（运行中）${NC}\n"
+            run_txt="${GREEN}运行中${NC}"
         else
-            printf "${YELLOW}已安装（未运行）${NC}\n"
+            run_txt="${YELLOW}未运行${NC}"
         fi
+        if command -v systemctl &>/dev/null; then
+            if systemctl is-enabled fail2ban &>/dev/null; then
+                enable_txt="${GREEN}已开机自启${NC}"
+            else
+                enable_txt="${RED}未开机自启${NC}"
+            fi
+        elif command -v chkconfig &>/dev/null; then
+            if chkconfig --list fail2ban 2>/dev/null | grep -q "3:on"; then
+                enable_txt="${GREEN}已开机自启${NC}"
+            else
+                enable_txt="${RED}未开机自启${NC}"
+            fi
+        else
+            enable_txt="${YELLOW}未知${NC}"
+        fi
+        printf "已安装（%b / %b）\n" "$run_txt" "$enable_txt"
     else
         printf "${RED}未安装${NC}\n"
+    fi
+}
+
+# 优化：独立的开机自启设置函数，install_fail2ban 复用，也可在菜单中单独调用
+# 适用场景：已安装但未设置自启、手动装过 fail2ban、systemctl enable 未生效等
+enable_fail2ban_autostart() {
+    if ! command -v fail2ban-client &>/dev/null; then
+        printf "${RED}Fail2Ban 未安装，请先安装${NC}\n"; return
+    fi
+    printf "${BLUE}正在设置 Fail2Ban 开机自启...${NC}\n"
+    if command -v systemctl &>/dev/null; then
+        systemctl enable fail2ban &>/dev/null
+        if systemctl is-enabled fail2ban &>/dev/null; then
+            printf "${GREEN}✔ 已设置开机自启（systemd）${NC}\n"
+        else
+            printf "${RED}✘ 设置失败，请手动执行: systemctl enable fail2ban${NC}\n"
+        fi
+        if ! pgrep -x fail2ban-server &>/dev/null; then
+            systemctl start fail2ban &>/dev/null && printf "${GREEN}已同步启动 Fail2Ban${NC}\n"
+        fi
+    else
+        chkconfig fail2ban on 2>/dev/null || update-rc.d fail2ban defaults 2>/dev/null
+        if command -v chkconfig &>/dev/null && chkconfig --list fail2ban 2>/dev/null | grep -q "3:on"; then
+            printf "${GREEN}✔ 已设置开机自启（chkconfig）${NC}\n"
+        else
+            printf "${YELLOW}已尝试设置，请手动确认: chkconfig fail2ban on 或 update-rc.d fail2ban defaults${NC}\n"
+        fi
+        if ! pgrep -x fail2ban-server &>/dev/null; then
+            service fail2ban start &>/dev/null && printf "${GREEN}已同步启动 Fail2Ban${NC}\n"
+        fi
     fi
 }
 
@@ -261,12 +322,8 @@ install_fail2ban() {
         fi
     fi
 
-    if command -v systemctl &>/dev/null; then
-        systemctl enable fail2ban && systemctl start fail2ban
-    else
-        chkconfig fail2ban on 2>/dev/null || update-rc.d fail2ban defaults 2>/dev/null
-        service fail2ban start
-    fi
+    # 优化：统一调用自启设置函数，安装即保证开机自启，逻辑不再重复
+    enable_fail2ban_autostart
 
     sleep 2
     if pgrep -x fail2ban-server &>/dev/null; then
@@ -321,9 +378,10 @@ config_fail2ban() {
     read -p "时间窗口(秒, 默认600): " findtime; findtime=${findtime:-600}
     read -p "最大尝试次数(默认5): " maxretry; maxretry=${maxretry:-5}
 
-    sed -i "s/^bantime.*=.*/bantime = $bantime/" "$conf_file"
-    sed -i "s/^findtime.*=.*/findtime = $findtime/" "$conf_file"
-    sed -i "s/^maxretry.*=.*/maxretry = $maxretry/" "$conf_file"
+    # 修复：限定只替换 [DEFAULT] 段落内的参数，避免覆盖 portscan 等 jail 单独设置的 bantime
+    sed -i "/^\[DEFAULT\]/,/^\[/ s/^bantime.*=.*/bantime = $bantime/" "$conf_file"
+    sed -i "/^\[DEFAULT\]/,/^\[/ s/^findtime.*=.*/findtime = $findtime/" "$conf_file"
+    sed -i "/^\[DEFAULT\]/,/^\[/ s/^maxretry.*=.*/maxretry = $maxretry/" "$conf_file"
 
     if fail2ban-server -t &>/dev/null; then
         systemctl restart fail2ban 2>/dev/null || service fail2ban restart
@@ -432,7 +490,13 @@ EOF
     fi
 
     if grep -q '^\[portscan\]' "$jail_local"; then
-        sed -i '/^\[portscan\]/,/^$/d' "$jail_local"
+        # 修复：原 sed 依赖段落后有空行才能删干净，若 [portscan] 恰好在文件末尾会删不完整
+        # 导致重复段落、配置校验失败后回滚。改用 awk 按"下一个 [ 段落或文件结尾"为界删除，更健壮
+        awk '
+            /^\[portscan\]/ { skip=1; next }
+            /^\[/ && skip { skip=0 }
+            !skip { print }
+        ' "$jail_local" > "${jail_local}.tmp" && mv "${jail_local}.tmp" "$jail_local"
     fi
 
     # 优化点：阈值收紧到 4 次，因为业务端口已被排除，碰触其他端口 4 次必是扫描
@@ -652,6 +716,7 @@ fail2ban_menu() {
         echo "4. 基础参数配置"
         echo "5. 卸载 Fail2Ban"
         echo "6. 防扫/黑名单/地域限制"
+        echo "7. 设置/确认开机自启"
         echo "0. 返回上级菜单"
         read -p "请选择操作: " fb_choice
         case $fb_choice in
@@ -661,6 +726,7 @@ fail2ban_menu() {
             4) config_fail2ban ;;
             5) uninstall_fail2ban ;;
             6) advanced_defense_menu ;;
+            7) enable_fail2ban_autostart ;;
             0) break ;;
             *) printf "${RED}无效选项${NC}\n" ;;
         esac
