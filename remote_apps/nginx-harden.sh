@@ -286,6 +286,27 @@ SSLSEC
     fi
 }
 
+hide_nginx_version() {
+    local conf="${NGINX_CONF_DIR}/nginx.conf"
+    [[ -f "$conf" ]] || die "找不到 $conf"
+    # 备份
+    local ts; ts=$(date +%Y%m%d_%H%M%S)
+    cp "$conf" "${BACKUP_DIR}/nginx.conf.bak-${ts}"
+    info "已备份 $conf -> ${BACKUP_DIR}/nginx.conf.bak-${ts}"
+
+    if grep -qE "^\s*server_tokens\s+off;" "$conf"; then
+        success "server_tokens 已经是 off，无需修改"
+        return
+    fi
+    if grep -q "server_tokens" "$conf"; then
+        sed -i 's/^\s*server_tokens\s.*/    server_tokens off;/' "$conf"
+    else
+        # 在 http 块开始后插入
+        sed -i '/^http {/a\    server_tokens off;' "$conf"
+    fi
+    nginx -t && systemctl reload nginx && success "已隐藏 Nginx 版本号，server_tokens 已设为 off" || die "配置错误"
+}
+
 # ──────────────────────────────────────────────────────────
 # 综合：一键加固
 # ──────────────────────────────────────────────────────────
@@ -353,6 +374,7 @@ interactive_menu() {
         echo -e " ${CYAN}7)${NC} 配置 CSP"
         echo -e " ${CYAN}8)${NC} 路径遍历防护"
         echo -e " ${CYAN}9)${NC} SSL 安全强化 (HSTS)"
+        echo -e " ${CYAN}10)${NC} 隐藏 Nginx 版本号 (全局)"
         echo ""
         echo -e " ${GREEN}A)${NC} 一键全部加固 (推荐)"
         echo -e " ${RED}R)${NC} 移除站点的安全配置"
@@ -424,6 +446,7 @@ interactive_menu() {
                 inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
                 nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
                 ;;
+            10) hide_nginx_version ;;
             [Aa])
                 list_domains
                 apply_all_security
