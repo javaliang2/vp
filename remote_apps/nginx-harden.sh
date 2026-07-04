@@ -1,470 +1,480 @@
 #!/bin/bash
 # ============================================================
-#  nginx-harden.sh — Nginx 全局基础加固 + fail2ban 联动 v4.2
-#  - 适合宿主机 Nginx 反向代理容器化站点的场景
-#  - CSP/方法限制/限流等站点相关项已移除，请按站点单独处理
-#  - 全局阻断日志自动接入 fail2ban，无需手动配置
-#  v4.2 更新:
-#    - HSTS 拆分为独立分阶段模块（检测HTTPS存在 + 显式确认 + 短max-age起步）
-#    - 新增 real_ip 模块（Cloudflare），修正 CDN 场景下 fail2ban 误封代理IP
-#    - 新增 WordPress 安全 snippet（uploads禁PHP/屏蔽隐藏文件/xmlrpc等）
-#    - fail2ban 规则扩展支持 444 状态码
+#  nginx-web-security.sh — Nginx 层 Web 安全加固脚本
+#  配合 nginx-gateway.sh 使用，专注于网站应用安全
+#  支持：安全头 / 路径防护 / 防盗链 / 请求过滤 / CSP / 防爬虫
+#  系统：Ubuntu / Debian / CentOS / RHEL
 # ============================================================
 set -euo pipefail
-umask 022
+shopt -s extglob
 
-# ── 全局配置 ──
+# ──────────────────────────────────────────────────────────
+# 全局配置（与主脚本保持一致）
+# ──────────────────────────────────────────────────────────
 NGINX_CONF_DIR="${NGINX_CONF_DIR:-/etc/nginx}"
-CONF_D_DIR="${NGINX_CONF_DIR}/conf.d"
-SNIPPETS_DIR="${NGINX_CONF_DIR}/snippets"
-BACKUP_DIR="/var/backups/nginx-harden"
-LOG_FILE="/var/log/nginx-harden.log"
-BLOCKED_LOG="/var/log/nginx/blocked.log"
-TIMESTAMP=$(date +'%Y-%m-%d %H:%M:%S')
-BACKUP_FILE="${BACKUP_DIR}/nginx-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-FAIL2BAN_FILTER="/etc/fail2ban/filter.d/nginx-harden.conf"
-FAIL2BAN_JAIL="/etc/fail2ban/jail.d/nginx-harden.conf"
+SITES_AVAILABLE="${NGINX_CONF_DIR}/sites-available"
+SITES_DIR="${SITES_DIR:-${NGINX_CONF_DIR}/sites-enabled}"
+SNIPPET_DIR="${NGINX_CONF_DIR}/snippets"
+BACKUP_DIR="${BACKUP_DIR:-/var/backups/nginx-gateway}"
+LOG_FILE="/var/log/nginx-web-security.log"
 
-# ── 颜色与日志 ──
+mkdir -p "$SNIPPET_DIR" "$BACKUP_DIR"
+touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/dev/null"
+
+# ──────────────────────────────────────────────────────────
+# 颜色 & 日志
+# ──────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-_log() {
-    local msg="$*"
-    echo -e "${msg}" 1>&2
-    sed -r 's/\x1b\[[0-9;]*m//g' <<< "$msg" >> "$LOG_FILE" 2>/dev/null || true
-}
+_log() { echo -e "$*" | tee -a "$LOG_FILE" 1>&2; }
 info()    { _log "${CYAN}[信息]${NC}  $*"; }
 success() { _log "${GREEN}[成功]${NC}  $*"; }
 warn()    { _log "${YELLOW}[警告]${NC}  $*"; }
 error()   { _log "${RED}[错误]${NC}  $*"; }
 die()     { error "$*"; exit 1; }
 
-require_root() { [[ $EUID -eq 0 ]] || die "请以 root 身份运行（sudo $0）"; }
-safe_read() { read -r "$@" || true; }
+require_root() {
+    [[ $EUID -eq 0 ]] || die "请以 root 身份运行本脚本（sudo $0）"
+}
+
+safe_read() {
+    set +e
+    read -r "$@"
+    local _rc=$?
+    set -e
+    return $_rc
+}
+
 confirm() {
     local _ans
-    safe_read -r -p "${YELLOW}$1 [y/N]${NC} " _ans
+    safe_read -rp "${YELLOW}$1 [y/N]${NC} " _ans
     [[ ${_ans,,} == "y" ]]
 }
 
-init_env() {
-    mkdir -p "$CONF_D_DIR" "$SNIPPETS_DIR" "$BACKUP_DIR" "$(dirname "$LOG_FILE")" "$(dirname "$BLOCKED_LOG")"
-    command -v nginx &>/dev/null || die "未检测到 Nginx，请先安装"
-    # 创建阻断日志并设置权限（nginx 用户可写）
-    touch "$BLOCKED_LOG"
-    local nginx_user pid_file
-    pid_file=$( [[ -f /var/run/nginx.pid ]] && echo /var/run/nginx.pid || echo /run/nginx.pid )
-    nginx_user=$(ps -o user= -p "$(cat "$pid_file" 2>/dev/null || echo 1)" 2>/dev/null || echo "www-data")
-    chown "${nginx_user}:adm" "$BLOCKED_LOG" 2>/dev/null || chown root:adm "$BLOCKED_LOG"
-    chmod 640 "$BLOCKED_LOG"
-    # 确保 nginx 配置包含 conf.d
-    if ! nginx -T 2>/dev/null | grep -q 'include.*conf\.d/\*\.conf'; then
-        warn "主配置可能未包含 ${CONF_D_DIR}，请确认 nginx.conf 中存在 'include conf.d/*.conf;'"
+# ──────────────────────────────────────────────────────────
+# 工具：列出所有站点，供用户选择
+# ──────────────────────────────────────────────────────────
+list_domains() {
+    local -a domains=()
+    for conf in "${SITES_AVAILABLE}"/*.conf; do
+        [[ -f "$conf" ]] || continue
+        local name; name=$(basename "$conf" .conf)
+        # 跳过系统保留的 00-block-ip 等
+        [[ "$name" == 00-* ]] && continue
+        domains+=("$name")
+    done
+
+    if [[ ${#domains[@]} -eq 0 ]]; then
+        die "未找到任何站点配置，请先用 nginx-gateway.sh 创建站点"
     fi
+
+    echo -e "\n${BOLD}已配置的站点:${NC}"
+    local i=1
+    for d in "${domains[@]}"; do
+        printf "  %2d) %s\n" "$i" "$d"
+        (( i++ ))
+    done
+    echo ""
+    safe_read -rp "请选择站点序号 [1-${#domains[@]}]: " _idx
+    if ! [[ "$_idx" =~ ^[0-9]+$ ]] || (( _idx < 1 || _idx > ${#domains[@]} )); then
+        die "无效序号"
+    fi
+    SELECTED_DOMAIN="${domains[$(( _idx - 1 ))]}"
+    SELECTED_CONF="${SITES_AVAILABLE}/${SELECTED_DOMAIN}.conf"
+    SELECTED_SNIPPET="${SNIPPET_DIR}/security-${SELECTED_DOMAIN}.conf"
+    info "已选择站点: $SELECTED_DOMAIN"
 }
 
-backup_configs() {
-    info "备份整个 Nginx 配置目录..."
-    tar -czf "${BACKUP_FILE}" -C / etc/nginx && chmod 600 "${BACKUP_FILE}" || die "备份失败"
-    success "备份完成 -> ${BACKUP_FILE}"
-}
+# ──────────────────────────────────────────────────────────
+# 辅助：确保站点的 server 块中 include 了安全片段
+# ──────────────────────────────────────────────────────────
+inject_include() {
+    local conf="$1"
+    local snippet_path="$2"
+    local marker="include ${snippet_path};"
+    if grep -qF "$marker" "$conf"; then
+        return
+    fi
 
-restore_backup() {
-    [[ -f "${BACKUP_FILE}" ]] || die "未找到备份文件"
-    warn "正在回滚配置..."
-    tar -xzf "${BACKUP_FILE}" -C /
-    success "已回滚"
-    nginx -t 1>&2 && systemctl reload nginx && success "回滚后重载成功" || warn "回滚后仍异常，请手动检查"
-}
-
-safe_reload() {
-    if nginx -t 1>&2; then
-        systemctl reload nginx
-        success "Nginx 已重载"
-        return 0
+    # 在第一个 location / 块之前插入 include，或追加到 server 块末尾
+    if grep -qE '^[[:space:]]*location[[:space:]]+/[[:space:]]*{' "$conf"; then
+        # 插入在 location / 前一行
+        sed -i "0,/^[[:space:]]*location[[:space:]]*\/[[:space:]]*{/ s//${marker}\n&/" "$conf"
     else
-        error "配置语法错误！"
-        if [[ -f "${BACKUP_FILE}" ]]; then
-            confirm "是否立即回滚到备份？" && { restore_backup; return 1; }
-        else
-            warn "备份文件不存在，无法自动回滚"
-        fi
-        die "语法错误且未回滚，请手动修复"
+        # 在最后一个 } 前插入
+        sed -i "\$i ${marker}" "$conf"
     fi
+    info "已将安全配置引入站点: $conf"
 }
 
-# ── 全局基础加固模块（对所有站点安全、无业务副作用） ──
-
-harden_server_tokens() {
-    cat > "${CONF_D_DIR}/90-security-tokens.conf" <<'EOF'
-server_tokens off;
-EOF
-    success "版本隐藏 -> ${CONF_D_DIR}/90-security-tokens.conf"
-}
-
-harden_security_headers() {
-    cat > "${CONF_D_DIR}/91-security-headers.conf" <<'EOF'
+# ──────────────────────────────────────────────────────────
+# 1. 安全响应头
+# ──────────────────────────────────────────────────────────
+add_security_headers() {
+    cat > "$SELECTED_SNIPPET" <<'HEADERS'
+# ---- 安全响应头 ----
 add_header X-Frame-Options "SAMEORIGIN" always;
-add_header X-XSS-Protection "1; mode=block" always;  # 现代浏览器已忽略此指令，保留仅为兼容旧版
 add_header X-Content-Type-Options "nosniff" always;
 add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-EOF
-    success "安全响应头 (不含HSTS，见单独模块) -> ${CONF_D_DIR}/91-security-headers.conf"
-    info "注意：若各站点 server/location 块自行定义了 add_header，会覆盖此处的值（nginx 的 add_header 不会跨层级叠加），请按需检查。"
+add_header X-XSS-Protection "1; mode=block" always;
+add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+HEADERS
+    success "安全响应头已生成"
 }
 
-# ── HSTS：单独模块，分阶段启用，避免"生效后无法撤销"的风险 ──
-harden_hsts() {
-    local conf="${CONF_D_DIR}/91b-hsts.conf"
+# ──────────────────────────────────────────────────────────
+# 2. 敏感文件封锁（.git, .env, 备份文件等）
+# ──────────────────────────────────────────────────────────
+add_file_protection() {
+    cat >> "$SELECTED_SNIPPET" <<'FILEBLOCK'
 
-    local https_sites
-    https_sites=$(nginx -T 2>/dev/null | grep -cE 'listen[[:space:]]+.*443.*ssl') || https_sites=0
-
-    if [[ "$https_sites" -eq 0 ]]; then
-        warn "未检测到任何 'listen 443 ssl' 配置，跳过 HSTS（避免站点尚未支持 HTTPS 时被强制跳转导致不可访问）"
-        return 0
-    fi
-
-    if [[ "${ENABLE_HSTS:-}" != "1" ]]; then
-        if [[ -t 0 ]]; then
-            warn "HSTS 生效后（尤其带 includeSubDomains），浏览器会在 max-age 时间内强制该域名及所有子域走 HTTPS。"
-            warn "若某个子域/路径证书或HTTPS配置有问题，用户在缓存期内将完全无法通过 HTTP 访问，且客户端无法手动撤销。"
-            confirm "已确认所有相关站点及子域的 HTTPS 均可正常访问，继续启用 HSTS？" || { info "跳过 HSTS"; return 0; }
-        else
-            info "非交互模式默认跳过 HSTS（设置 ENABLE_HSTS=1 显式启用）"
-            return 0
-        fi
-    fi
-
-    local max_age="${HSTS_MAX_AGE:-300}"
-    cat > "$conf" <<EOF
-# 首次启用建议短 max-age 观察（当前: ${max_age}s）。
-# 确认稳定运行几天无异常后，建议依次调大: 300(5分钟) -> 86400(1天) -> 31536000(1年)
-# 调整方法: HSTS_MAX_AGE=31536000 ENABLE_HSTS=1 $0 --fine-tune 或重新执行本项
-add_header Strict-Transport-Security "max-age=${max_age}; includeSubDomains" always;
-EOF
-    success "HSTS -> $conf (max-age=${max_age}s)"
-    if [[ "$max_age" -lt 31536000 ]]; then
-        info "当前为测试期短周期设置，稳定后请调大 max-age 并考虑提交 HSTS preload。"
-    fi
-}
-
-harden_permissions_policy() {
-    local conf="${CONF_D_DIR}/94-permissions-policy.conf"
-    # 无交互直接启用，因为该项对反向代理无害
-    echo 'add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), interest-cohort=()" always;' > "$conf"
-    success "Permissions-Policy -> $conf"
-}
-
-harden_buffers_timeouts() {
-    local conf="${CONF_D_DIR}/92-security-buffers.conf"
-    local max_body="${NGINX_MAX_BODY_SIZE:-100M}"
-
-    cat > "$conf" <<EOF
-client_body_buffer_size      128k;
-client_header_buffer_size    1k;
-large_client_header_buffers  4 8k;
-client_max_body_size         ${max_body};
-client_body_timeout   10;
-client_header_timeout 10;
-keepalive_timeout     15;
-send_timeout          10;
-EOF
-    success "缓冲区与超时 -> $conf (最大上传: ${max_body})"
-    info "提示：可通过环境变量 NGINX_MAX_BODY_SIZE 自定义，单个站点可在 server/location 中覆盖。"
-}
-
-# ── real_ip：CDN/反代场景下修正 fail2ban 误封代理节点IP ──
-harden_real_ip() {
-    local conf="${CONF_D_DIR}/89-real-ip.conf"
-
-    if [[ "${ENABLE_REAL_IP:-}" != "1" ]]; then
-        if [[ -t 0 ]]; then
-            echo ""
-            info "real_ip 检测：若站点前面有 Cloudflare 等 CDN/反代，nginx 看到的 \$remote_addr 是 CDN 节点 IP，"
-            info "fail2ban 封禁将作用在 CDN IP 而非真实攻击者，等同无效。"
-            confirm "站点是否使用 Cloudflare？" || { info "跳过 real_ip 配置"; return 0; }
-        else
-            info "非交互模式跳过 real_ip 配置（设置 ENABLE_REAL_IP=1 启用）"
-            return 0
-        fi
-    fi
-
-    info "拉取 Cloudflare IP 段..."
-    {
-        echo "# Cloudflare real IP ranges — 由 nginx-harden.sh 自动生成，请勿手动编辑"
-        echo "# 更新时间: ${TIMESTAMP}"
-        for url in https://www.cloudflare.com/ips-v4 https://www.cloudflare.com/ips-v6; do
-            curl -fsSL "$url" 2>/dev/null | sed 's/^/set_real_ip_from /; s/$/;/'
-        done
-        echo "real_ip_header CF-Connecting-IP;"
-        echo "real_ip_recursive on;"
-    } > "$conf"
-
-    if [[ $(grep -c 'set_real_ip_from' "$conf") -lt 2 ]]; then
-        warn "获取 Cloudflare IP 段失败或不完整，请检查网络连接后重试"
-        rm -f "$conf"
-        return 1
-    fi
-    success "real_ip (Cloudflare) -> $conf"
-    warn "Cloudflare IP 段会变化，建议加入 cron 定期重新执行本项（例如每月一次）以保持更新。"
-}
-
-# ── WordPress 安全 snippet（站点级，需各站点手动 include） ──
-harden_wordpress_snippet() {
-    local conf="${SNIPPETS_DIR}/wordpress-security.conf"
-    cat > "$conf" <<'EOF'
-# WordPress 安全片段 — 由 nginx-harden.sh 生成
-# 使用方法：在各 WP 站点的 server {} 块中加入:
-#   include snippets/wordpress-security.conf;
-# 请按站点实际情况删改（例如是否使用 Jetpack / REST API 依赖等）
-
-# 禁止执行 wp-content/uploads 目录下的 PHP（防止利用上传漏洞放置 webshell）
-location ~* ^/wp-content/uploads/.*\.php$ {
+# ---- 敏感文件保护 ----
+location ~ /\. {
     deny all;
-    return 444;
+    access_log off;
+    log_not_found off;
 }
-
-# 屏蔽隐藏文件（.git .env .htaccess 等），保留 /.well-known 用于证书验证等用途
-location ~ /\.(?!well-known) {
+location ~* \.(bak|config|sql|fla|psd|ini|log|sh|inc|swp|dist)$ {
     deny all;
-    return 444;
+    access_log off;
+    log_not_found off;
 }
-
-# 屏蔽敏感文件直接访问
-location ~* ^/(wp-config\.php|readme\.html|license\.txt|wp-content/debug\.log)$ {
+location ~* (\.git|\.svn|\.hg|\.env|\.htpasswd|composer\.(json|lock)|package\.json|yarn\.lock)$ {
     deny all;
-    return 444;
+    access_log off;
+    log_not_found off;
+}
+FILEBLOCK
+    success "敏感文件封锁规则已添加"
 }
 
-# xmlrpc.php 是暴力破解 / DDoS 放大攻击的常见入口，多数站点用不到，默认屏蔽
-# 若依赖 Jetpack 或远程发布 (XML-RPC) 功能，请注释掉这一段
-location = /xmlrpc.php {
-    deny all;
-    return 444;
+# ──────────────────────────────────────────────────────────
+# 3. 请求方法限制（仅允许 GET HEAD POST OPTIONS）
+# ──────────────────────────────────────────────────────────
+add_method_restriction() {
+    cat >> "$SELECTED_SNIPPET" <<'METHODS'
+
+# ---- HTTP 方法限制 ----
+if ($request_method !~ ^(GET|HEAD|POST|OPTIONS)$ ) {
+    return 405;
+}
+METHODS
+    success "请求方法已限制"
 }
 
-# 可选：屏蔽 REST API 用户名枚举端点，视是否有插件依赖该接口决定是否启用
-#location ~* ^/wp-json/wp/v2/users {
-#    deny all;
-#    return 444;
-#}
-EOF
-    success "WordPress 安全片段 -> $conf"
-    warn "该片段不会自动生效，需在各 WP 站点的 server {} 块中手动加入: include snippets/wordpress-security.conf;"
-}
-
-# ── 全局阻断日志（接入 fail2ban） ──
-ensure_blocked_map() {
-    cat > "${CONF_D_DIR}/99-blocked-log.conf" <<'EOF'
-# 为阻断日志定义条件变量，并全局记录所有被拒绝的请求
-map $status $blocked {
-    default 0;
-    403 1;
-    405 1;
-    444 1;
-    503 1;
-}
-
-access_log /var/log/nginx/blocked.log combined if=$blocked;
-EOF
-    success "全局阻断日志配置 -> ${CONF_D_DIR}/99-blocked-log.conf"
-}
-
-# ── fail2ban 集成 ──
-install_fail2ban() {
-    if command -v fail2ban-server &>/dev/null; then
-        info "fail2ban 已安装"
-        return 0
+# ──────────────────────────────────────────────────────────
+# 4. 防盗链（图片/视频等资源）
+# ──────────────────────────────────────────────────────────
+add_hotlink_protection() {
+    local allowed_domains=""
+    echo -e "${CYAN}请输入允许引用资源的域名（多个用空格分隔，留空则只允许本站）${NC}"
+    echo "示例: yoursite.com cdn.yoursite.com"
+    safe_read -rp "允许的域名: " allowed_domains
+    if [[ -z "$allowed_domains" ]]; then
+        allowed_domains="none"
     fi
-    info "正在安装 fail2ban ..."
-    if command -v apt &>/dev/null; then
-        apt update && apt install -y fail2ban
-    elif command -v yum &>/dev/null; then
-        yum install -y epel-release && yum install -y fail2ban
-    elif command -v dnf &>/dev/null; then
-        dnf install -y fail2ban
+
+    cat >> "$SELECTED_SNIPPET" <<HOTLINK
+
+# ---- 防盗链 (图片/视频) ----
+location ~* \.(gif|png|jpe?g|svg|webp|bmp|ico|mp4|webm|ogg)$ {
+    valid_referers none blocked server_names ${allowed_domains};
+    if (\$invalid_referer) {
+        return 403;
+    }
+}
+HOTLINK
+    success "防盗链规则已应用（允许: ${allowed_domains}）"
+}
+
+# ──────────────────────────────────────────────────────────
+# 5. 基础 WAF（简单 URL 参数过滤）
+# ──────────────────────────────────────────────────────────
+add_basic_waf() {
+    cat >> "$SELECTED_SNIPPET" <<'WAF'
+
+# ---- 简单 WAF 过滤 ----
+# 拦截包含常见攻击特征的请求
+set $block_request 0;
+if ($query_string ~* "(<|>|'|%3C|%3E|%27|%22|%28|%29|%0A|%0D|%09|union.*select|select.*from|insert.*into|drop.*table|update.*set|delete.*from|script|alert|onmouseover|onerror|onload|eval\(|document\.cookie|\.\.\/)") {
+    set $block_request 1;
+}
+if ($request_uri ~* "(<|>|'|%3C|%3E|%27|%22|%28|%29|%0A|%0D|%09|%00|\.\.\/|\.\.\\\|\/\.\/)") {
+    set $block_request 1;
+}
+if ($block_request = 1) {
+    return 403;
+}
+WAF
+    success "基础 WAF 过滤规则已添加"
+}
+
+# ──────────────────────────────────────────────────────────
+# 6. 恶意爬虫 / User-Agent 封锁
+# ──────────────────────────────────────────────────────────
+add_bad_bot_blocking() {
+    cat >> "$SELECTED_SNIPPET" <<'BOTBLOCK'
+
+# ---- 恶意爬虫封锁 ----
+if ($http_user_agent ~* (scrapy|curl|wget|python-requests|libwww|perl|nikto|sqlmap|masscan|nmap|zgrab|gobuster|dirbuster|nessus|openvas|acunetix|burp|whatweb|wpscan|joomscan|havij|netsparker|AppScan|WebInspect|ZAP|Vega|Arachni|Skipfish|Wfuzz|Brutus|Hydra|Medusa|JohnTheRipper|Hashcat)) {
+    return 403;
+}
+BOTBLOCK
+    success "恶意爬虫 User-Agent 封锁已添加"
+}
+
+# ──────────────────────────────────────────────────────────
+# 7. 内容安全策略 (CSP)
+# ──────────────────────────────────────────────────────────
+add_csp() {
+    echo -e "${CYAN}配置内容安全策略 (CSP)${NC}"
+    echo "这将限制浏览器加载资源的来源，防止 XSS 和数据注入"
+    local default_src="'self'"
+    safe_read -rp "默认加载源 (default-src) [默认 'self']: " _ds
+    [[ -n "$_ds" ]] && default_src="$_ds"
+
+    local script_src="'self' 'unsafe-inline' 'unsafe-eval'"
+    safe_read -rp "脚本加载源 (script-src) [默认 'self' 'unsafe-inline' 'unsafe-eval']: " _ss
+    [[ -n "$_ss" ]] && script_src="$_ss"
+
+    local style_src="'self' 'unsafe-inline'"
+    safe_read -rp "样式加载源 (style-src) [默认 'self' 'unsafe-inline']: " _st
+    [[ -n "$_st" ]] && style_src="$_st"
+
+    cat >> "$SELECTED_SNIPPET" <<CSP
+
+# ---- 内容安全策略 ----
+add_header Content-Security-Policy "default-src ${default_src}; script-src ${script_src}; style-src ${style_src}; img-src * data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; form-action 'self';" always;
+CSP
+    success "CSP 策略已添加"
+}
+
+# ──────────────────────────────────────────────────────────
+# 8. 防止目录遍历 & 禁用目录列表
+# ──────────────────────────────────────────────────────────
+add_path_traversal_protection() {
+    cat >> "$SELECTED_SNIPPET" <<'PATHSAFE'
+
+# ---- 路径安全 ----
+# 禁止访问包含 ../ 的路径
+if ($request_uri ~* "\.\." ) {
+    return 403;
+}
+# 禁止目录列表（如果 autoindex 被意外打开）
+autoindex off;
+PATHSAFE
+    success "路径遍历防护已启用"
+}
+
+# ──────────────────────────────────────────────────────────
+# 9. SSL 加固（HSTS 预加载、禁止旧协议）
+# ──────────────────────────────────────────────────────────
+add_ssl_hardening() {
+    # 如果站点已经是 SSL，则在 server 块内追加 HSTS 等
+    if grep -q "ssl_certificate" "$SELECTED_CONF"; then
+        cat >> "$SELECTED_SNIPPET" <<'SSLSEC'
+
+# ---- SSL 强化 ----
+# 强制 HSTS (若证书有效)
+add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+# 禁用 SSLv3 等旧协议已在 ssl_protocols 中，此处只补充
+SSLSEC
+        success "SSL 安全强化已添加 (HSTS preload)"
     else
-        die "无法自动安装 fail2ban，请手动安装"
+        warn "当前站点未使用 SSL，跳过 HSTS 配置"
     fi
-    success "fail2ban 安装完成"
 }
 
-configure_fail2ban() {
-    install_fail2ban
-
-    # 过滤器（含 444，用于 WordPress snippet 等 deny 场景）
-    cat > "${FAIL2BAN_FILTER}" <<'EOF'
-[Definition]
-failregex = ^<HOST> - .* "(GET|POST|HEAD|PUT|DELETE|MKCOL|PROPFIND|OPTIONS) [^"]* HTTP/[0-9.]+" (403|405|444|503) .*$
-ignoreregex =
-EOF
-
-    # jail：不写死 bantime/findtime/maxretry/banaction，继承 jail.local 的 [DEFAULT]，
-    # 这样若日后通过其它工具（如 firewall_fail2ban.sh 的"基础参数配置"）调整全局阈值，
-    # 本 jail 会自动保持一致，无需两边分别维护
-    cat > "${FAIL2BAN_JAIL}" <<EOF
-[nginx-harden]
-enabled = true
-port    = http,https
-filter  = nginx-harden
-logpath = ${BLOCKED_LOG}
-EOF
-
-    systemctl enable fail2ban
-
-    # 优先 reload，避免影响其他已存在的 jail 的当前 ban 状态
-    if systemctl is-active --quiet fail2ban; then
-        systemctl reload fail2ban || systemctl restart fail2ban
+# ──────────────────────────────────────────────────────────
+# 综合：一键加固
+# ──────────────────────────────────────────────────────────
+apply_all_security() {
+    info "开始为 ${SELECTED_DOMAIN} 执行全面安全加固..."
+    # 清空/新建安全片段
+    echo "# Nginx Web 安全加固: ${SELECTED_DOMAIN} (生成时间: $(date))" > "$SELECTED_SNIPPET"
+    add_security_headers
+    add_file_protection
+    add_method_restriction
+    add_hotlink_protection
+    add_basic_waf
+    add_bad_bot_blocking
+    add_csp
+    add_path_traversal_protection
+    add_ssl_hardening
+    # 将片段注入站点配置
+    inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
+    # 检查并重载 Nginx
+    if nginx -t; then
+        systemctl reload nginx
+        success "全部安全规则已应用，Nginx 重载成功"
     else
-        systemctl restart fail2ban
+        error "Nginx 配置测试失败！请检查 $SELECTED_SNIPPET 和 $SELECTED_CONF"
+        # 可自动移除注入的 include，避免站点宕机
+        sed -i "\|include ${SELECTED_SNIPPET};|d" "$SELECTED_CONF"
+        warn "已自动移除安全片段引入，请修正后重试"
     fi
-    success "fail2ban 联动规则已部署，监狱: nginx-harden"
-    info "现在任何返回 403/405/444/503 的请求都会被记录，触发封禁的阈值/时长继承自 jail.local 的 [DEFAULT]。"
 }
 
-# ── 一键全局基础加固 ──
-apply_all_hardening() {
-    backup_configs
-    harden_real_ip
-    harden_server_tokens
-    harden_security_headers
-    harden_hsts
-    harden_permissions_policy
-    harden_buffers_timeouts
-    harden_wordpress_snippet
-    ensure_blocked_map
-    configure_fail2ban
-
-    safe_reload
-    success "全局基础加固 + fail2ban 联动完成！"
-    echo ""
-    info "以下为站点相关项，本次未处理，留待按站点(WordPress/AList/图床等)单独配置："
-    echo "    - Content-Security-Policy (CSP)"
-    echo "    - HTTP 请求方法限制 (GET/HEAD/POST 严格模式 vs WebDAV 兼容)"
-    echo "    - 请求/连接限流 (limit_req / limit_conn)"
-    echo ""
-    info "WordPress 站点请在各自 server {} 块中加入: include snippets/wordpress-security.conf;"
+# ──────────────────────────────────────────────────────────
+# 移除安全配置
+# ──────────────────────────────────────────────────────────
+remove_security() {
+    list_domains
+    if [[ -f "$SELECTED_SNIPPET" ]]; then
+        rm -f "$SELECTED_SNIPPET"
+        success "已删除安全片段: $SELECTED_SNIPPET"
+    fi
+    if grep -qF "include ${SELECTED_SNIPPET};" "$SELECTED_CONF"; then
+        sed -i "\|include ${SELECTED_SNIPPET};|d" "$SELECTED_CONF"
+        success "已从站点配置中移除 include"
+    fi
+    nginx -t && systemctl reload nginx && success "Nginx 重载完成" || warn "配置检查失败，请手动处理"
 }
 
-# 撤销
-revert_hardening() {
-    confirm "移除全局基础加固配置并恢复备份？" || return
-    rm -f "${CONF_D_DIR}/89-real-ip.conf" \
-          "${CONF_D_DIR}/90-security-tokens.conf" \
-          "${CONF_D_DIR}/91-security-headers.conf" \
-          "${CONF_D_DIR}/91b-hsts.conf" \
-          "${CONF_D_DIR}/92-security-buffers.conf" \
-          "${CONF_D_DIR}/94-permissions-policy.conf" \
-          "${CONF_D_DIR}/99-blocked-log.conf"
-    rm -f "${SNIPPETS_DIR}/wordpress-security.conf"
-    rm -f "${FAIL2BAN_FILTER}" "${FAIL2BAN_JAIL}"
-    if command -v fail2ban-server &>/dev/null && systemctl is-active --quiet fail2ban; then
-        systemctl reload fail2ban || systemctl restart fail2ban
-        info "已移除 nginx-harden 规则，fail2ban 已重新加载"
-    fi
-    local latest
-    latest=$(ls -1t "${BACKUP_DIR}"/nginx-backup-*.tar.gz 2>/dev/null | head -1)
-    if [[ -f "$latest" ]] && confirm "恢复备份 ${latest##*/}？"; then
-        tar -xzf "$latest" -C /
-        success "已恢复"
-    fi
-    safe_reload || true
-    warn "若曾在 WP 站点 server 块中手动 include 过 wordpress-security.conf，请自行移除该行。"
-    warn "若曾手动在某些站点 server 块中添加过阻断相关配置，请手动清理对应 conf 文件。"
-}
-
-# ── 命令行参数 ──
-CMD="menu"
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -a|--all) CMD="all"; shift ;;
-        -f|--fail2ban) CMD="fail2ban"; shift ;;
-        -r|--revert) CMD="revert"; shift ;;
-        -h|--help)
-            echo "用法: $0 [-a 全局基础加固 | -f 仅部署fail2ban联动 | -r 撤销]"
-            echo ""
-            echo "环境变量:"
-            echo "  ENABLE_HSTS=1           非交互模式下启用 HSTS (默认跳过)"
-            echo "  HSTS_MAX_AGE=<秒数>     HSTS max-age，默认 300（测试期短周期）"
-            echo "  ENABLE_REAL_IP=1        非交互模式下启用 Cloudflare real_ip (默认跳过)"
-            echo "  NGINX_MAX_BODY_SIZE=<值> 客户端最大上传大小，默认 100M"
-            exit 0 ;;
-        *) die "未知参数: $1" ;;
-    esac
-done
-
-# 菜单
+# ──────────────────────────────────────────────────────────
+# 交互式菜单
+# ──────────────────────────────────────────────────────────
 interactive_menu() {
+    require_root
     while true; do
         clear
         echo -e "${BOLD}${GREEN}"
         echo "  ╔════════════════════════════════════════════════╗"
-        echo "  ║     Nginx 全局基础加固 + fail2ban v4.2        ║"
-        echo "  ║     (CSP/方法限制/限流请按站点单独处理)        ║"
+        echo "  ║      Nginx Web 安全加固 (应用层)              ║"
         echo "  ╚════════════════════════════════════════════════╝"
         echo -e "${NC}"
-        echo "  1) 一键全局基础加固 (推荐)"
-        echo "  2) 仅部署 fail2ban 联动规则"
-        echo "  3) 撤销全局基础加固"
-        echo "  4) 精细配置 (单项执行)"
-        echo "  5) 重载 Nginx"
-        echo "  0) 退出"
-        safe_read -r -p "选择: " choice
+        echo -e " ${CYAN}1)${NC} 添加安全响应头"
+        echo -e " ${CYAN}2)${NC} 敏感文件保护"
+        echo -e " ${CYAN}3)${NC} 限制请求方法"
+        echo -e " ${CYAN}4)${NC} 防盗链"
+        echo -e " ${CYAN}5)${NC} 基础 WAF 规则"
+        echo -e " ${CYAN}6)${NC} 恶意爬虫封锁"
+        echo -e " ${CYAN}7)${NC} 配置 CSP"
+        echo -e " ${CYAN}8)${NC} 路径遍历防护"
+        echo -e " ${CYAN}9)${NC} SSL 安全强化 (HSTS)"
+        echo ""
+        echo -e " ${GREEN}A)${NC} 一键全部加固 (推荐)"
+        echo -e " ${RED}R)${NC} 移除站点的安全配置"
+        echo -e " ${CYAN}Q)${NC} 退出"
+        echo ""
+        safe_read -rp "请选择: " choice
+
         case "$choice" in
-            1) apply_all_hardening; safe_read -r -p "按回车继续..." _ ;;
-            2) configure_fail2ban; safe_read -r -p "按回车继续..." _ ;;
-            3) revert_hardening; safe_read -r -p "按回车继续..." _ ;;
-            4) fine_tune_menu ;;
-            5) safe_reload; safe_read -r -p "按回车继续..." _ ;;
-            0) echo "再见"; exit 0 ;;
-            *) warn "无效" ;;
+            1)
+                list_domains
+                echo "# 安全头" > "$SELECTED_SNIPPET"
+                add_security_headers
+                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
+                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
+                ;;
+            2)
+                list_domains
+                echo "# 文件保护" > "$SELECTED_SNIPPET"
+                add_file_protection
+                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
+                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
+                ;;
+            3)
+                list_domains
+                echo "# 方法限制" > "$SELECTED_SNIPPET"
+                add_method_restriction
+                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
+                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
+                ;;
+            4)
+                list_domains
+                echo "# 防盗链" > "$SELECTED_SNIPPET"
+                add_hotlink_protection
+                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
+                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
+                ;;
+            5)
+                list_domains
+                echo "# WAF" > "$SELECTED_SNIPPET"
+                add_basic_waf
+                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
+                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
+                ;;
+            6)
+                list_domains
+                echo "# 爬虫封锁" > "$SELECTED_SNIPPET"
+                add_bad_bot_blocking
+                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
+                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
+                ;;
+            7)
+                list_domains
+                echo "# CSP" > "$SELECTED_SNIPPET"
+                add_csp
+                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
+                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
+                ;;
+            8)
+                list_domains
+                echo "# 路径安全" > "$SELECTED_SNIPPET"
+                add_path_traversal_protection
+                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
+                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
+                ;;
+            9)
+                list_domains
+                echo "# SSL强化" > "$SELECTED_SNIPPET"
+                add_ssl_hardening
+                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
+                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
+                ;;
+            [Aa])
+                list_domains
+                apply_all_security
+                ;;
+            [Rr])
+                remove_security
+                ;;
+            [Qq]|0)
+                echo "再见！"; exit 0
+                ;;
+            *)
+                warn "无效选项"
+                ;;
         esac
+        safe_read -rp "按回车继续..." _
     done
 }
 
-fine_tune_menu() {
-    while true; do
-        clear
-        echo -e "${CYAN}精细配置（全局基础项）:${NC}"
-        echo "  1) real_ip (Cloudflare)"
-        echo "  2) 隐藏版本号 (server_tokens off)"
-        echo "  3) 安全响应头 (不含HSTS)"
-        echo "  4) HSTS (分阶段启用)"
-        echo "  5) Permissions-Policy"
-        echo "  6) 缓冲区/超时/上传限制"
-        echo "  7) WordPress 安全片段"
-        echo "  8) 定义 \$blocked 条件变量 + 全局阻断日志"
-        echo "  9) 部署 fail2ban 联动"
-        echo "  0) 返回"
-        safe_read -r -p "选择: " c
-        case "$c" in
-            1) harden_real_ip; safe_reload ;;
-            2) harden_server_tokens; safe_reload ;;
-            3) harden_security_headers; safe_reload ;;
-            4) harden_hsts; safe_reload ;;
-            5) harden_permissions_policy; safe_reload ;;
-            6) harden_buffers_timeouts; safe_reload ;;
-            7) harden_wordpress_snippet ;;
-            8) ensure_blocked_map; safe_reload ;;
-            9) configure_fail2ban ;;
-            0) return ;;
-            *) warn "无效" ;;
-        esac
-        safe_read -r -p "按回车继续..." _
-    done
-}
-
+# ──────────────────────────────────────────────────────────
+# 命令行入口
+# ──────────────────────────────────────────────────────────
 main() {
-    require_root
-    init_env
-    case "$CMD" in
-        all) apply_all_hardening ;;
-        fail2ban) configure_fail2ban ;;
-        revert) revert_hardening ;;
-        menu) interactive_menu ;;
+    if [[ $# -eq 0 ]]; then
+        interactive_menu
+        exit 0
+    fi
+    # 允许的命令行: domain 安全选项
+    # 示例: ./nginx-web-security.sh example.com all
+    local domain="${1}"
+    local action="${2:-all}"
+    SELECTED_DOMAIN="$domain"
+    SELECTED_CONF="${SITES_AVAILABLE}/${SELECTED_DOMAIN}.conf"
+    SELECTED_SNIPPET="${SNIPPET_DIR}/security-${SELECTED_DOMAIN}.conf"
+    [[ -f "$SELECTED_CONF" ]] || die "站点配置不存在: $SELECTED_CONF"
+
+    case "$action" in
+        headers)    add_security_headers ;;
+        files)      add_file_protection ;;
+        methods)    add_method_restriction ;;
+        hotlink)    add_hotlink_protection ;;
+        waf)        add_basic_waf ;;
+        bots)       add_bad_bot_blocking ;;
+        csp)        add_csp ;;
+        path)       add_path_traversal_protection ;;
+        ssl)        add_ssl_hardening ;;
+        all)        apply_all_security ;;
+        remove)     remove_security ;;
+        *)          echo "未知动作: $action"; exit 1 ;;
     esac
+    inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
+    nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
 }
 
 main "$@"
