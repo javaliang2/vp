@@ -20,12 +20,16 @@ apt install -y curl gnupg2 ca-certificates lsb-release debian-archive-keyring
 curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor \
     | tee /usr/share/keyrings/nginx-archive-keyring.gpg >/dev/null
 
-# 校验指纹（应为 573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62）
-FPR=$(gpg --dry-run --quiet --no-keyring --import --import-options import-show \
-    /usr/share/keyrings/nginx-archive-keyring.gpg | grep -o '[0-9A-F]\{40\}' | head -1)
-echo "密钥指纹: $FPR"
-if [[ "$FPR" != "573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62" ]]; then
-    echo "警告：指纹不匹配，请勿继续，手动核实！"
+# 校验指纹（keyring 里可能同时含多把 nginx 签名 key，逐一比对，
+# 只要目标指纹出现在其中任意一把即可，不能只取第一个）
+KEYRING_OUTPUT=$(gpg --dry-run --quiet --no-keyring --import --import-options import-show \
+    /usr/share/keyrings/nginx-archive-keyring.gpg)
+EXPECTED_FPR="573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"
+if echo "$KEYRING_OUTPUT" | tr -d ' \n' | grep -qF "$EXPECTED_FPR"; then
+    echo "密钥指纹校验通过（匹配官方 signing-key@nginx.com）"
+else
+    echo "警告：keyring 中未找到官方指纹 $EXPECTED_FPR，请勿继续，手动核实！"
+    echo "$KEYRING_OUTPUT"
     exit 1
 fi
 
