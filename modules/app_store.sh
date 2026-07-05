@@ -23,7 +23,7 @@ declare -A APPS=(
     ["nginx安全加固"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/nginx-web-security.sh"
     ["rsync"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/install_rsync.sh"
     ["WireGuard安装"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/wireguard-mesh.sh"
-    ["MariaDB + Redis"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/infra-shared.sh"
+    ["nginx官方仓"]="https://raw.githubusercontent.com/lje02/vp/main/remote_apps/nginx.sh"
 )
 
 run_remote_app() {
