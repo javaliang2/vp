@@ -350,7 +350,7 @@ server {
         # ★★★ 请根据实际后端处理方式修改以下配置 ★★★
         # 如果是 PHP-FPM (WordPress 常见):
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/var/run/php/php8.1-fpm.sock;  # 按实际版本修改
+        fastcgi_pass unix:/var/run/php/php8.4-fpm.sock;  # 按实际版本修改
         # 如果是反向代理到其他端口:
         # proxy_pass http://127.0.0.1:8080;
     }
