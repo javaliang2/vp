@@ -1,15 +1,15 @@
 #!/bin/bash
 # ============================================================
-#  nginx-web-security.sh — Nginx 层 Web 安全加固脚本
-#  配合 nginx-gateway.sh 使用，专注于网站应用安全
-#  支持：安全头 / 路径防护 / 防盗链 / 请求过滤 / CSP / 防爬虫
-#  系统：Ubuntu / Debian / CentOS / RHEL
+#  nginx-web-security.sh — Nginx 层 Web 安全加固 (无冲突版)
+#  配合 nginx-gateway.sh 使用，专注通用 Web 安全
+#  功能：安全头 / 路径防护 / 防盗链 / WAF / CSP / 爬虫封锁 / 隐藏版本
+#  不包含 SSL 强化（主脚本已处理）和 WordPress 特殊规则（避免冲突）
 # ============================================================
 set -euo pipefail
 shopt -s extglob
 
 # ──────────────────────────────────────────────────────────
-# 全局配置（与主脚本保持一致）
+# 全局配置
 # ──────────────────────────────────────────────────────────
 NGINX_CONF_DIR="${NGINX_CONF_DIR:-/etc/nginx}"
 SITES_AVAILABLE="${NGINX_CONF_DIR}/sites-available"
@@ -34,18 +34,10 @@ warn()    { _log "${YELLOW}[警告]${NC}  $*"; }
 error()   { _log "${RED}[错误]${NC}  $*"; }
 die()     { error "$*"; exit 1; }
 
-require_root() {
-    [[ $EUID -eq 0 ]] || die "请以 root 身份运行本脚本（sudo $0）"
-}
-
+require_root() { [[ $EUID -eq 0 ]] || die "请以 root 身份运行本脚本（sudo $0）"; }
 safe_read() {
-    set +e
-    read -r "$@"
-    local _rc=$?
-    set -e
-    return $_rc
+    set +e; read -r "$@"; local _rc=$?; set -e; return $_rc
 }
-
 confirm() {
     local _ans
     safe_read -rp "${YELLOW}$1 [y/N]${NC} " _ans
@@ -60,8 +52,7 @@ list_domains() {
     for conf in "${SITES_AVAILABLE}"/*.conf; do
         [[ -f "$conf" ]] || continue
         local name; name=$(basename "$conf" .conf)
-        # 跳过系统保留的 00-block-ip 等
-        [[ "$name" == 00-* ]] && continue
+        [[ "$name" == 00-* ]] && continue   # 跳过系统保护配置
         domains+=("$name")
     done
 
@@ -87,7 +78,7 @@ list_domains() {
 }
 
 # ──────────────────────────────────────────────────────────
-# 辅助：确保站点的 server 块中 include 了安全片段
+# 辅助：将安全片段 include 注入站点配置
 # ──────────────────────────────────────────────────────────
 inject_include() {
     local conf="$1"
@@ -96,13 +87,9 @@ inject_include() {
     if grep -qF "$marker" "$conf"; then
         return
     fi
-
-    # 在第一个 location / 块之前插入 include，或追加到 server 块末尾
     if grep -qE '^[[:space:]]*location[[:space:]]+/[[:space:]]*{' "$conf"; then
-        # 插入在 location / 前一行
         sed -i "0,/^[[:space:]]*location[[:space:]]*\/[[:space:]]*{/ s//${marker}\n&/" "$conf"
     else
-        # 在最后一个 } 前插入
         sed -i "\$i ${marker}" "$conf"
     fi
     info "已将安全配置引入站点: $conf"
@@ -124,7 +111,7 @@ HEADERS
 }
 
 # ──────────────────────────────────────────────────────────
-# 2. 敏感文件封锁（.git, .env, 备份文件等）
+# 2. 敏感文件封锁
 # ──────────────────────────────────────────────────────────
 add_file_protection() {
     cat >> "$SELECTED_SNIPPET" <<'FILEBLOCK'
@@ -150,7 +137,7 @@ FILEBLOCK
 }
 
 # ──────────────────────────────────────────────────────────
-# 3. 请求方法限制（仅允许 GET HEAD POST OPTIONS）
+# 3. 请求方法限制
 # ──────────────────────────────────────────────────────────
 add_method_restriction() {
     cat >> "$SELECTED_SNIPPET" <<'METHODS'
@@ -164,16 +151,14 @@ METHODS
 }
 
 # ──────────────────────────────────────────────────────────
-# 4. 防盗链（图片/视频等资源）
+# 4. 防盗链
 # ──────────────────────────────────────────────────────────
 add_hotlink_protection() {
     local allowed_domains=""
     echo -e "${CYAN}请输入允许引用资源的域名（多个用空格分隔，留空则只允许本站）${NC}"
     echo "示例: yoursite.com cdn.yoursite.com"
     safe_read -rp "允许的域名: " allowed_domains
-    if [[ -z "$allowed_domains" ]]; then
-        allowed_domains="none"
-    fi
+    [[ -z "$allowed_domains" ]] && allowed_domains="none"
 
     cat >> "$SELECTED_SNIPPET" <<HOTLINK
 
@@ -189,13 +174,12 @@ HOTLINK
 }
 
 # ──────────────────────────────────────────────────────────
-# 5. 基础 WAF（简单 URL 参数过滤）
+# 5. 基础 WAF
 # ──────────────────────────────────────────────────────────
 add_basic_waf() {
     cat >> "$SELECTED_SNIPPET" <<'WAF'
 
 # ---- 简单 WAF 过滤 ----
-# 拦截包含常见攻击特征的请求
 set $block_request 0;
 if ($query_string ~* "(<|>|'|%3C|%3E|%27|%22|%28|%29|%0A|%0D|%09|union.*select|select.*from|insert.*into|drop.*table|update.*set|delete.*from|script|alert|onmouseover|onerror|onload|eval\(|document\.cookie|\.\.\/)") {
     set $block_request 1;
@@ -211,7 +195,7 @@ WAF
 }
 
 # ──────────────────────────────────────────────────────────
-# 6. 恶意爬虫 / User-Agent 封锁
+# 6. 恶意爬虫封锁
 # ──────────────────────────────────────────────────────────
 add_bad_bot_blocking() {
     cat >> "$SELECTED_SNIPPET" <<'BOTBLOCK'
@@ -229,7 +213,6 @@ BOTBLOCK
 # ──────────────────────────────────────────────────────────
 add_csp() {
     echo -e "${CYAN}配置内容安全策略 (CSP)${NC}"
-    echo "这将限制浏览器加载资源的来源，防止 XSS 和数据注入"
     local default_src="'self'"
     safe_read -rp "默认加载源 (default-src) [默认 'self']: " _ds
     [[ -n "$_ds" ]] && default_src="$_ds"
@@ -251,41 +234,23 @@ CSP
 }
 
 # ──────────────────────────────────────────────────────────
-# 8. 防止目录遍历 & 禁用目录列表
+# 8. 路径遍历防护
 # ──────────────────────────────────────────────────────────
 add_path_traversal_protection() {
     cat >> "$SELECTED_SNIPPET" <<'PATHSAFE'
 
 # ---- 路径安全 ----
-# 禁止访问包含 ../ 的路径
 if ($request_uri ~* "\.\." ) {
     return 403;
 }
-# 禁止目录列表（如果 autoindex 被意外打开）
 autoindex off;
 PATHSAFE
     success "路径遍历防护已启用"
 }
 
 # ──────────────────────────────────────────────────────────
-# 9. SSL 加固（HSTS 预加载、禁止旧协议）
+# 9. 隐藏 Nginx 版本号（全局）
 # ──────────────────────────────────────────────────────────
-add_ssl_hardening() {
-    # 如果站点已经是 SSL，则在 server 块内追加 HSTS 等
-    if grep -q "ssl_certificate" "$SELECTED_CONF"; then
-        cat >> "$SELECTED_SNIPPET" <<'SSLSEC'
-
-# ---- SSL 强化 ----
-# 强制 HSTS (若证书有效)
-add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
-# 禁用 SSLv3 等旧协议已在 ssl_protocols 中，此处只补充
-SSLSEC
-        success "SSL 安全强化已添加 (HSTS preload)"
-    else
-        warn "当前站点未使用 SSL，跳过 HSTS 配置"
-    fi
-}
-
 hide_nginx_version() {
     local conf="${NGINX_CONF_DIR}/nginx.conf"
     [[ -f "$conf" ]] || die "找不到 $conf"
@@ -301,18 +266,16 @@ hide_nginx_version() {
     if grep -q "server_tokens" "$conf"; then
         sed -i 's/^\s*server_tokens\s.*/    server_tokens off;/' "$conf"
     else
-        # 在 http 块开始后插入
         sed -i '/^http {/a\    server_tokens off;' "$conf"
     fi
     nginx -t && systemctl reload nginx && success "已隐藏 Nginx 版本号，server_tokens 已设为 off" || die "配置错误"
 }
 
 # ──────────────────────────────────────────────────────────
-# 综合：一键加固
+# 一键全部加固（不包含 SSL 强化和 WordPress）
 # ──────────────────────────────────────────────────────────
 apply_all_security() {
     info "开始为 ${SELECTED_DOMAIN} 执行全面安全加固..."
-    # 清空/新建安全片段
     echo "# Nginx Web 安全加固: ${SELECTED_DOMAIN} (生成时间: $(date))" > "$SELECTED_SNIPPET"
     add_security_headers
     add_file_protection
@@ -322,18 +285,15 @@ apply_all_security() {
     add_bad_bot_blocking
     add_csp
     add_path_traversal_protection
-    add_ssl_hardening
-    # 将片段注入站点配置
+    # 不包含 SSL 强化和 WordPress，避免冲突
+
     inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
-    # 检查并重载 Nginx
     if nginx -t; then
         systemctl reload nginx
         success "全部安全规则已应用，Nginx 重载成功"
     else
-        error "Nginx 配置测试失败！请检查 $SELECTED_SNIPPET 和 $SELECTED_CONF"
-        # 可自动移除注入的 include，避免站点宕机
+        error "Nginx 配置测试失败！已自动移除引入，请检查"
         sed -i "\|include ${SELECTED_SNIPPET};|d" "$SELECTED_CONF"
-        warn "已自动移除安全片段引入，请修正后重试"
     fi
 }
 
@@ -362,7 +322,7 @@ interactive_menu() {
         clear
         echo -e "${BOLD}${GREEN}"
         echo "  ╔════════════════════════════════════════════════╗"
-        echo "  ║      Nginx Web 安全加固 (应用层)              ║"
+        echo "  ║      Nginx Web 安全加固 (通用版)              ║"
         echo "  ╚════════════════════════════════════════════════╝"
         echo -e "${NC}"
         echo -e " ${CYAN}1)${NC} 添加安全响应头"
@@ -373,8 +333,7 @@ interactive_menu() {
         echo -e " ${CYAN}6)${NC} 恶意爬虫封锁"
         echo -e " ${CYAN}7)${NC} 配置 CSP"
         echo -e " ${CYAN}8)${NC} 路径遍历防护"
-        echo -e " ${CYAN}9)${NC} SSL 安全强化 (HSTS)"
-        echo -e " ${CYAN}10)${NC} 隐藏 Nginx 版本号 (全局)"
+        echo -e " ${CYAN}9)${NC} 隐藏 Nginx 版本号 (全局)"
         echo ""
         echo -e " ${GREEN}A)${NC} 一键全部加固 (推荐)"
         echo -e " ${RED}R)${NC} 移除站点的安全配置"
@@ -440,13 +399,8 @@ interactive_menu() {
                 nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
                 ;;
             9)
-                list_domains
-                echo "# SSL强化" > "$SELECTED_SNIPPET"
-                add_ssl_hardening
-                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
-                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
+                hide_nginx_version
                 ;;
-            10) hide_nginx_version ;;
             [Aa])
                 list_domains
                 apply_all_security
@@ -454,7 +408,7 @@ interactive_menu() {
             [Rr])
                 remove_security
                 ;;
-            [Qq]|0)
+            [Qq])
                 echo "再见！"; exit 0
                 ;;
             *)
@@ -473,10 +427,14 @@ main() {
         interactive_menu
         exit 0
     fi
-    # 允许的命令行: domain 安全选项
-    # 示例: ./nginx-web-security.sh example.com all
     local domain="${1}"
     local action="${2:-all}"
+
+    if [[ "$domain" == "hide-version" ]]; then
+        hide_nginx_version
+        exit 0
+    fi
+
     SELECTED_DOMAIN="$domain"
     SELECTED_CONF="${SITES_AVAILABLE}/${SELECTED_DOMAIN}.conf"
     SELECTED_SNIPPET="${SNIPPET_DIR}/security-${SELECTED_DOMAIN}.conf"
@@ -491,7 +449,6 @@ main() {
         bots)       add_bad_bot_blocking ;;
         csp)        add_csp ;;
         path)       add_path_traversal_protection ;;
-        ssl)        add_ssl_hardening ;;
         all)        apply_all_security ;;
         remove)     remove_security ;;
         *)          echo "未知动作: $action"; exit 1 ;;
