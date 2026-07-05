@@ -3,6 +3,7 @@
 #  nginx-web-security.sh — Nginx 层 Web 安全加固 (无冲突版)
 #  配合 nginx-gateway.sh 使用，专注通用 Web 安全
 #  功能：安全头 / 路径防护 / 防盗链 / WAF / CSP / 爬虫封锁 / 隐藏版本
+#        后台访问限制 (WireGuard 内网，WordPress 后台全覆盖)
 #  不包含 SSL 强化（主脚本已处理）和 WordPress 特殊规则（避免冲突）
 # ============================================================
 set -euo pipefail
@@ -272,7 +273,34 @@ hide_nginx_version() {
 }
 
 # ──────────────────────────────────────────────────────────
-# 一键全部加固（不包含 SSL 强化和 WordPress）
+# 10. 后台访问限制 (WordPress 默认路径全覆盖)
+# ──────────────────────────────────────────────────────────
+add_admin_access_restriction() {
+    local paths allowed_network
+    echo -e "${CYAN}配置后台访问限制 – 仅允许 WireGuard 内网访问管理页面${NC}"
+    safe_read -rp "请输入需要保护的后台路径（多个用空格分隔）[默认: wp-admin wp-login.php xmlrpc.php]: " paths
+    [[ -z "$paths" ]] && paths="wp-admin wp-login.php xmlrpc.php"   # ← WordPress 核心后台全覆盖
+
+    safe_read -rp "允许访问的内网 IP 段 [默认: 10.0.0.0/8]: " allowed_network
+    [[ -z "$allowed_network" ]] && allowed_network="10.0.0.0/8"
+
+    # 将空格分隔的路径转换为正则选择分支
+    local path_regex
+    path_regex=$(echo "$paths" | sed -E 's/[[:space:]]+/|/g')
+
+    cat >> "$SELECTED_SNIPPET" <<RESTRICT
+
+# ---- 后台访问限制 (WireGuard 内网) ----
+location ~ ^/(${path_regex}) {
+    allow ${allowed_network};
+    deny all;
+}
+RESTRICT
+    success "后台访问限制已生效：路径 [${paths}] 仅允许 ${allowed_network} 访问"
+}
+
+# ──────────────────────────────────────────────────────────
+# 一键全部加固（不包含后台限制，避免误限制无后台站点）
 # ──────────────────────────────────────────────────────────
 apply_all_security() {
     info "开始为 ${SELECTED_DOMAIN} 执行全面安全加固..."
@@ -285,7 +313,8 @@ apply_all_security() {
     add_bad_bot_blocking
     add_csp
     add_path_traversal_protection
-    # 不包含 SSL 强化和 WordPress，避免冲突
+    # 后台访问限制按需手动添加，取消下一行注释可自动启用 WordPress 默认限制
+    # add_admin_access_restriction
 
     inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
     if nginx -t; then
@@ -334,6 +363,7 @@ interactive_menu() {
         echo -e " ${CYAN}7)${NC} 配置 CSP"
         echo -e " ${CYAN}8)${NC} 路径遍历防护"
         echo -e " ${CYAN}9)${NC} 隐藏 Nginx 版本号 (全局)"
+        echo -e " ${CYAN}10)${NC} 后台访问限制 (WordPress/自定义)"
         echo ""
         echo -e " ${GREEN}A)${NC} 一键全部加固 (推荐)"
         echo -e " ${RED}R)${NC} 移除站点的安全配置"
@@ -401,6 +431,13 @@ interactive_menu() {
             9)
                 hide_nginx_version
                 ;;
+            10)
+                list_domains
+                echo "# 后台访问限制" > "$SELECTED_SNIPPET"
+                add_admin_access_restriction
+                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
+                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
+                ;;
             [Aa])
                 list_domains
                 apply_all_security
@@ -449,6 +486,7 @@ main() {
         bots)       add_bad_bot_blocking ;;
         csp)        add_csp ;;
         path)       add_path_traversal_protection ;;
+        admin-restrict) add_admin_access_restriction ;;
         all)        apply_all_security ;;
         remove)     remove_security ;;
         *)          echo "未知动作: $action"; exit 1 ;;
