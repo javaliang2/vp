@@ -390,11 +390,11 @@ add_admin_access_restriction() {
         # 公网封锁规则
         cat > "$SELECTED_SNIPPET" <<CDN_BLOCK
 # ---- 后台路径公网封锁（CDN 环境） ----
-location ~ ^/(${paths// /|}) {
-    deny all;
-    access_log off;
-    log_not_found off;
-}
+# 使用 = 和 ^~ 确保最高优先级，不会被其他 location 绕过
+location ^~ /wp-admin/ { deny all; }
+location = /wp-admin  { deny all; }
+location = /wp-login.php { deny all; }
+location = /xmlrpc.php   { deny all; }
 CDN_BLOCK
         inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
 
@@ -454,10 +454,10 @@ INTERNAL_SERVER
         allowed_network="${allowed_network:-10.0.0.0/8}"
         cat > "$SELECTED_SNIPPET" <<DIRECT_IP
 # ---- 后台访问限制 (直连模式) ----
-location ~ ^/(${paths// /|}) {
-    allow ${allowed_network};
-    deny all;
-}
+location ^~ /wp-admin/ { allow ${allowed_network}; deny all; }
+location = /wp-admin  { allow ${allowed_network}; deny all; }
+location = /wp-login.php { allow ${allowed_network}; deny all; }
+location = /xmlrpc.php   { allow ${allowed_network}; deny all; }
 DIRECT_IP
         inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
         success "已添加直连模式 IP 限制，仅 ${allowed_network} 可访问后台。"
