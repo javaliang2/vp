@@ -303,8 +303,8 @@ extract_backend_block() {
     EXTRACTED_BACKEND=""
     EXTRACTED_BACKEND=$(awk '
         /^[[:space:]]*location[[:space:]]/ && !inside {
-            inside = 1; brace = 0; block = ""
-            # 统计当前行花括号
+            inside = 1; brace = 0; inner = ""
+            # 计算当前行花括号数量
             line = $0; gsub(/[^{}]/, "", line)
             for (i = 1; i <= length(line); i++) {
                 c = substr(line, i, 1)
@@ -312,29 +312,51 @@ extract_backend_block() {
                 else if (c == "}") brace--
             }
             if (brace == 0) {
-                # 单行块，直接检查
-                if ($0 ~ /(proxy_pass|fastcgi_pass)/) { print $0; exit }
+                # 单行 location / { ... }，提取 { 和 } 之间的内容
+                split($0, parts, /{/)
+                if (length(parts) > 1) {
+                    inner = parts[2]
+                    sub(/}[[:space:]]*$/, "", inner)
+                }
+                if (inner ~ /(proxy_pass|fastcgi_pass)/) {
+                    print inner
+                    exit
+                }
                 inside = 0
             } else {
-                next   # 多行块，从下一行开始收集
+                # 多行块：跳过当前行（只包含 {），下一行开始收集内部内容
+                next
             }
         }
         inside {
+            # 统计当前行的花括号，更新 brace 深度
             line = $0; gsub(/[^{}]/, "", line)
             for (i = 1; i <= length(line); i++) {
                 c = substr(line, i, 1)
                 if (c == "{") brace++
                 else if (c == "}") brace--
             }
-            block = block $0 "\n"
+            # 如果已经到达闭合括号 (brace <= 0)，说明当前行包含结尾的 }
             if (brace <= 0) {
-                if (block ~ /(proxy_pass|fastcgi_pass)/) { print block; exit }
+                # 去掉本行末尾的 } 及其后空白
+                sub(/}[[:space:]]*$/, "", $0)
+                inner = inner $0 "\n"
+                # 去掉最终可能的换行
+                sub(/[[:space:]]+$/, "", inner)
+                if (inner ~ /(proxy_pass|fastcgi_pass)/) {
+                    print inner
+                    exit
+                }
                 inside = 0
+                next
             }
+            # 否则是正常内部行，直接追加
+            inner = inner $0 "\n"
         }
     ' "$conf")
+
     if [[ -n "$EXTRACTED_BACKEND" ]]; then
-        info "已自动提取后端配置："
+        info "已自动提取后端配置（已去除花括号）："
         echo "$EXTRACTED_BACKEND" | sed 's/^/  /'
     else
         warn "未能自动提取后端配置，将进入手动输入模式"
@@ -348,6 +370,7 @@ add_admin_access_restriction() {
     local paths allowed_network
     echo -e "${CYAN}配置后台访问限制 – 仅允许 WireGuard 内网访问管理页面${NC}"
     safe_read -rp "请输入需要保护的后台路径（空格分隔）[默认: wp-admin wp-login.php xmlrpc.php]: " paths
+    # 清理并应用默认值
     paths=$(echo "$paths" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g')
     [[ -z "$paths" ]] && paths="wp-admin wp-login.php xmlrpc.php"
 
@@ -394,6 +417,9 @@ CDN_BLOCK
             done
         fi
 
+        # 保证指令有合适的缩进（每行前加 8 个空格）
+        backend_block=$(echo "$backend_block" | sed 's/^/        /')
+
         local internal_conf="${SITES_AVAILABLE}/10-admin-${SELECTED_DOMAIN}.conf"
         cat > "$internal_conf" <<INTERNAL_SERVER
 # ---- 内网后台访问 Server (WireGuard 直连) ----
@@ -409,7 +435,6 @@ server {
         allow 10.0.0.0/8;
         deny all;
 
-        # 自动提取的后端处理指令
 ${backend_block}
     }
 
