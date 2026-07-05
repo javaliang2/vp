@@ -295,20 +295,79 @@ hide_nginx_version() {
     nginx -t && systemctl reload nginx && success "已隐藏 Nginx 版本号，server_tokens 已设为 off" || die "配置错误"
 }
 
-# ──────────────────────────────────────────────────────────
-# 10. 后台访问限制（支持 Cloudflare CDN 双 Server 隔离）
-# ──────────────────────────────────────────────────────────
+# ============================================================
+# 新增：自动提取原站点配置中的后端处理指令
+# ============================================================
+extract_backend_block() {
+    local conf="$1"
+    EXTRACTED_BACKEND=""
+    # 用 awk 提取第一个包含 proxy_pass 或 fastcgi_pass 的 location 块内容
+    # 输出该块内部的所有行（去除 location 行和花括号）
+    EXTRACTED_BACKEND=$(awk '
+        BEGIN { in_block=0; brace=0; found=0; output="" }
+        /location[[:space:]]/ && !in_block {
+            # 进入 location 块
+            in_block=1
+            brace=0
+            block_content=""
+        }
+        in_block {
+            # 统计花括号
+            n = split($0, a, "")
+            for (i=1; i<=n; i++) {
+                if (a[i] == "{") brace++
+                if (a[i] == "}") brace--
+            }
+            # 第一行包含 location，不计入块内容，但要从下一行开始收集
+            if (brace > 0 && block_content == "") {
+                # 第一行是 location ... {，跳过
+                next
+            }
+            # 如果块已经开始，记录行
+            if (brace > 0) {
+                block_content = block_content $0 "\n"
+            }
+            # 块结束
+            if (brace == 0 && in_block) {
+                # 检查块内是否有 proxy_pass 或 fastcgi_pass
+                if (block_content ~ /(proxy_pass|fastcgi_pass)/) {
+                    output = block_content
+                    found=1
+                    exit
+                }
+                # 否则清空，继续寻找下一个块
+                in_block=0
+                block_content=""
+            }
+        }
+        END {
+            if (found) print output
+        }
+    ' "$conf")
+
+    if [[ -n "$EXTRACTED_BACKEND" ]]; then
+        info "已自动提取后端配置："
+        echo "$EXTRACTED_BACKEND" | sed 's/^/  /'
+    else
+        warn "未能自动提取后端配置，请手动输入（例如 proxy_pass http://backend;）"
+        EXTRACTED_BACKEND=""
+    fi
+}
+
+# ============================================================
+# 10. 后台访问限制（支持 CDN 双 Server 隔离 + 自动提取后端）
+# ============================================================
 add_admin_access_restriction() {
     local paths allowed_network
     echo -e "${CYAN}配置后台访问限制 – 仅允许 WireGuard 内网访问管理页面${NC}"
-    safe_read -rp "请输入需要保护的后台路径（多个用空格分隔）[默认: wp-admin wp-login.php xmlrpc.php]: " paths
+    safe_read -rp "请输入需要保护的后台路径（空格分隔）[默认: wp-admin wp-login.php xmlrpc.php]: " paths
     [[ -z "$paths" ]] && paths="wp-admin wp-login.php xmlrpc.php"
 
     local use_cdn
     safe_read -rp "当前站点是否使用 Cloudflare CDN？[Y/n]: " use_cdn
     use_cdn="${use_cdn:-y}"
     if [[ "${use_cdn,,}" == "y" ]]; then
-        # ── CDN 模式：生成双 Server 配置 ──
+        # ── CDN 模式 ──
         echo -e "${YELLOW}检测到 CDN 环境，将创建内网专用 Server 隔离后台。${NC}"
         local wg_ip wg_port
         safe_read -rp "WireGuard 内网监听 IP [默认: $(get_wg_ip)]: " wg_ip
@@ -316,10 +375,9 @@ add_admin_access_restriction() {
         safe_read -rp "内网 Server 监听端口 [默认: 443]: " wg_port
         wg_port="${wg_port:-443}"
 
-        # 自动获取 SSL 证书路径
         get_ssl_cert_paths "$SELECTED_CONF"
 
-        # 公网侧：后台路径全部拒绝
+        # 公网封锁
         cat > "$SELECTED_SNIPPET" <<CDN_BLOCK
 # ---- 后台路径公网封锁（CDN 环境） ----
 location ~ ^/(${paths// /|}) {
@@ -330,7 +388,26 @@ location ~ ^/(${paths// /|}) {
 CDN_BLOCK
         inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
 
-        # 生成内网专用 Server
+        # 自动提取后端处理指令
+        local auto_extract
+        safe_read -rp "是否自动从原站配置提取后端处理指令？[Y/n]: " auto_extract
+        auto_extract="${auto_extract:-y}"
+        local backend_block=""
+        if [[ "${auto_extract,,}" == "y" ]]; then
+            extract_backend_block "$SELECTED_CONF"
+            backend_block="$EXTRACTED_BACKEND"
+        fi
+        if [[ -z "$backend_block" ]]; then
+            echo -e "${YELLOW}请手动输入后端处理指令（例如 proxy_pass http://wp_backend; 或 fastcgi_pass ...;）${NC}"
+            echo "输入完成后在新行输入 END 结束："
+            backend_block=""
+            while IFS= read -r line; do
+                [[ "$line" == "END" ]] && break
+                backend_block+="$line"$'\n'
+            done
+        fi
+
+        # 生成内网 Server
         local internal_conf="${SITES_AVAILABLE}/10-admin-${SELECTED_DOMAIN}.conf"
         cat > "$internal_conf" <<INTERNAL_SERVER
 # ---- 内网后台访问 Server (WireGuard 直连) ----
@@ -340,19 +417,14 @@ server {
 
     ssl_certificate     ${SSL_CERT};
     ssl_certificate_key ${SSL_KEY};
-    # 如果存在统一的 SSL 参数片断，取消下面的注释
-    # include snippets/ssl-params.conf;
+    # include snippets/ssl-params.conf;  # 若有可取消注释
 
     location ~ ^/(${paths// /|}) {
         allow 10.0.0.0/8;
         deny all;
 
-        # ★★★ 请根据实际后端处理方式修改以下配置 ★★★
-        # 如果是 PHP-FPM (WordPress 常见):
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/var/run/php/php8.4-fpm.sock;  # 按实际版本修改
-        # 如果是反向代理到其他端口:
-        # proxy_pass http://127.0.0.1:8080;
+        # 自动提取的后端处理指令
+${backend_block}
     }
 
     location / {
@@ -361,14 +433,12 @@ server {
 }
 INTERNAL_SERVER
 
-        # 启用内网 Server
         ln -sf "$internal_conf" "${SITES_ENABLED}/10-admin-${SELECTED_DOMAIN}.conf"
         success "内网专用 Server 已创建: $internal_conf"
         success "请确保管理设备通过 WireGuard 访问 https://${wg_ip}:${wg_port}/wp-admin"
-        warn "请根据实际 PHP 版本或反代配置，编辑 ${internal_conf} 中的 location 块！"
 
     else
-        # ── 非 CDN 模式：直接在公网站点限制 IP ──
+        # ── 非 CDN 模式 ──
         safe_read -rp "允许访问的内网 IP 段 [默认: 10.0.0.0/8]: " allowed_network
         allowed_network="${allowed_network:-10.0.0.0/8}"
         cat > "$SELECTED_SNIPPET" <<DIRECT_IP
