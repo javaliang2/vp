@@ -89,9 +89,9 @@ inject_include() {
     if grep -qF "$marker" "$conf"; then
         return
     fi
-    # 如果存在 location / {} 块，在其前插入；否则追加到文件末尾
+    # 使用 # 作为 s 命令分隔符，地址范围也用 \#...# 避免转义斜杠
     if grep -qE '^[[:space:]]*location[[:space:]]+/[[:space:]]*{' "$conf"; then
-        sed -i "0,/^[[:space:]]*location[[:space:]]*\/[[:space:]]*{/ s//${marker}\n&/" "$conf"
+        sed -i "\#^[[:space:]]*location[[:space:]]*/[[:space:]]*{# s##${marker}\n&#" "$conf"
     else
         sed -i "\$i ${marker}" "$conf"
     fi
