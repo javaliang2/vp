@@ -1185,6 +1185,7 @@ manage_routing() {
         echo " 4. 添加跳转节点 (链式代理)"
         echo " 5. 查看当前活跃链式链路"
         echo " 6. 重置入站规则 (恢复直连)"
+        echo " 7. WireGuard 内网穿透与 DNS 劫持"
         echo "------------------------------------------------"
         echo " 0. 返回主菜单"
         echo "------------------------------------------------"
@@ -1596,6 +1597,86 @@ manage_routing() {
                     fi
                 fi
                 pause ;;
+            7) # 专属内网穿透：修改 Hosts 劫持并注入 direct 路由 (支持多配置管理)
+                while true; do
+                    clear
+                    echo -e "${YELLOW}━━━ 内网管理穿透 (WireGuard DNS 劫持) ━━━${PLAIN}"
+                    echo -e "作用：绕过 CF，将后台域名直接解析到特定内网 IP 并走直连\n"
+                    echo " 1. 添加内网域名映射 (支持多次添加)"
+                    echo " 2. 查看当前映射列表"
+                    echo " 3. 删除特定域名映射"
+                    echo "------------------------------------------------"
+                    echo " 0. 返回上一级"
+                    read -p "请选择: " wg_choice
+
+                    case $wg_choice in
+                        1)
+                            read -p "请输入要管理的后台域名 (如 wp.domain.com): " wg_domain
+                            [[ -z "$wg_domain" ]] && continue
+                            read -p "请输入该域名对应的 WG 内网 IP (如 10.0.0.5): " wg_ip
+                            [[ -z "$wg_ip" ]] && continue
+
+                            # 步骤 A：清理可能存在的旧记录，追加新记录，并打上脚本专属标签
+                            sed -i "/[[:space:]]${wg_domain}[[:space:]]*#/d" /etc/hosts
+                            echo "${wg_ip} ${wg_domain} # added_by_sb_wg_admin" >> /etc/hosts
+                            echo -e "\n${GREEN}✔ [步骤 1] 域名 ${wg_domain} 已绑定至 ${wg_ip}${PLAIN}"
+
+                            # 步骤 B：使用 jq 注入路由规则
+                            # 无论执行多少次，这段逻辑都能保证 10.0.0.0/8 规则唯一且在最高优先级
+                            make_tmp
+                            jq --arg cidr "10.0.0.0/8" '
+                                .route.rules = [
+                                    {"ip_cidr": [$cidr], "outbound": "direct"}
+                                ] + [
+                                    .route.rules[] | select(
+                                        if .ip_cidr then
+                                            (.ip_cidr | contains([$cidr])) | not
+                                        else true end
+                                    )
+                                ]
+                            ' "$CONFIG_FILE" > "$_TMP_JSON"
+
+                            if save_and_restart; then
+                                echo -e "${GREEN}✔ [步骤 2] Sing-box 路由分流已更新！${PLAIN}"
+                            else
+                                echo -e "${RED}✖ 路由注入失败，配置已回滚。${PLAIN}"
+                            fi
+                            pause ;;
+                            
+                        2)
+                            echo -e "\n${CYAN}--- 当前生效的内网域名劫持列表 ---${PLAIN}"
+                            if grep -q "added_by_sb_wg_admin" /etc/hosts; then
+                                grep "added_by_sb_wg_admin" /etc/hosts | awk '{printf "  %-15s -> %s\n", $1, $2}'
+                            else
+                                echo -e "  ${YELLOW}暂无任何配置${PLAIN}"
+                            fi
+                            pause ;;
+                            
+                        3)
+                            echo -e "\n${CYAN}--- 请选择要删除的域名 ---${PLAIN}"
+                            if ! grep -q "added_by_sb_wg_admin" /etc/hosts; then
+                                echo -e "  ${YELLOW}暂无任何配置可删${PLAIN}"
+                                pause; continue
+                            fi
+                            
+                            grep "added_by_sb_wg_admin" /etc/hosts | awk '{printf "  %-15s -> %s\n", $1, $2}'
+                            echo ""
+                            read -p "请输入要移除的域名 (例如 wp.domain.com，直接回车取消): " del_domain
+                            [[ -z "$del_domain" ]] && continue
+                            
+                            if grep -q "[[:space:]]${del_domain}[[:space:]]*# added_by_sb_wg_admin" /etc/hosts; then
+                                sed -i "/[[:space:]]${del_domain}[[:space:]]*# added_by_sb_wg_admin/d" /etc/hosts
+                                echo -e "${GREEN}✔ 域名 ${del_domain} 的本地劫持已移除。${PLAIN}"
+                            else
+                                echo -e "${RED}✖ 未找到关于 ${del_domain} 的记录。${PLAIN}"
+                            fi
+                            pause ;;
+                            
+                        0) break ;;
+                        *) continue ;;
+                    esac
+                done
+                ;;
 
             0) return 0 ;;
         esac
