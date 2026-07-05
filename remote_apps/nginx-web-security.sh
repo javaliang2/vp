@@ -367,16 +367,33 @@ extract_backend_block() {
 # 10. 后台访问限制（支持 CDN 双 Server 隔离 + 自动提取后端）
 # ============================================================
 add_admin_access_restriction() {
-    local paths allowed_network
-    echo -e "${CYAN}配置后台访问限制 – 仅允许 WireGuard 内网访问管理页面${NC}"
-    safe_read -rp "请输入需要保护的后台路径（空格分隔）[默认: wp-admin wp-login.php xmlrpc.php]: " paths
-    # 清理并应用默认值
-    paths=$(echo "$paths" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g')
-    [[ -z "$paths" ]] && paths="wp-admin wp-login.php xmlrpc.php"
+    local paths_input allowed_network
+    echo -e "${CYAN}配置后台访问限制 – 仅允许受信任网络访问管理页面${NC}"
+    safe_read -rp "请输入需要保护的后台路径（空格分隔）[默认: wp-admin wp-login.php xmlrpc.php]: " paths_input
+    paths_input=$(echo "$paths_input" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g')
+    [[ -z "$paths_input" ]] && paths_input="wp-admin wp-login.php xmlrpc.php"
+
+    local -a paths_arr esc_paths
+    read -r -a paths_arr <<< "$paths_input"
+    local p
+    for p in "${paths_arr[@]}"; do
+        esc_paths+=("${p//./\\.}")   # 转义 . ，避免 wp-login.php 里的点被当成正则任意字符
+    done
+    local paths_regex
+    paths_regex=$(IFS='|'; echo "${esc_paths[*]}")
+
+    # wp-admin 下的 admin-ajax.php 是 WordPress 前台（未登录访客）常用的公开接口，
+    # 如果整体封锁 /wp-admin/ 会连它一起挡掉，导致前台功能（搜索/购物车/表单等）失效
+    local expose_ajax="n"
+    if printf '%s\n' "${paths_arr[@]}" | grep -qx "wp-admin"; then
+        safe_read -rp "检测到 wp-admin，是否放行 /wp-admin/admin-ajax.php 供前台 AJAX 使用（多数 WordPress 站点需要）？[Y/n]: " expose_ajax
+        expose_ajax="${expose_ajax:-y}"
+    fi
 
     local use_cdn
     safe_read -rp "当前站点是否使用 Cloudflare CDN？[Y/n]: " use_cdn
     use_cdn="${use_cdn:-y}"
+
     if [[ "${use_cdn,,}" == "y" ]]; then
         echo -e "${YELLOW}检测到 CDN 环境，将创建内网专用 Server 隔离后台。${NC}"
         local wg_ip wg_port
@@ -384,25 +401,15 @@ add_admin_access_restriction() {
         wg_ip="${wg_ip:-$(get_wg_ip)}"
         safe_read -rp "内网 Server 监听端口 [默认: 443]: " wg_port
         wg_port="${wg_port:-443}"
+        safe_read -rp "允许访问内网 Server 的网段 [默认: 10.0.0.0/8]: " allowed_network
+        allowed_network="${allowed_network:-10.0.0.0/8}"
 
         get_ssl_cert_paths "$SELECTED_CONF"
 
-        # 公网封锁规则
-        cat > "$SELECTED_SNIPPET" <<CDN_BLOCK
-# ---- 后台路径公网封锁（CDN 环境） ----
-# 使用 = 和 ^~ 确保最高优先级，不会被其他 location 绕过
-location ^~ /wp-admin/ { deny all; }
-location = /wp-admin  { deny all; }
-location = /wp-login.php { deny all; }
-location = /xmlrpc.php   { deny all; }
-CDN_BLOCK
-        inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
-
-        # 自动提取后端处理指令
-        local auto_extract
+        # 先拿到后端处理指令（admin-ajax 例外规则需要复用同一套 proxy_pass/fastcgi_pass）
+        local auto_extract backend_block=""
         safe_read -rp "是否自动从原站配置提取后端处理指令？[Y/n]: " auto_extract
         auto_extract="${auto_extract:-y}"
-        local backend_block=""
         if [[ "${auto_extract,,}" == "y" ]]; then
             extract_backend_block "$SELECTED_CONF"
             backend_block="$EXTRACTED_BACKEND"
@@ -417,48 +424,92 @@ CDN_BLOCK
             done
         fi
 
-        # 保证指令有合适的缩进（每行前加 8 个空格）
-        backend_block=$(echo "$backend_block" | sed 's/^/        /')
+        # 公网封锁规则：按用户实际输入的路径动态生成（不再硬编码固定三项）
+        {
+            echo "# ---- 后台路径公网封锁（CDN 环境） ----"
+            echo "# 使用 = 和 ^~ 确保最高优先级，不会被其他 location 绕过"
+            if [[ "${expose_ajax,,}" == "y" ]]; then
+                echo "location = /wp-admin/admin-ajax.php {"
+                echo "$backend_block" | sed 's/^/    /'
+                echo "}"
+            fi
+            for p in "${paths_arr[@]}"; do
+                if [[ "$p" == *.* ]]; then
+                    echo "location = /${p} { deny all; }"
+                else
+                    echo "location ^~ /${p}/ { deny all; }"
+                    echo "location = /${p}  { deny all; }"
+                fi
+            done
+        } > "$SELECTED_SNIPPET"
+        inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
+
+        local backend_indented
+        backend_indented=$(echo "$backend_block" | sed 's/^/        /')
 
         local internal_conf="${SITES_AVAILABLE}/10-admin-${SELECTED_DOMAIN}.conf"
-        cat > "$internal_conf" <<INTERNAL_SERVER
-# ---- 内网后台访问 Server (WireGuard 直连) ----
+        # 关键修复：模板部分用「引号包裹」的 heredoc（不做变量展开），
+        # 用占位符 + sed 替换标量值；backend_block 单独以 printf 原样写入。
+        # 原写法是不加引号的 heredoc，backend_block/证书路径里一旦出现 nginx 变量
+        # （如 $host、$remote_addr），会被 bash 提前展开——脚本开了 set -u，
+        # 未定义变量直接导致脚本报错退出，或者更隐蔽地把变量吃成空字符串。
+        {
+            cat <<'TEMPLATE_HEAD'
+# ---- 内网后台访问 Server (受信任网络直连) ----
 server {
-    listen ${wg_ip}:${wg_port} ssl http2;
-    server_name ${SELECTED_DOMAIN};
+    listen __LISTEN__ ssl;
+    http2 on;
+    server_name __DOMAIN__;
 
-    ssl_certificate     ${SSL_CERT};
-    ssl_certificate_key ${SSL_KEY};
-    # include snippets/ssl-params.conf;  # 若有可取消注释
+    ssl_certificate     __SSL_CERT__;
+    ssl_certificate_key __SSL_KEY__;
 
-    location ~ ^/(${paths// /|}) {
-        allow 10.0.0.0/8;
+    location ~ ^/(__PATHS__)(/|$) {
+        allow __ALLOWED_NET__;
         deny all;
 
-${backend_block}
+TEMPLATE_HEAD
+            printf '%s\n' "$backend_indented"
+            cat <<'TEMPLATE_TAIL'
     }
 
     location / {
         return 404;
     }
 }
-INTERNAL_SERVER
+TEMPLATE_TAIL
+        } > "$internal_conf"
+
+        # 用 # 做 sed 分隔符，避免证书路径/网段里的 / 冲突
+        sed -i \
+            -e "s#__LISTEN__#${wg_ip}:${wg_port}#" \
+            -e "s#__DOMAIN__#${SELECTED_DOMAIN}#" \
+            -e "s#__SSL_CERT__#${SSL_CERT}#" \
+            -e "s#__SSL_KEY__#${SSL_KEY}#" \
+            -e "s#__PATHS__#${paths_regex}#" \
+            -e "s#__ALLOWED_NET__#${allowed_network}#" \
+            "$internal_conf"
 
         ln -sf "$internal_conf" "${SITES_ENABLED}/10-admin-${SELECTED_DOMAIN}.conf"
         success "内网专用 Server 已创建: $internal_conf"
-        success "请确保管理设备通过 WireGuard 访问 https://${wg_ip}:${wg_port}/wp-admin"
+        success "请确保管理设备通过受信任网络访问 https://${wg_ip}:${wg_port}/${paths_arr[0]}"
+        [[ "${expose_ajax,,}" == "y" ]] && info "已放行 /wp-admin/admin-ajax.php 公网访问（前台 AJAX 所需）"
 
     else
         # 非 CDN 直连模式
         safe_read -rp "允许访问的内网 IP 段 [默认: 10.0.0.0/8]: " allowed_network
         allowed_network="${allowed_network:-10.0.0.0/8}"
-        cat > "$SELECTED_SNIPPET" <<DIRECT_IP
-# ---- 后台访问限制 (直连模式) ----
-location ^~ /wp-admin/ { allow ${allowed_network}; deny all; }
-location = /wp-admin  { allow ${allowed_network}; deny all; }
-location = /wp-login.php { allow ${allowed_network}; deny all; }
-location = /xmlrpc.php   { allow ${allowed_network}; deny all; }
-DIRECT_IP
+        {
+            echo "# ---- 后台访问限制 (直连模式) ----"
+            for p in "${paths_arr[@]}"; do
+                if [[ "$p" == *.* ]]; then
+                    echo "location = /${p} { allow ${allowed_network}; deny all; }"
+                else
+                    echo "location ^~ /${p}/ { allow ${allowed_network}; deny all; }"
+                    echo "location = /${p}  { allow ${allowed_network}; deny all; }"
+                fi
+            done
+        } > "$SELECTED_SNIPPET"
         inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
         success "已添加直连模式 IP 限制，仅 ${allowed_network} 可访问后台。"
     fi
