@@ -301,56 +301,43 @@ hide_nginx_version() {
 extract_backend_block() {
     local conf="$1"
     EXTRACTED_BACKEND=""
-    # 用 awk 提取第一个包含 proxy_pass 或 fastcgi_pass 的 location 块内容
-    # 输出该块内部的所有行（去除 location 行和花括号）
     EXTRACTED_BACKEND=$(awk '
-        BEGIN { in_block=0; brace=0; found=0; output="" }
-        /location[[:space:]]/ && !in_block {
-            # 进入 location 块
-            in_block=1
-            brace=0
-            block_content=""
-        }
-        in_block {
-            # 统计花括号
-            n = split($0, a, "")
-            for (i=1; i<=n; i++) {
-                if (a[i] == "{") brace++
-                if (a[i] == "}") brace--
+        /^[[:space:]]*location[[:space:]]/ && !inside {
+            inside = 1; brace = 0; block = ""
+            # 统计当前行花括号
+            line = $0; gsub(/[^{}]/, "", line)
+            for (i = 1; i <= length(line); i++) {
+                c = substr(line, i, 1)
+                if (c == "{") brace++
+                else if (c == "}") brace--
             }
-            # 第一行包含 location，不计入块内容，但要从下一行开始收集
-            if (brace > 0 && block_content == "") {
-                # 第一行是 location ... {，跳过
-                next
-            }
-            # 如果块已经开始，记录行
-            if (brace > 0) {
-                block_content = block_content $0 "\n"
-            }
-            # 块结束
-            if (brace == 0 && in_block) {
-                # 检查块内是否有 proxy_pass 或 fastcgi_pass
-                if (block_content ~ /(proxy_pass|fastcgi_pass)/) {
-                    output = block_content
-                    found=1
-                    exit
-                }
-                # 否则清空，继续寻找下一个块
-                in_block=0
-                block_content=""
+            if (brace == 0) {
+                # 单行块，直接检查
+                if ($0 ~ /(proxy_pass|fastcgi_pass)/) { print $0; exit }
+                inside = 0
+            } else {
+                next   # 多行块，从下一行开始收集
             }
         }
-        END {
-            if (found) print output
+        inside {
+            line = $0; gsub(/[^{}]/, "", line)
+            for (i = 1; i <= length(line); i++) {
+                c = substr(line, i, 1)
+                if (c == "{") brace++
+                else if (c == "}") brace--
+            }
+            block = block $0 "\n"
+            if (brace <= 0) {
+                if (block ~ /(proxy_pass|fastcgi_pass)/) { print block; exit }
+                inside = 0
+            }
         }
     ' "$conf")
-
     if [[ -n "$EXTRACTED_BACKEND" ]]; then
         info "已自动提取后端配置："
         echo "$EXTRACTED_BACKEND" | sed 's/^/  /'
     else
-        warn "未能自动提取后端配置，请手动输入（例如 proxy_pass http://backend;）"
-        EXTRACTED_BACKEND=""
+        warn "未能自动提取后端配置，将进入手动输入模式"
     fi
 }
 
@@ -361,13 +348,13 @@ add_admin_access_restriction() {
     local paths allowed_network
     echo -e "${CYAN}配置后台访问限制 – 仅允许 WireGuard 内网访问管理页面${NC}"
     safe_read -rp "请输入需要保护的后台路径（空格分隔）[默认: wp-admin wp-login.php xmlrpc.php]: " paths
+    paths=$(echo "$paths" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g')
     [[ -z "$paths" ]] && paths="wp-admin wp-login.php xmlrpc.php"
 
     local use_cdn
     safe_read -rp "当前站点是否使用 Cloudflare CDN？[Y/n]: " use_cdn
     use_cdn="${use_cdn:-y}"
     if [[ "${use_cdn,,}" == "y" ]]; then
-        # ── CDN 模式 ──
         echo -e "${YELLOW}检测到 CDN 环境，将创建内网专用 Server 隔离后台。${NC}"
         local wg_ip wg_port
         safe_read -rp "WireGuard 内网监听 IP [默认: $(get_wg_ip)]: " wg_ip
@@ -377,7 +364,7 @@ add_admin_access_restriction() {
 
         get_ssl_cert_paths "$SELECTED_CONF"
 
-        # 公网封锁
+        # 公网封锁规则
         cat > "$SELECTED_SNIPPET" <<CDN_BLOCK
 # ---- 后台路径公网封锁（CDN 环境） ----
 location ~ ^/(${paths// /|}) {
@@ -407,7 +394,6 @@ CDN_BLOCK
             done
         fi
 
-        # 生成内网 Server
         local internal_conf="${SITES_AVAILABLE}/10-admin-${SELECTED_DOMAIN}.conf"
         cat > "$internal_conf" <<INTERNAL_SERVER
 # ---- 内网后台访问 Server (WireGuard 直连) ----
@@ -438,7 +424,7 @@ INTERNAL_SERVER
         success "请确保管理设备通过 WireGuard 访问 https://${wg_ip}:${wg_port}/wp-admin"
 
     else
-        # ── 非 CDN 模式 ──
+        # 非 CDN 直连模式
         safe_read -rp "允许访问的内网 IP 段 [默认: 10.0.0.0/8]: " allowed_network
         allowed_network="${allowed_network:-10.0.0.0/8}"
         cat > "$SELECTED_SNIPPET" <<DIRECT_IP
