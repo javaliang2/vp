@@ -1,9 +1,9 @@
 #!/bin/bash
 # ============================================================
-#  nginx-web-security.sh — Nginx 层 Web 安全加固 (无冲突版)
+#  nginx-web-security.sh — Nginx Web 安全加固 (CDN 隔离完整版)
 #  配合 nginx-gateway.sh 使用，专注通用 Web 安全
 #  功能：安全头 / 路径防护 / 防盗链 / WAF / CSP / 爬虫封锁 / 隐藏版本
-#        后台访问限制 (WireGuard 内网，WordPress 后台全覆盖)
+#        后台访问限制（支持 Cloudflare CDN 双 Server 隔离）
 #  不包含 SSL 强化（主脚本已处理）和 WordPress 特殊规则（避免冲突）
 # ============================================================
 set -euo pipefail
@@ -14,7 +14,7 @@ shopt -s extglob
 # ──────────────────────────────────────────────────────────
 NGINX_CONF_DIR="${NGINX_CONF_DIR:-/etc/nginx}"
 SITES_AVAILABLE="${NGINX_CONF_DIR}/sites-available"
-SITES_DIR="${SITES_DIR:-${NGINX_CONF_DIR}/sites-enabled}"
+SITES_ENABLED="${SITES_DIR:-${NGINX_CONF_DIR}/sites-enabled}"
 SNIPPET_DIR="${NGINX_CONF_DIR}/snippets"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/nginx-gateway}"
 LOG_FILE="/var/log/nginx-web-security.log"
@@ -46,14 +46,15 @@ confirm() {
 }
 
 # ──────────────────────────────────────────────────────────
-# 工具：列出所有站点，供用户选择
+# 工具：列出所有站点，供用户选择（跳过系统保护配置和内网管理配置）
 # ──────────────────────────────────────────────────────────
 list_domains() {
     local -a domains=()
     for conf in "${SITES_AVAILABLE}"/*.conf; do
         [[ -f "$conf" ]] || continue
         local name; name=$(basename "$conf" .conf)
-        [[ "$name" == 00-* ]] && continue   # 跳过系统保护配置
+        # 跳过系统保护配置和内网专用 Server
+        [[ "$name" == 00-* || "$name" == 10-* ]] && continue
         domains+=("$name")
     done
 
@@ -88,12 +89,34 @@ inject_include() {
     if grep -qF "$marker" "$conf"; then
         return
     fi
+    # 如果存在 location / {} 块，在其前插入；否则追加到文件末尾
     if grep -qE '^[[:space:]]*location[[:space:]]+/[[:space:]]*{' "$conf"; then
         sed -i "0,/^[[:space:]]*location[[:space:]]*\/[[:space:]]*{/ s//${marker}\n&/" "$conf"
     else
         sed -i "\$i ${marker}" "$conf"
     fi
     info "已将安全配置引入站点: $conf"
+}
+
+# ──────────────────────────────────────────────────────────
+# 自动获取 WireGuard 接口 IPv4（取第一个）
+# ──────────────────────────────────────────────────────────
+get_wg_ip() {
+    local ip
+    ip=$(ip -4 addr show wg0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+    echo "${ip:-10.0.0.1}"
+}
+
+# ──────────────────────────────────────────────────────────
+# 从站点配置中提取 SSL 证书路径（假设只使用第一个 server 块的证书）
+# ──────────────────────────────────────────────────────────
+get_ssl_cert_paths() {
+    local conf="$1"
+    SSL_CERT=$(grep -m1 '^\s*ssl_certificate\s' "$conf" | sed -E 's/.*ssl_certificate\s+//;s/;//')
+    SSL_KEY=$(grep -m1 '^\s*ssl_certificate_key\s' "$conf" | sed -E 's/.*ssl_certificate_key\s+//;s/;//')
+    [[ -z "$SSL_CERT" || -z "$SSL_KEY" ]] && die "无法从 $conf 读取 SSL 证书路径，请手动指定"
+    info "SSL 证书: $SSL_CERT"
+    info "SSL 私钥: $SSL_KEY"
 }
 
 # ──────────────────────────────────────────────────────────
@@ -273,34 +296,95 @@ hide_nginx_version() {
 }
 
 # ──────────────────────────────────────────────────────────
-# 10. 后台访问限制 (WordPress 默认路径全覆盖)
+# 10. 后台访问限制（支持 Cloudflare CDN 双 Server 隔离）
 # ──────────────────────────────────────────────────────────
 add_admin_access_restriction() {
     local paths allowed_network
     echo -e "${CYAN}配置后台访问限制 – 仅允许 WireGuard 内网访问管理页面${NC}"
     safe_read -rp "请输入需要保护的后台路径（多个用空格分隔）[默认: wp-admin wp-login.php xmlrpc.php]: " paths
-    [[ -z "$paths" ]] && paths="wp-admin wp-login.php xmlrpc.php"   # ← WordPress 核心后台全覆盖
+    [[ -z "$paths" ]] && paths="wp-admin wp-login.php xmlrpc.php"
 
-    safe_read -rp "允许访问的内网 IP 段 [默认: 10.0.0.0/8]: " allowed_network
-    [[ -z "$allowed_network" ]] && allowed_network="10.0.0.0/8"
+    local use_cdn
+    safe_read -rp "当前站点是否使用 Cloudflare CDN？[Y/n]: " use_cdn
+    use_cdn="${use_cdn:-y}"
+    if [[ "${use_cdn,,}" == "y" ]]; then
+        # ── CDN 模式：生成双 Server 配置 ──
+        echo -e "${YELLOW}检测到 CDN 环境，将创建内网专用 Server 隔离后台。${NC}"
+        local wg_ip wg_port
+        safe_read -rp "WireGuard 内网监听 IP [默认: $(get_wg_ip)]: " wg_ip
+        wg_ip="${wg_ip:-$(get_wg_ip)}"
+        safe_read -rp "内网 Server 监听端口 [默认: 443]: " wg_port
+        wg_port="${wg_port:-443}"
 
-    # 将空格分隔的路径转换为正则选择分支
-    local path_regex
-    path_regex=$(echo "$paths" | sed -E 's/[[:space:]]+/|/g')
+        # 自动获取 SSL 证书路径
+        get_ssl_cert_paths "$SELECTED_CONF"
 
-    cat >> "$SELECTED_SNIPPET" <<RESTRICT
+        # 公网侧：后台路径全部拒绝
+        cat > "$SELECTED_SNIPPET" <<CDN_BLOCK
+# ---- 后台路径公网封锁（CDN 环境） ----
+location ~ ^/(${paths// /|}) {
+    deny all;
+    access_log off;
+    log_not_found off;
+}
+CDN_BLOCK
+        inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
 
-# ---- 后台访问限制 (WireGuard 内网) ----
-location ~ ^/(${path_regex}) {
+        # 生成内网专用 Server
+        local internal_conf="${SITES_AVAILABLE}/10-admin-${SELECTED_DOMAIN}.conf"
+        cat > "$internal_conf" <<INTERNAL_SERVER
+# ---- 内网后台访问 Server (WireGuard 直连) ----
+server {
+    listen ${wg_ip}:${wg_port} ssl http2;
+    server_name ${SELECTED_DOMAIN};
+
+    ssl_certificate     ${SSL_CERT};
+    ssl_certificate_key ${SSL_KEY};
+    # 如果存在统一的 SSL 参数片断，取消下面的注释
+    # include snippets/ssl-params.conf;
+
+    location ~ ^/(${paths// /|}) {
+        allow 10.0.0.0/8;
+        deny all;
+
+        # ★★★ 请根据实际后端处理方式修改以下配置 ★★★
+        # 如果是 PHP-FPM (WordPress 常见):
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php8.1-fpm.sock;  # 按实际版本修改
+        # 如果是反向代理到其他端口:
+        # proxy_pass http://127.0.0.1:8080;
+    }
+
+    location / {
+        return 404;
+    }
+}
+INTERNAL_SERVER
+
+        # 启用内网 Server
+        ln -sf "$internal_conf" "${SITES_ENABLED}/10-admin-${SELECTED_DOMAIN}.conf"
+        success "内网专用 Server 已创建: $internal_conf"
+        success "请确保管理设备通过 WireGuard 访问 https://${wg_ip}:${wg_port}/wp-admin"
+        warn "请根据实际 PHP 版本或反代配置，编辑 ${internal_conf} 中的 location 块！"
+
+    else
+        # ── 非 CDN 模式：直接在公网站点限制 IP ──
+        safe_read -rp "允许访问的内网 IP 段 [默认: 10.0.0.0/8]: " allowed_network
+        allowed_network="${allowed_network:-10.0.0.0/8}"
+        cat > "$SELECTED_SNIPPET" <<DIRECT_IP
+# ---- 后台访问限制 (直连模式) ----
+location ~ ^/(${paths// /|}) {
     allow ${allowed_network};
     deny all;
 }
-RESTRICT
-    success "后台访问限制已生效：路径 [${paths}] 仅允许 ${allowed_network} 访问"
+DIRECT_IP
+        inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
+        success "已添加直连模式 IP 限制，仅 ${allowed_network} 可访问后台。"
+    fi
 }
 
 # ──────────────────────────────────────────────────────────
-# 一键全部加固（不包含后台限制，避免误限制无后台站点）
+# 一键全部加固（不包含后台访问限制，避免误操作）
 # ──────────────────────────────────────────────────────────
 apply_all_security() {
     info "开始为 ${SELECTED_DOMAIN} 执行全面安全加固..."
@@ -313,8 +397,7 @@ apply_all_security() {
     add_bad_bot_blocking
     add_csp
     add_path_traversal_protection
-    # 后台访问限制按需手动添加，取消下一行注释可自动启用 WordPress 默认限制
-    # add_admin_access_restriction
+    # 后台限制需手动执行，避免误封
 
     inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
     if nginx -t; then
@@ -327,10 +410,11 @@ apply_all_security() {
 }
 
 # ──────────────────────────────────────────────────────────
-# 移除安全配置
+# 移除安全配置（包括内网 Server）
 # ──────────────────────────────────────────────────────────
 remove_security() {
     list_domains
+    # 移除公网 snippet 引用
     if [[ -f "$SELECTED_SNIPPET" ]]; then
         rm -f "$SELECTED_SNIPPET"
         success "已删除安全片段: $SELECTED_SNIPPET"
@@ -338,6 +422,13 @@ remove_security() {
     if grep -qF "include ${SELECTED_SNIPPET};" "$SELECTED_CONF"; then
         sed -i "\|include ${SELECTED_SNIPPET};|d" "$SELECTED_CONF"
         success "已从站点配置中移除 include"
+    fi
+    # 移除可能的内网 Server
+    local internal_conf="${SITES_AVAILABLE}/10-admin-${SELECTED_DOMAIN}.conf"
+    if [[ -f "$internal_conf" ]]; then
+        rm -f "$internal_conf"
+        rm -f "${SITES_ENABLED}/10-admin-${SELECTED_DOMAIN}.conf"
+        success "已删除内网后台 Server: $internal_conf"
     fi
     nginx -t && systemctl reload nginx && success "Nginx 重载完成" || warn "配置检查失败，请手动处理"
 }
@@ -351,7 +442,7 @@ interactive_menu() {
         clear
         echo -e "${BOLD}${GREEN}"
         echo "  ╔════════════════════════════════════════════════╗"
-        echo "  ║      Nginx Web 安全加固 (通用版)              ║"
+        echo "  ║      Nginx Web 安全加固 (CDN 隔离版)          ║"
         echo "  ╚════════════════════════════════════════════════╝"
         echo -e "${NC}"
         echo -e " ${CYAN}1)${NC} 添加安全响应头"
@@ -363,7 +454,7 @@ interactive_menu() {
         echo -e " ${CYAN}7)${NC} 配置 CSP"
         echo -e " ${CYAN}8)${NC} 路径遍历防护"
         echo -e " ${CYAN}9)${NC} 隐藏 Nginx 版本号 (全局)"
-        echo -e " ${CYAN}10)${NC} 后台访问限制 (WordPress/自定义)"
+        echo -e " ${CYAN}10)${NC} 后台访问限制 (WordPress/CDN 双 Server 隔离)"
         echo ""
         echo -e " ${GREEN}A)${NC} 一键全部加固 (推荐)"
         echo -e " ${RED}R)${NC} 移除站点的安全配置"
@@ -433,10 +524,8 @@ interactive_menu() {
                 ;;
             10)
                 list_domains
-                echo "# 后台访问限制" > "$SELECTED_SNIPPET"
                 add_admin_access_restriction
-                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
-                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
+                nginx -t && systemctl reload nginx && success "后台限制已生效" || die "配置错误，请检查"
                 ;;
             [Aa])
                 list_domains
@@ -478,20 +567,59 @@ main() {
     [[ -f "$SELECTED_CONF" ]] || die "站点配置不存在: $SELECTED_CONF"
 
     case "$action" in
-        headers)    add_security_headers ;;
-        files)      add_file_protection ;;
-        methods)    add_method_restriction ;;
-        hotlink)    add_hotlink_protection ;;
-        waf)        add_basic_waf ;;
-        bots)       add_bad_bot_blocking ;;
-        csp)        add_csp ;;
-        path)       add_path_traversal_protection ;;
-        admin-restrict) add_admin_access_restriction ;;
-        all)        apply_all_security ;;
-        remove)     remove_security ;;
-        *)          echo "未知动作: $action"; exit 1 ;;
+        headers)
+            echo "# headers" > "$SELECTED_SNIPPET"
+            add_security_headers
+            ;;
+        files)
+            echo "# files" > "$SELECTED_SNIPPET"
+            add_file_protection
+            ;;
+        methods)
+            echo "# methods" > "$SELECTED_SNIPPET"
+            add_method_restriction
+            ;;
+        hotlink)
+            echo "# hotlink" > "$SELECTED_SNIPPET"
+            add_hotlink_protection
+            ;;
+        waf)
+            echo "# waf" > "$SELECTED_SNIPPET"
+            add_basic_waf
+            ;;
+        bots)
+            echo "# bots" > "$SELECTED_SNIPPET"
+            add_bad_bot_blocking
+            ;;
+        csp)
+            echo "# csp" > "$SELECTED_SNIPPET"
+            add_csp
+            ;;
+        path)
+            echo "# path" > "$SELECTED_SNIPPET"
+            add_path_traversal_protection
+            ;;
+        admin-restrict)
+            add_admin_access_restriction
+            ;;
+        all)
+            apply_all_security
+            ;;
+        remove)
+            remove_security
+            ;;
+        *)
+            echo "未知动作: $action"
+            echo "可用动作: headers files methods hotlink waf bots csp path admin-restrict all remove"
+            exit 1
+            ;;
     esac
-    inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
+
+    # admin-restrict 内部已自行 inject_include，无需再次注入
+    if [[ "$action" != "admin-restrict" && "$action" != "remove" && "$action" != "all" ]]; then
+        inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
+    fi
+
     nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
 }
 
