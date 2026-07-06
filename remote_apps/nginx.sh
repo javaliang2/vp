@@ -168,10 +168,18 @@ success "安装完成: ${OLD_VERSION} → ${NEW_VERSION}"
 
 # ── 关键：官方 nginx.org 包不带 sites-available/sites-enabled 这套约定，
 # 只有 conf.d/。而 nginx-gateway.sh / nginx-web-security.sh 都硬编码依赖
-# sites-available/sites-enabled，如果是首次安装（这两个目录不存在），
-# 需要手动补上，否则你现有脚本会直接找不到任何站点配置。
-if [[ ! -d /etc/nginx/sites-available ]]; then
-    info "检测到首次安装（官方包默认没有 sites-available/sites-enabled），正在补齐..."
+# sites-available/sites-enabled，需要单独校验：
+#   1) 目录是否存在（首次安装场景）
+#   2) nginx.conf 里 include 那行是否存在 —— 即使目录已存在（升级场景），
+#      dpkg 处理 conffile 时也可能把 nginx.conf 直接换成官方包的默认模板
+#      （如果本地文件跟旧包默认模板完全一致，dpkg 判断“无本地修改”会静默覆盖），
+#      导致目录还在但 include 行被冲掉，只检查目录存在与否会漏掉这种情况。
+NEED_FIX=0
+[[ -d /etc/nginx/sites-available ]] || NEED_FIX=1
+grep -qE 'include[[:space:]]+/etc/nginx/sites-enabled/\*' /etc/nginx/nginx.conf 2>/dev/null || NEED_FIX=1
+
+if (( NEED_FIX )); then
+    info "检测到 sites-available/sites-enabled 缺失或 nginx.conf 未 include，正在补齐..."
 
     ts=$(date +%Y%m%d_%H%M%S)
     cp /etc/nginx/nginx.conf "${BACKUP_DIR}/nginx.conf.bak-${ts}"
@@ -180,12 +188,12 @@ if [[ ! -d /etc/nginx/sites-available ]]; then
 
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
 
-    if ! grep -q 'sites-enabled' /etc/nginx/nginx.conf; then
+    if ! grep -qE 'include[[:space:]]+/etc/nginx/sites-enabled/\*' /etc/nginx/nginx.conf; then
         if grep -qE 'include\s+/etc/nginx/conf\.d/\*\.conf;' /etc/nginx/nginx.conf; then
-            sed -i '/include\s*\/etc\/nginx\/conf\.d\/\*\.conf;/a\    include /etc/nginx/sites-enabled/*.conf;' /etc/nginx/nginx.conf
+            sed -i '/include\s*\/etc\/nginx\/conf\.d\/\*\.conf;/a\    include /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
         else
             # 找不到 conf.d include，退而求其次，插到 http {} 块开头
-            sed -i '/^http\s*{/a\    include /etc/nginx/sites-enabled/*.conf;' /etc/nginx/nginx.conf
+            sed -i '/^http\s*{/a\    include /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
         fi
     fi
 
@@ -197,7 +205,7 @@ if [[ ! -d /etc/nginx/sites-available ]]; then
         die "已回滚，请手动检查 /etc/nginx/nginx.conf 后重新运行本脚本"
     fi
 else
-    info "sites-available/sites-enabled 已存在（升级场景），无需额外处理"
+    info "sites-available/sites-enabled 及 nginx.conf include 均已就绪，无需处理"
     nginx -t || warn "现有配置 nginx -t 未通过，请在重启 nginx 前手动排查，不要贸然重启"
 fi
 
