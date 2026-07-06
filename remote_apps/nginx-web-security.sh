@@ -1,10 +1,8 @@
 #!/bin/bash
 # ============================================================
-#  nginx-web-security.sh — Nginx Web 安全加固 (CDN 隔离完整版)
-#  配合 nginx-gateway.sh 使用，专注通用 Web 安全
-#  功能：安全头 / 路径防护 / 防盗链 / WAF / CSP / 爬虫封锁 / 隐藏版本
-#        后台访问限制（支持 Cloudflare CDN 双 Server 隔离）
-#  不包含 SSL 强化（主脚本已处理）和 WordPress 特殊规则（避免冲突）
+#  nginx-admin-restrict.sh — 后台访问限制（支持 Cloudflare CDN 双 Server 隔离）
+#  从 nginx-web-security.sh 精简而来，只保留后台访问限制这一项功能
+#  配合 nginx-gateway.sh 使用
 # ============================================================
 set -euo pipefail
 shopt -s extglob
@@ -17,10 +15,7 @@ SITES_AVAILABLE="${NGINX_CONF_DIR}/sites-available"
 SITES_ENABLED="${SITES_DIR:-${NGINX_CONF_DIR}/sites-enabled}"
 SNIPPET_DIR="${NGINX_CONF_DIR}/snippets"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/nginx-gateway}"
-LOG_FILE="/var/log/nginx-web-security.log"
-
-mkdir -p "$SNIPPET_DIR" "$BACKUP_DIR"
-touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/dev/null"
+LOG_FILE="/var/log/nginx-admin-restrict.log"
 
 # ──────────────────────────────────────────────────────────
 # 颜色 & 日志
@@ -36,6 +31,11 @@ error()   { _log "${RED}[错误]${NC}  $*"; }
 die()     { error "$*"; exit 1; }
 
 require_root() { [[ $EUID -eq 0 ]] || die "请以 root 身份运行本脚本（sudo $0）"; }
+require_root
+
+mkdir -p "$SNIPPET_DIR" "$BACKUP_DIR"
+touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/dev/null"
+
 safe_read() {
     set +e; read -r "$@"; local _rc=$?; set -e; return $_rc
 }
@@ -119,184 +119,8 @@ get_ssl_cert_paths() {
     info "SSL 私钥: $SSL_KEY"
 }
 
-# ──────────────────────────────────────────────────────────
-# 1. 安全响应头
-# ──────────────────────────────────────────────────────────
-add_security_headers() {
-    cat > "$SELECTED_SNIPPET" <<'HEADERS'
-# ---- 安全响应头 ----
-add_header X-Frame-Options "SAMEORIGIN" always;
-add_header X-Content-Type-Options "nosniff" always;
-add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-add_header X-XSS-Protection "1; mode=block" always;
-add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
-HEADERS
-    success "安全响应头已生成"
-}
-
-# ──────────────────────────────────────────────────────────
-# 2. 敏感文件封锁
-# ──────────────────────────────────────────────────────────
-add_file_protection() {
-    cat >> "$SELECTED_SNIPPET" <<'FILEBLOCK'
-
-# ---- 敏感文件保护 ----
-location ~ /\. {
-    deny all;
-    access_log off;
-    log_not_found off;
-}
-location ~* \.(bak|config|sql|fla|psd|ini|log|sh|inc|swp|dist)$ {
-    deny all;
-    access_log off;
-    log_not_found off;
-}
-location ~* (\.git|\.svn|\.hg|\.env|\.htpasswd|composer\.(json|lock)|package\.json|yarn\.lock)$ {
-    deny all;
-    access_log off;
-    log_not_found off;
-}
-FILEBLOCK
-    success "敏感文件封锁规则已添加"
-}
-
-# ──────────────────────────────────────────────────────────
-# 3. 请求方法限制
-# ──────────────────────────────────────────────────────────
-add_method_restriction() {
-    cat >> "$SELECTED_SNIPPET" <<'METHODS'
-
-# ---- HTTP 方法限制 ----
-if ($request_method !~ ^(GET|HEAD|POST|OPTIONS)$ ) {
-    return 405;
-}
-METHODS
-    success "请求方法已限制"
-}
-
-# ──────────────────────────────────────────────────────────
-# 4. 防盗链
-# ──────────────────────────────────────────────────────────
-add_hotlink_protection() {
-    local allowed_domains=""
-    echo -e "${CYAN}请输入允许引用资源的域名（多个用空格分隔，留空则只允许本站）${NC}"
-    echo "示例: yoursite.com cdn.yoursite.com"
-    safe_read -rp "允许的域名: " allowed_domains
-    [[ -z "$allowed_domains" ]] && allowed_domains="none"
-
-    cat >> "$SELECTED_SNIPPET" <<HOTLINK
-
-# ---- 防盗链 (图片/视频) ----
-location ~* \.(gif|png|jpe?g|svg|webp|bmp|ico|mp4|webm|ogg)$ {
-    valid_referers none blocked server_names ${allowed_domains};
-    if (\$invalid_referer) {
-        return 403;
-    }
-}
-HOTLINK
-    success "防盗链规则已应用（允许: ${allowed_domains}）"
-}
-
-# ──────────────────────────────────────────────────────────
-# 5. 基础 WAF
-# ──────────────────────────────────────────────────────────
-add_basic_waf() {
-    cat >> "$SELECTED_SNIPPET" <<'WAF'
-
-# ---- 简单 WAF 过滤 ----
-set $block_request 0;
-if ($query_string ~* "(<|>|'|%3C|%3E|%27|%22|%28|%29|%0A|%0D|%09|union.*select|select.*from|insert.*into|drop.*table|update.*set|delete.*from|script|alert|onmouseover|onerror|onload|eval\(|document\.cookie|\.\.\/)") {
-    set $block_request 1;
-}
-if ($request_uri ~* "(<|>|'|%3C|%3E|%27|%22|%28|%29|%0A|%0D|%09|%00|\.\.\/|\.\.\\\|\/\.\/)") {
-    set $block_request 1;
-}
-if ($block_request = 1) {
-    return 403;
-}
-WAF
-    success "基础 WAF 过滤规则已添加"
-}
-
-# ──────────────────────────────────────────────────────────
-# 6. 恶意爬虫封锁
-# ──────────────────────────────────────────────────────────
-add_bad_bot_blocking() {
-    cat >> "$SELECTED_SNIPPET" <<'BOTBLOCK'
-
-# ---- 恶意爬虫封锁 ----
-if ($http_user_agent ~* (scrapy|curl|wget|python-requests|libwww|perl|nikto|sqlmap|masscan|nmap|zgrab|gobuster|dirbuster|nessus|openvas|acunetix|burp|whatweb|wpscan|joomscan|havij|netsparker|AppScan|WebInspect|ZAP|Vega|Arachni|Skipfish|Wfuzz|Brutus|Hydra|Medusa|JohnTheRipper|Hashcat)) {
-    return 403;
-}
-BOTBLOCK
-    success "恶意爬虫 User-Agent 封锁已添加"
-}
-
-# ──────────────────────────────────────────────────────────
-# 7. 内容安全策略 (CSP)
-# ──────────────────────────────────────────────────────────
-add_csp() {
-    echo -e "${CYAN}配置内容安全策略 (CSP)${NC}"
-    local default_src="'self'"
-    safe_read -rp "默认加载源 (default-src) [默认 'self']: " _ds
-    [[ -n "$_ds" ]] && default_src="$_ds"
-
-    local script_src="'self' 'unsafe-inline' 'unsafe-eval'"
-    safe_read -rp "脚本加载源 (script-src) [默认 'self' 'unsafe-inline' 'unsafe-eval']: " _ss
-    [[ -n "$_ss" ]] && script_src="$_ss"
-
-    local style_src="'self' 'unsafe-inline'"
-    safe_read -rp "样式加载源 (style-src) [默认 'self' 'unsafe-inline']: " _st
-    [[ -n "$_st" ]] && style_src="$_st"
-
-    cat >> "$SELECTED_SNIPPET" <<CSP
-
-# ---- 内容安全策略 ----
-add_header Content-Security-Policy "default-src ${default_src}; script-src ${script_src}; style-src ${style_src}; img-src * data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; form-action 'self';" always;
-CSP
-    success "CSP 策略已添加"
-}
-
-# ──────────────────────────────────────────────────────────
-# 8. 路径遍历防护
-# ──────────────────────────────────────────────────────────
-add_path_traversal_protection() {
-    cat >> "$SELECTED_SNIPPET" <<'PATHSAFE'
-
-# ---- 路径安全 ----
-if ($request_uri ~* "\.\." ) {
-    return 403;
-}
-autoindex off;
-PATHSAFE
-    success "路径遍历防护已启用"
-}
-
-# ──────────────────────────────────────────────────────────
-# 9. 隐藏 Nginx 版本号（全局）
-# ──────────────────────────────────────────────────────────
-hide_nginx_version() {
-    local conf="${NGINX_CONF_DIR}/nginx.conf"
-    [[ -f "$conf" ]] || die "找不到 $conf"
-    # 备份
-    local ts; ts=$(date +%Y%m%d_%H%M%S)
-    cp "$conf" "${BACKUP_DIR}/nginx.conf.bak-${ts}"
-    info "已备份 $conf -> ${BACKUP_DIR}/nginx.conf.bak-${ts}"
-
-    if grep -qE "^\s*server_tokens\s+off;" "$conf"; then
-        success "server_tokens 已经是 off，无需修改"
-        return
-    fi
-    if grep -q "server_tokens" "$conf"; then
-        sed -i 's/^\s*server_tokens\s.*/    server_tokens off;/' "$conf"
-    else
-        sed -i '/^http {/a\    server_tokens off;' "$conf"
-    fi
-    nginx -t && systemctl reload nginx && success "已隐藏 Nginx 版本号，server_tokens 已设为 off" || die "配置错误"
-}
-
 # ============================================================
-# 新增：自动提取原站点配置中的后端处理指令
+# 自动提取原站点配置中的后端处理指令
 # ============================================================
 extract_backend_block() {
     local conf="$1"
@@ -304,7 +128,6 @@ extract_backend_block() {
     EXTRACTED_BACKEND=$(awk '
         /^[[:space:]]*location[[:space:]]/ && !inside {
             inside = 1; brace = 0; inner = ""
-            # 计算当前行花括号数量
             line = $0; gsub(/[^{}]/, "", line)
             for (i = 1; i <= length(line); i++) {
                 c = substr(line, i, 1)
@@ -312,7 +135,6 @@ extract_backend_block() {
                 else if (c == "}") brace--
             }
             if (brace == 0) {
-                # 单行 location / { ... }，提取 { 和 } 之间的内容
                 split($0, parts, /{/)
                 if (length(parts) > 1) {
                     inner = parts[2]
@@ -324,24 +146,19 @@ extract_backend_block() {
                 }
                 inside = 0
             } else {
-                # 多行块：跳过当前行（只包含 {），下一行开始收集内部内容
                 next
             }
         }
         inside {
-            # 统计当前行的花括号，更新 brace 深度
             line = $0; gsub(/[^{}]/, "", line)
             for (i = 1; i <= length(line); i++) {
                 c = substr(line, i, 1)
                 if (c == "{") brace++
                 else if (c == "}") brace--
             }
-            # 如果已经到达闭合括号 (brace <= 0)，说明当前行包含结尾的 }
             if (brace <= 0) {
-                # 去掉本行末尾的 } 及其后空白
                 sub(/}[[:space:]]*$/, "", $0)
                 inner = inner $0 "\n"
-                # 去掉最终可能的换行
                 sub(/[[:space:]]+$/, "", inner)
                 if (inner ~ /(proxy_pass|fastcgi_pass)/) {
                     print inner
@@ -350,7 +167,6 @@ extract_backend_block() {
                 inside = 0
                 next
             }
-            # 否则是正常内部行，直接追加
             inner = inner $0 "\n"
         }
     ' "$conf")
@@ -364,7 +180,7 @@ extract_backend_block() {
 }
 
 # ============================================================
-# 10. 后台访问限制（支持 CDN 双 Server 隔离 + 自动提取后端）
+# 后台访问限制（支持 CDN 双 Server 隔离 + 自动提取后端）
 # ============================================================
 add_admin_access_restriction() {
     local paths_input allowed_network
@@ -448,11 +264,9 @@ add_admin_access_restriction() {
         backend_indented=$(echo "$backend_block" | sed 's/^/        /')
 
         local internal_conf="${SITES_AVAILABLE}/10-admin-${SELECTED_DOMAIN}.conf"
-        # 关键修复：模板部分用「引号包裹」的 heredoc（不做变量展开），
-        # 用占位符 + sed 替换标量值；backend_block 单独以 printf 原样写入。
-        # 原写法是不加引号的 heredoc，backend_block/证书路径里一旦出现 nginx 变量
-        # （如 $host、$remote_addr），会被 bash 提前展开——脚本开了 set -u，
-        # 未定义变量直接导致脚本报错退出，或者更隐蔽地把变量吃成空字符串。
+        # 用「引号包裹」的 heredoc（不做变量展开），占位符 + sed 替换标量值；
+        # backend_block 单独以 printf 原样写入，避免其中的 nginx 变量（如 $host）
+        # 被 bash 提前展开（脚本开了 set -u，未定义变量会直接报错退出）。
         {
             cat <<'TEMPLATE_HEAD'
 # ---- 内网后台访问 Server (受信任网络直连) ----
@@ -516,37 +330,10 @@ TEMPLATE_TAIL
 }
 
 # ──────────────────────────────────────────────────────────
-# 一键全部加固（不包含后台访问限制，避免误操作）
-# ──────────────────────────────────────────────────────────
-apply_all_security() {
-    info "开始为 ${SELECTED_DOMAIN} 执行全面安全加固..."
-    echo "# Nginx Web 安全加固: ${SELECTED_DOMAIN} (生成时间: $(date))" > "$SELECTED_SNIPPET"
-    add_security_headers
-    add_file_protection
-    add_method_restriction
-    add_hotlink_protection
-    add_basic_waf
-    add_bad_bot_blocking
-    add_csp
-    add_path_traversal_protection
-    # 后台限制需手动执行，避免误封
-
-    inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
-    if nginx -t; then
-        systemctl reload nginx
-        success "全部安全规则已应用，Nginx 重载成功"
-    else
-        error "Nginx 配置测试失败！已自动移除引入，请检查"
-        sed -i "\|include ${SELECTED_SNIPPET};|d" "$SELECTED_CONF"
-    fi
-}
-
-# ──────────────────────────────────────────────────────────
 # 移除安全配置（包括内网 Server）
 # ──────────────────────────────────────────────────────────
 remove_security() {
     list_domains
-    # 移除公网 snippet 引用
     if [[ -f "$SELECTED_SNIPPET" ]]; then
         rm -f "$SELECTED_SNIPPET"
         success "已删除安全片段: $SELECTED_SNIPPET"
@@ -555,7 +342,6 @@ remove_security() {
         sed -i "\|include ${SELECTED_SNIPPET};|d" "$SELECTED_CONF"
         success "已从站点配置中移除 include"
     fi
-    # 移除可能的内网 Server
     local internal_conf="${SITES_AVAILABLE}/10-admin-${SELECTED_DOMAIN}.conf"
     if [[ -f "$internal_conf" ]]; then
         rm -f "$internal_conf"
@@ -569,26 +355,14 @@ remove_security() {
 # 交互式菜单
 # ──────────────────────────────────────────────────────────
 interactive_menu() {
-    require_root
     while true; do
         clear
         echo -e "${BOLD}${GREEN}"
         echo "  ╔════════════════════════════════════════════════╗"
-        echo "  ║      Nginx Web 安全加固 (CDN 隔离版)          ║"
+        echo "  ║   Nginx 后台访问限制 (CDN 双 Server 隔离)       ║"
         echo "  ╚════════════════════════════════════════════════╝"
         echo -e "${NC}"
-        echo -e " ${CYAN}1)${NC} 添加安全响应头"
-        echo -e " ${CYAN}2)${NC} 敏感文件保护"
-        echo -e " ${CYAN}3)${NC} 限制请求方法"
-        echo -e " ${CYAN}4)${NC} 防盗链"
-        echo -e " ${CYAN}5)${NC} 基础 WAF 规则"
-        echo -e " ${CYAN}6)${NC} 恶意爬虫封锁"
-        echo -e " ${CYAN}7)${NC} 配置 CSP"
-        echo -e " ${CYAN}8)${NC} 路径遍历防护"
-        echo -e " ${CYAN}9)${NC} 隐藏 Nginx 版本号 (全局)"
-        echo -e " ${CYAN}10)${NC} 后台访问限制 (WordPress/CDN 双 Server 隔离)"
-        echo ""
-        echo -e " ${GREEN}A)${NC} 一键全部加固 (推荐)"
+        echo -e " ${CYAN}1)${NC} 后台访问限制 (WordPress/CDN 双 Server 隔离)"
         echo -e " ${RED}R)${NC} 移除站点的安全配置"
         echo -e " ${CYAN}Q)${NC} 退出"
         echo ""
@@ -597,71 +371,8 @@ interactive_menu() {
         case "$choice" in
             1)
                 list_domains
-                echo "# 安全头" > "$SELECTED_SNIPPET"
-                add_security_headers
-                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
-                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
-                ;;
-            2)
-                list_domains
-                echo "# 文件保护" > "$SELECTED_SNIPPET"
-                add_file_protection
-                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
-                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
-                ;;
-            3)
-                list_domains
-                echo "# 方法限制" > "$SELECTED_SNIPPET"
-                add_method_restriction
-                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
-                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
-                ;;
-            4)
-                list_domains
-                echo "# 防盗链" > "$SELECTED_SNIPPET"
-                add_hotlink_protection
-                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
-                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
-                ;;
-            5)
-                list_domains
-                echo "# WAF" > "$SELECTED_SNIPPET"
-                add_basic_waf
-                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
-                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
-                ;;
-            6)
-                list_domains
-                echo "# 爬虫封锁" > "$SELECTED_SNIPPET"
-                add_bad_bot_blocking
-                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
-                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
-                ;;
-            7)
-                list_domains
-                echo "# CSP" > "$SELECTED_SNIPPET"
-                add_csp
-                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
-                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
-                ;;
-            8)
-                list_domains
-                echo "# 路径安全" > "$SELECTED_SNIPPET"
-                add_path_traversal_protection
-                inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
-                nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
-                ;;
-            9)
-                hide_nginx_version
-                ;;
-            10)
-                list_domains
                 add_admin_access_restriction
                 nginx -t && systemctl reload nginx && success "后台限制已生效" || die "配置错误，请检查"
-                ;;
-            [Aa])
-                list_domains
-                apply_all_security
                 ;;
             [Rr])
                 remove_security
@@ -686,12 +397,7 @@ main() {
         exit 0
     fi
     local domain="${1}"
-    local action="${2:-all}"
-
-    if [[ "$domain" == "hide-version" ]]; then
-        hide_nginx_version
-        exit 0
-    fi
+    local action="${2:-admin-restrict}"
 
     SELECTED_DOMAIN="$domain"
     SELECTED_CONF="${SITES_AVAILABLE}/${SELECTED_DOMAIN}.conf"
@@ -699,60 +405,19 @@ main() {
     [[ -f "$SELECTED_CONF" ]] || die "站点配置不存在: $SELECTED_CONF"
 
     case "$action" in
-        headers)
-            echo "# headers" > "$SELECTED_SNIPPET"
-            add_security_headers
-            ;;
-        files)
-            echo "# files" > "$SELECTED_SNIPPET"
-            add_file_protection
-            ;;
-        methods)
-            echo "# methods" > "$SELECTED_SNIPPET"
-            add_method_restriction
-            ;;
-        hotlink)
-            echo "# hotlink" > "$SELECTED_SNIPPET"
-            add_hotlink_protection
-            ;;
-        waf)
-            echo "# waf" > "$SELECTED_SNIPPET"
-            add_basic_waf
-            ;;
-        bots)
-            echo "# bots" > "$SELECTED_SNIPPET"
-            add_bad_bot_blocking
-            ;;
-        csp)
-            echo "# csp" > "$SELECTED_SNIPPET"
-            add_csp
-            ;;
-        path)
-            echo "# path" > "$SELECTED_SNIPPET"
-            add_path_traversal_protection
-            ;;
         admin-restrict)
             add_admin_access_restriction
-            ;;
-        all)
-            apply_all_security
+            nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
             ;;
         remove)
             remove_security
             ;;
         *)
             echo "未知动作: $action"
-            echo "可用动作: headers files methods hotlink waf bots csp path admin-restrict all remove"
+            echo "可用动作: admin-restrict remove"
             exit 1
             ;;
     esac
-
-    # admin-restrict 内部已自行 inject_include，无需再次注入
-    if [[ "$action" != "admin-restrict" && "$action" != "remove" && "$action" != "all" ]]; then
-        inject_include "$SELECTED_CONF" "$SELECTED_SNIPPET"
-    fi
-
-    nginx -t && systemctl reload nginx && success "已生效" || die "配置错误"
 }
 
 main "$@"
