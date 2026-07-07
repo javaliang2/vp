@@ -116,17 +116,19 @@ check_port() {
     return 0
 }
 
-# 在 CERT_DIR 目录下扫描证书文件
+# 在候选目录下扫描证书文件（依次尝试 sing-box 自身目录 与 certbot 默认目录）
 find_certs() {
     local domain=$1
-    local search_dir="$CERT_DIR/$domain"
+    local search_dirs=("$CERT_DIR/$domain" "/etc/letsencrypt/live/$domain")
     CERT_PATH=""; KEY_PATH=""
-    if [[ -d "$search_dir" ]]; then
-        local c_names=("server.crt" "fullchain.cer" "fullchain.pem" "$domain.cer" "cert.pem")
-        local k_names=("server.key" "$domain.key" "privkey.pem" "cert.key")
-        for f in "${c_names[@]}"; do [[ -f "$search_dir/$f" ]] && CERT_PATH="$search_dir/$f" && break; done
-        for f in "${k_names[@]}"; do [[ -f "$search_dir/$f" ]] && KEY_PATH="$search_dir/$f" && break; done
-    fi
+    local c_names=("server.crt" "fullchain.cer" "fullchain.pem" "$domain.cer" "cert.pem")
+    local k_names=("server.key" "$domain.key" "privkey.pem" "cert.key")
+    for search_dir in "${search_dirs[@]}"; do
+        [[ -d "$search_dir" ]] || continue
+        for f in "${c_names[@]}"; do [[ -z "$CERT_PATH" && -f "$search_dir/$f" ]] && CERT_PATH="$search_dir/$f"; done
+        for f in "${k_names[@]}"; do [[ -z "$KEY_PATH" && -f "$search_dir/$f" ]] && KEY_PATH="$search_dir/$f"; done
+        [[ -n "$CERT_PATH" && -n "$KEY_PATH" ]] && break
+    done
 }
 
 init_config() {
