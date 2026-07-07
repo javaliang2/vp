@@ -64,6 +64,9 @@ init_dirs() {
        ! grep -q "sites-enabled" "${NGINX_CONF_DIR}/nginx.conf" 2>/dev/null; then
         warn "nginx.conf 未包含 sites-enabled，请手动添加: include /etc/nginx/sites-enabled/*;"
     fi
+    ensure_server_tokens_off
+    ensure_slow_attack_protection
+    ensure_default_catchall
 }
 
 # 防止路径为系统关键目录（防 rm -rf / 等误操作）
@@ -167,6 +170,28 @@ nginx_reload() {
 nginx_restart() { require_root; systemctl restart nginx && success "Nginx 已重启"; }
 nginx_status()  { systemctl status nginx; }
 
+nginx_update() {
+    require_root
+    command -v nginx &>/dev/null || die "未检测到 Nginx，请先执行: $0 nginx install"
+    local old_ver; old_ver=$(nginx -v 2>&1)
+    info "当前版本: ${old_ver}"
+    info "正在检查更新..."
+    local mgr; mgr=$(detect_pkg_manager)
+    case $mgr in
+        apt)     apt-get update -qq && apt-get install --only-upgrade -y nginx ;;
+        dnf|yum) $mgr update -y nginx ;;
+        pacman)  pacman -Sy --noconfirm nginx ;;
+    esac
+    nginx -t 2>&1 >&2 || die "更新后配置检查失败，请检查兼容性后再重启"
+    systemctl restart nginx
+    local new_ver; new_ver=$(nginx -v 2>&1)
+    if [[ "$old_ver" == "$new_ver" ]]; then
+        success "Nginx 已是最新版本: ${new_ver}"
+    else
+        success "Nginx 已更新: ${old_ver} → ${new_ver}"
+    fi
+}
+
 check_sub_filter_module() {
     if ! nginx -V 2>&1 | grep -q "http_sub_module"; then
         warn "当前 Nginx 未编译 http_sub_module，镜像模式的内容替换功能不可用。"
@@ -242,10 +267,108 @@ find_certs_advanced() {
 }
 
 # ──────────────────────────────────────────────────────────
+# 通用安全响应头（server 级，随 ssl_block 一并写入）
+# 注意：若某 location 自身也用了 add_header（如静态资源的
+# Cache-Control），该 location 会丢失此处继承的头，需在那里
+# 重复声明，避免重现 gateway/harden 脚本间的 add_header 覆盖问题。
+# ──────────────────────────────────────────────────────────
+security_headers_lines() {
+    cat <<'EOF'
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+EOF
+}
+
+# 拒绝非常规 HTTP 方法（TRACE/CONNECT/自定义方法等），常用于探测/扫描
+deny_dangerous_methods_lines() {
+    cat <<'EOF'
+    if ($request_method !~ ^(GET|HEAD|POST|PUT|DELETE|PATCH)$) { return 444; }
+EOF
+}
+
+# 拦截备份/临时文件（.bak/.sql/编辑器交换文件/波浪号结尾等），
+# 与已有的 `location ~ /\.` （点开头隐藏文件）互补
+deny_sensitive_files_lines() {
+    cat <<'EOF'
+    location ~* \.(bak|backup|sql|sqlite|swp|swo|save|old|orig|dist)$ { deny all; }
+    location ~ ~$ { deny all; }
+EOF
+}
+
+# 反代场景隐藏后端技术栈信息，避免暴露后端框架/中间件版本
+proxy_hide_backend_headers_lines() {
+    cat <<'EOF'
+        proxy_hide_header X-Powered-By;
+        proxy_hide_header Server;
+EOF
+}
+
+# 隐藏 Nginx 版本号（server_tokens off，写入 nginx.conf 的 http{} 块）
+ensure_server_tokens_off() {
+    local ngxconf="${NGINX_CONF_DIR}/nginx.conf"
+    [[ -f "$ngxconf" ]] || return 0
+    grep -qE '^\s*server_tokens\s+off\s*;' "$ngxconf" && return 0
+    if grep -qE '^\s*http\s*\{' "$ngxconf"; then
+        sed -i '/^\s*http\s*{/a\    server_tokens off;' "$ngxconf"
+        info "已在 nginx.conf 中添加 server_tokens off;（隐藏版本号）"
+    else
+        warn "未能在 nginx.conf 中定位 http{} 块，请手动添加: server_tokens off;"
+    fi
+}
+
+# 防慢速攻击（Slowloris 等）+ 请求体大小限制，写入 nginx.conf 的 http{} 块
+ensure_slow_attack_protection() {
+    local ngxconf="${NGINX_CONF_DIR}/nginx.conf"
+    [[ -f "$ngxconf" ]] || return 0
+    grep -qE '^\s*client_body_timeout\s' "$ngxconf" && return 0
+    if grep -qE '^\s*http\s*\{' "$ngxconf"; then
+        sed -i '/^\s*http\s*{/a\
+    client_body_timeout 10s;\
+    client_header_timeout 10s;\
+    send_timeout 10s;\
+    client_max_body_size 20m;' "$ngxconf"
+        info "已在 nginx.conf 中添加慢速攻击防护参数（超时 10s + 请求体上限 20m）"
+        warn "client_max_body_size 默认 20m，若某站点需要更大上传（如 WordPress 媒体库），可在该站点配置里单独覆盖此指令"
+    else
+        warn "未能在 nginx.conf 中定位 http{} 块，请手动添加防慢速攻击参数"
+    fi
+}
+
+# 默认兜底 server：拒绝未匹配任何已配置域名的请求（含直接用 IP 访问、
+# 伪造 Host 头扫描），避免这类请求被随机分配给排序最靠前的真实站点
+ensure_default_catchall() {
+    local conf="${NGINX_CONF_DIR}/conf.d/00-default-catchall.conf"
+    [[ -f "$conf" ]] && return 0
+    mkdir -p "${NGINX_CONF_DIR}/conf.d"
+    cert_self_signed_auto "_default_catchall" 3650
+    cat > "$conf" <<EOF
+# 由 nginx-gateway.sh 自动生成，请勿手动编辑
+server {
+    listen      80 default_server;
+    listen      [::]:80 default_server;
+    server_name _;
+    return 444;
+}
+
+server {
+    listen      443 ssl default_server;
+    listen      [::]:443 ssl default_server;
+    server_name _;
+    ssl_certificate     ${SELF_CERT_DIR}/_default_catchall/fullchain.pem;
+    ssl_certificate_key ${SELF_CERT_DIR}/_default_catchall/privkey.pem;
+    return 444;
+}
+EOF
+    info "已生成默认兜底 server（拒绝未匹配域名/IP 直连请求）: $conf"
+}
+
+# ──────────────────────────────────────────────────────────
 # 通用 SSL 安全配置块
 # ──────────────────────────────────────────────────────────
 ssl_block() {
-    local cert="$1" key="$2"
+    local cert="$1" key="$2" hsts="${3:-}" mode="${4:-}"
     cat <<EOF
     ssl_certificate     $cert;
     ssl_certificate_key $key;
@@ -254,8 +377,18 @@ ssl_block() {
     ssl_prefer_server_ciphers off;
     ssl_session_timeout 1d;
     ssl_session_cache   shared:SSL:10m;
-    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
 EOF
+    # 自签名证书没有 OCSP 响应地址，开启会导致 worker 报错刷屏，故跳过
+    if [[ "$mode" != "self" ]]; then
+        cat <<'EOF'
+    ssl_stapling on;
+    ssl_stapling_verify on;
+    resolver 1.1.1.1 8.8.8.8 valid=300s;
+    resolver_timeout 5s;
+EOF
+    fi
+    [[ -n "$hsts" ]] && echo "    add_header Strict-Transport-Security \"${hsts}\" always;"
+    security_headers_lines
 }
 
 # ──────────────────────────────────────────────────────────
@@ -263,7 +396,7 @@ EOF
 # ──────────────────────────────────────────────────────────
 ask_ssl_params() {
     # 重置所有 SSL 相关全局变量
-    _SSL_MODE="" _SSL_PORT="" _SSL_CERT="" _SSL_KEY="" _SSL_301="no" _SSL_HTTP_PORT="80"
+    _SSL_MODE="" _SSL_PORT="" _SSL_CERT="" _SSL_KEY="" _SSL_301="no" _SSL_HTTP_PORT="80" _HSTS_HEADER=""
 
     echo ""
     echo -e "${CYAN}── SSL / 证书配置 ──${NC}"
@@ -287,7 +420,34 @@ ask_ssl_params() {
             if [[ "$_SSL_HTTP_PORT" != "80" ]]; then
                 warn "非标准 HTTP 端口 ${_SSL_HTTP_PORT}：客户端须先访问 http://域名:${_SSL_HTTP_PORT}/ 才会触发 301 跳转"
             fi
+            _ask_hsts_level
+        else
+            warn "未开启 301 强转，将不发送 HSTS（避免声明与实际行为不符，导致回滚困难）"
         fi
+    }
+
+    _ask_hsts_level() {
+        _HSTS_HEADER=""
+        if [[ "$_SSL_MODE" == "self" ]]; then
+            warn "自签名证书场景下不建议启用 HSTS（客户端本就不信任证书，启用后出问题更难恢复访问），已默认关闭"
+            return
+        fi
+        echo ""
+        echo -e "${CYAN}── HSTS 强度 ──${NC}"
+        echo "  1) 不启用"
+        echo "  2) 观察期（max-age=5分钟，先验证全站 HTTPS 无异常）"
+        echo "  3) 标准（max-age=6个月 + includeSubDomains，推荐）"
+        echo "  4) 严格（max-age=2年 + includeSubDomains + preload）"
+        safe_read -rp "请选择 [1-4，默认 3]: " _hsts_choice
+        [[ -z "$_hsts_choice" ]] && _hsts_choice="3"
+        case "$_hsts_choice" in
+            1) _HSTS_HEADER="" ;;
+            2) _HSTS_HEADER="max-age=300" ;;
+            3) _HSTS_HEADER="max-age=15552000; includeSubDomains" ;;
+            4) _HSTS_HEADER="max-age=63072000; includeSubDomains; preload"
+               warn "preload 需自行提交到 hstspreload.org 且极难撤销，请确认所有子域名均已支持 HTTPS 后再选" ;;
+            *) die "无效选项" ;;
+        esac
     }
 
     case "$_ssl_choice" in
@@ -669,20 +829,22 @@ HTML
     error_log  /var/log/nginx/${domain}.error.log;
 
 CONF
-        [[ "$_SSL_MODE" != "none" ]] && ssl_block "$_SSL_CERT" "$_SSL_KEY" && echo ""
+        deny_dangerous_methods_lines
+        [[ "$_SSL_MODE" != "none" ]] && ssl_block "$_SSL_CERT" "$_SSL_KEY" "$_HSTS_HEADER" "$_SSL_MODE" && echo ""
 
-        cat <<'CONF'
-    location / {
-        try_files $uri $uri/ =404;
-    }
-
+        cat <<'CONF2'
     location ~* \.(css|js|png|jpg|jpeg|gif|ico|svg|woff2?)$ {
         expires 30d;
         add_header Cache-Control "public, immutable";
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
     }
 
     location ~ /\. { deny all; }
-CONF
+CONF2
+        deny_sensitive_files_lines
         if $php; then
             cat <<'PHP'
 
@@ -743,7 +905,8 @@ site_create_proxy() {
 
     client_max_body_size 0;
 CONF
-        [[ "$_SSL_MODE" != "none" ]] && ssl_block "$_SSL_CERT" "$_SSL_KEY" && echo ""
+        deny_dangerous_methods_lines
+        [[ "$_SSL_MODE" != "none" ]] && ssl_block "$_SSL_CERT" "$_SSL_KEY" "$_HSTS_HEADER" "$_SSL_MODE" && echo ""
 
         cat <<CONF
     location / {
@@ -757,6 +920,7 @@ CONF
         proxy_set_header    X-Forwarded-Proto \$scheme;
         proxy_cache_bypass  \$http_upgrade;
 CONF
+        proxy_hide_backend_headers_lines
         # 仅后端为 HTTPS 时才加 proxy_ssl 指令
         if [[ "$backend_is_https" == true ]]; then
             cat <<CONF
@@ -771,8 +935,9 @@ CONF
     # 允许 ACME webroot 验证，屏蔽其他隐藏路径
     location ~ /\.well-known { allow all; }
     location ~ /\.           { deny all; }
-}
 CONF
+        deny_sensitive_files_lines
+        echo "}"
     } > "$conf_file"
     _site_activate "$domain"
 }
@@ -834,6 +999,8 @@ site_create_mirror() {
         proxy_set_header   Referer         ${res_url};
         proxy_set_header   Accept-Encoding "";
         proxy_ssl_server_name on;
+        proxy_hide_header  X-Powered-By;
+        proxy_hide_header  Server;
     }
 LOCEOF
 )")
@@ -862,7 +1029,8 @@ LOCEOF
     error_log  /var/log/nginx/${domain}.error.log;
 
 CONF
-        [[ "$_SSL_MODE" != "none" ]] && ssl_block "$_SSL_CERT" "$_SSL_KEY" && echo ""
+        deny_dangerous_methods_lines
+        [[ "$_SSL_MODE" != "none" ]] && ssl_block "$_SSL_CERT" "$_SSL_KEY" "$_HSTS_HEADER" "$_SSL_MODE" && echo ""
 
         if $rewrite; then
             cat <<CONF
@@ -875,6 +1043,9 @@ CONF
         proxy_set_header   Referer           ${target_url};
         proxy_set_header   Accept-Encoding   "";
         proxy_ssl_server_name on;
+CONF
+            printf '%s\n' "$(proxy_hide_backend_headers_lines)"
+            cat <<CONF
 
         sub_filter "</head>"                 "<meta name='referrer' content='no-referrer'></head>";
         sub_filter "//${target_host}"         "//${domain}";
@@ -898,12 +1069,14 @@ CONF
         proxy_set_header    X-Forwarded-Proto \$scheme;
         proxy_cache_bypass  \$http_upgrade;
         proxy_ssl_server_name on;
-    }
 CONF
+            printf '%s\n' "$(proxy_hide_backend_headers_lines)"
+            echo "    }"
         fi
 
         echo ""
         echo "    location ~ /\. { deny all; }"
+        deny_sensitive_files_lines
         echo "}"
     } > "$conf_file"
 
@@ -1145,7 +1318,7 @@ site_create_redirect() {
             echo "    listen [::]:${_SSL_PORT} ssl;"
             echo "    server_name ${src_domain};"
             echo ""
-            ssl_block "$_SSL_CERT" "$_SSL_KEY"
+            ssl_block "$_SSL_CERT" "$_SSL_KEY" "$_HSTS_HEADER" "$_SSL_MODE"
             echo ""
             echo "    access_log /var/log/nginx/${src_domain}-redirect.access.log;"
             echo "    error_log  /var/log/nginx/${src_domain}-redirect.error.log;"
@@ -1269,7 +1442,8 @@ site_create_loadbalance() {
     error_log  /var/log/nginx/${domain}.error.log;
 CONF
 
-        [[ "$_SSL_MODE" != "none" ]] && ssl_block "$_SSL_CERT" "$_SSL_KEY" && echo ""
+        deny_dangerous_methods_lines
+        [[ "$_SSL_MODE" != "none" ]] && ssl_block "$_SSL_CERT" "$_SSL_KEY" "$_HSTS_HEADER" "$_SSL_MODE" && echo ""
 
         # 后台路径固定 location（精确匹配，优先于 location /）
         if [[ -n "$master_node" ]]; then
@@ -1286,8 +1460,9 @@ CONF
         proxy_set_header    X-Forwarded-Host  \$host;
         proxy_read_timeout  300s;
         proxy_send_timeout  300s;
-    }
 CONF
+            printf '%s\n' "$(proxy_hide_backend_headers_lines)"
+            echo "    }"
         fi
 
         cat <<CONF
@@ -1306,12 +1481,17 @@ CONF
         proxy_next_upstream error timeout invalid_header http_502 http_503 http_504;
         proxy_next_upstream_timeout 5s;
         proxy_next_upstream_tries 3;
-    }
+CONF
+        printf '%s\n' "$(proxy_hide_backend_headers_lines)"
+        echo "    }"
+
+        cat <<CONF
 
     location ~ /\.well-known { allow all; }
     location ~ /\.           { deny all; }
-}
 CONF
+        deny_sensitive_files_lines
+        echo "}"
     } > "$conf_file"
 
     _site_activate "$domain"
@@ -2178,6 +2358,7 @@ ${BOLD}配置备份:${NC}
  
 ${BOLD}Nginx 控制:${NC}
   nginx install           安装 Nginx（自动检测包管理器）
+  nginx update            检查并更新 Nginx 到最新版本（自动重启生效）
   nginx reload            检查语法并重载配置
   nginx restart           重启 Nginx
   nginx status            查看运行状态
@@ -2246,9 +2427,10 @@ interactive_menu() {
         echo " 25) 解除限制访问"
         echo " 26) 负载均衡节点管理"
         echo " 27) 查看状态"
+        echo " 28) 检查并更新 Nginx"
         echo "  0) 退出"
         echo ""
-        safe_read -rp "请选择 [0-25]: " choice
+        safe_read -rp "请选择 [0-28]: " choice
 
         case "$choice" in
              1) site_create_static ;;
@@ -2283,6 +2465,7 @@ interactive_menu() {
             25) site_remove_acl ;;
             26) site_lb_node ;;
             27) nginx_status ;;
+            28) nginx_update ;;
              0) echo "再见！"; exit 0 ;;
              *) warn "无效选项，请重试" ;;
         esac
@@ -2346,6 +2529,7 @@ main() {
         nginx)
             case "${sub}" in
                 install)     check_and_install_nginx ;;
+                update)      nginx_update ;;
                 reload)      nginx_reload ;;
                 restart)     nginx_restart ;;
                 status)      nginx_status ;;
