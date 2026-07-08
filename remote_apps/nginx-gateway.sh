@@ -66,7 +66,7 @@ init_dirs() {
     fi
     ensure_server_tokens_off
     ensure_slow_attack_protection
-    ensure_default_catchall
+    _ensure_block_ip
 }
 
 # 防止路径为系统关键目录（防 rm -rf / 等误操作）
@@ -336,33 +336,9 @@ ensure_slow_attack_protection() {
     fi
 }
 
-# 默认兜底 server：拒绝未匹配任何已配置域名的请求（含直接用 IP 访问、
-# 伪造 Host 头扫描），避免这类请求被随机分配给排序最靠前的真实站点
-ensure_default_catchall() {
-    local conf="${NGINX_CONF_DIR}/conf.d/00-default-catchall.conf"
-    [[ -f "$conf" ]] && return 0
-    mkdir -p "${NGINX_CONF_DIR}/conf.d"
-    cert_self_signed_auto "_default_catchall" 3650
-    cat > "$conf" <<EOF
-# 由 nginx-gateway.sh 自动生成，请勿手动编辑
-server {
-    listen      80 default_server;
-    listen      [::]:80 default_server;
-    server_name _;
-    return 444;
-}
-
-server {
-    listen      443 ssl default_server;
-    listen      [::]:443 ssl default_server;
-    server_name _;
-    ssl_certificate     ${SELF_CERT_DIR}/_default_catchall/fullchain.pem;
-    ssl_certificate_key ${SELF_CERT_DIR}/_default_catchall/privkey.pem;
-    return 444;
-}
-EOF
-    info "已生成默认兜底 server（拒绝未匹配域名/IP 直连请求）: $conf"
-}
+# 注：裸 IP / 未知 Host 的兜底拦截统一由 _ensure_block_ip() 负责
+# （原 ensure_default_catchall 已移除——两者都声明 default_server，
+#  同时存在会导致 nginx -t 报 "duplicate default server" 而重载失败）
 
 # ──────────────────────────────────────────────────────────
 # 通用 SSL 安全配置块
