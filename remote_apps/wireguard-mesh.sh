@@ -373,7 +373,9 @@ _list_peer_keys() {
         /^\[Peer\]/ { in_peer=1; next }
         /^\[/       { in_peer=0 }
         in_peer && /^[[:space:]]*PublicKey[[:space:]]*=/ {
-            split($0, kv, /[[:space:]]*=[[:space:]]*/); print kv[2]
+            eq = index($0, "="); v = substr($0, eq+1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+            print v
         }
     ' "$WG_CONF")
 }
@@ -406,10 +408,13 @@ _get_peer_field() {
         /^\[Peer\]/ { in_peer=1; pk=""; next }
         /^\[/       { in_peer=0 }
         in_peer && /^[[:space:]]*PublicKey/ {
-            split($0, a, /=/); gsub(/[[:space:]]/, "", a[2]); pk=a[2]
+            eq = index($0, "="); pk = substr($0, eq+1)
+            gsub(/[[:space:]]/, "", pk)
         }
         in_peer && pk==target && $0 ~ ("^[[:space:]]*" field) {
-            split($0, a, /=/); gsub(/^[[:space:]]+|[[:space:]]+$/, "", a[2]); print a[2]
+            eq = index($0, "="); v = substr($0, eq+1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+            print v
         }
     ' "$WG_CONF"
 }
@@ -461,9 +466,9 @@ cmd_edit_peer() {
         }
         /^\[Peer\]/ { in_peer=1; print; next }
         in_peer && /^[[:space:]]*PublicKey[[:space:]]*=/ {
-            split($0, kv, /[[:space:]]*=[[:space:]]*/);
-            gsub(/[[:space:]]/, "", kv[2])
-            if (kv[2] == target) {
+            eq = index($0, "="); cur_pk = substr($0, eq+1)
+            gsub(/[[:space:]]/, "", cur_pk)
+            if (cur_pk == target) {
                 in_target=1
                 if (new_pk != "") { print "PublicKey = " new_pk; next }
             }
@@ -542,10 +547,12 @@ cmd_remove_peer() {
         }
         in_peer {
             block = block $0 "\n"
-            split($0, kv, /[[:space:]]*=[[:space:]]*/);
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", kv[1])
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", kv[2])
-            if (kv[1] == "PublicKey" && kv[2] == target) found=1
+            eq = index($0, "=")
+            fname = (eq > 0) ? substr($0, 1, eq-1) : $0
+            fval  = (eq > 0) ? substr($0, eq+1) : ""
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", fname)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", fval)
+            if (fname == "PublicKey" && fval == target) found=1
         }
         !in_peer { print }
         END { if (in_peer && !found) printf "%s", block }
