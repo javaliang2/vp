@@ -60,13 +60,32 @@ init_dirs() {
         warn "无法写入日志文件 $LOG_FILE，请检查权限或设置环境变量 LOG_FILE"
         LOG_FILE="/var/log/nginx-gateway.log"  # 不降级到 /tmp
     fi
-    if [[ -f "${NGINX_CONF_DIR}/nginx.conf" ]] && \
-       ! grep -q "sites-enabled" "${NGINX_CONF_DIR}/nginx.conf" 2>/dev/null; then
-        warn "nginx.conf 未包含 sites-enabled，请手动添加: include /etc/nginx/sites-enabled/*;"
-    fi
+    ensure_sites_enabled_include
     ensure_server_tokens_off
     ensure_slow_attack_protection
     _ensure_block_ip
+}
+
+# 确保 nginx.conf 引入 sites-enabled（nginx.org 官方包默认不带这个约定，
+# 只有 conf.d；缺失时脚本生成的所有站点配置和防扫描拦截都不会被加载，
+# 且 nginx -t 不会报错——是最容易被忽略的一种"静默失败"，因此这里直接自动修复）
+ensure_sites_enabled_include() {
+    local ngxconf="${NGINX_CONF_DIR}/nginx.conf"
+    [[ -f "$ngxconf" ]] || return 0
+    grep -q "sites-enabled" "$ngxconf" && return 0
+    if grep -qE '^\s*http\s*\{' "$ngxconf"; then
+        cp "$ngxconf" "${ngxconf}.bak.$(date +%s)"
+        sed -i '/^\s*http\s*{/a\    include /etc/nginx/sites-enabled/*;' "$ngxconf"
+        if nginx -t &>/dev/null; then
+            info "已在 nginx.conf 中添加 include /etc/nginx/sites-enabled/*;（原文件已备份）"
+        else
+            # 修改后语法检查不过，回滚，避免留下一个无法启动的 nginx.conf
+            cp "${ngxconf}.bak."* "$ngxconf" 2>/dev/null
+            warn "自动添加 sites-enabled include 后语法检查未通过，已回滚，请手动添加: include /etc/nginx/sites-enabled/*;"
+        fi
+    else
+        warn "未能在 nginx.conf 中定位 http{} 块，请手动添加: include /etc/nginx/sites-enabled/*;"
+    fi
 }
 
 # 防止路径为系统关键目录（防 rm -rf / 等误操作）
