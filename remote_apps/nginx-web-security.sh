@@ -16,6 +16,8 @@ SITES_ENABLED="${SITES_DIR:-${NGINX_CONF_DIR}/sites-enabled}"
 SNIPPET_DIR="${NGINX_CONF_DIR}/snippets"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/nginx-gateway}"
 LOG_FILE="/var/log/nginx-admin-restrict.log"
+CONF_D_DIR="${NGINX_CONF_DIR}/conf.d"
+CF_REALIP_CONF="${CONF_D_DIR}/00-cloudflare-realip.conf"
 
 # ──────────────────────────────────────────────────────────
 # 颜色 & 日志
@@ -117,6 +119,80 @@ get_ssl_cert_paths() {
     [[ -z "$SSL_CERT" || -z "$SSL_KEY" ]] && die "无法从 $conf 读取 SSL 证书路径，请手动指定"
     info "SSL 证书: $SSL_CERT"
     info "SSL 私钥: $SSL_KEY"
+}
+
+# ============================================================
+# Cloudflare Real IP 还原（全局生效，与具体站点无关）
+# ============================================================
+fetch_cloudflare_ranges() {
+    command -v curl >/dev/null 2>&1 || die "需要 curl，请先安装：apt install curl"
+    info "正在从 Cloudflare 官方地址获取最新 IP 段..."
+    CF_IPV4=$(curl -fsSL --max-time 10 "https://www.cloudflare.com/ips-v4") \
+        || die "无法获取 Cloudflare IPv4 列表，请检查网络（是否可访问 cloudflare.com）"
+    CF_IPV6=$(curl -fsSL --max-time 10 "https://www.cloudflare.com/ips-v6") \
+        || die "无法获取 Cloudflare IPv6 列表，请检查网络（是否可访问 cloudflare.com）"
+    [[ -z "$CF_IPV4" || -z "$CF_IPV6" ]] && die "获取到的 Cloudflare IP 列表为空，请稍后重试"
+}
+
+configure_cloudflare_realip() {
+    echo -e "${CYAN}配置 Cloudflare Real IP 还原（全局生效，写入 ${CONF_D_DIR}）${NC}"
+    echo -e "${YELLOW}提示：仅当站点确实经过 Cloudflare 代理（橙色云朵）时才需要此项。${NC}"
+
+    mkdir -p "$CONF_D_DIR"
+    fetch_cloudflare_ranges
+
+    local header_choice real_ip_header
+    safe_read -rp "识别真实 IP 使用哪个请求头？[1: CF-Connecting-IP(默认,推荐) 2: X-Forwarded-For]: " header_choice
+    real_ip_header="CF-Connecting-IP"
+    [[ "$header_choice" == "2" ]] && real_ip_header="X-Forwarded-For"
+
+    if [[ -f "$CF_REALIP_CONF" ]]; then
+        mkdir -p "$BACKUP_DIR"
+        local backup_file="${BACKUP_DIR}/00-cloudflare-realip.conf.$(date +%Y%m%d%H%M%S).bak"
+        cp -a "$CF_REALIP_CONF" "$backup_file"
+        info "已备份旧配置到: $backup_file"
+    fi
+
+    {
+        echo "# ---- Cloudflare Real IP 还原（自动生成，请勿手动编辑） ----"
+        echo "# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "# 来源: https://www.cloudflare.com/ips-v4  https://www.cloudflare.com/ips-v6"
+        echo ""
+        while IFS= read -r ip; do
+            [[ -z "$ip" ]] && continue
+            echo "set_real_ip_from ${ip};"
+        done <<< "$CF_IPV4"
+        while IFS= read -r ip; do
+            [[ -z "$ip" ]] && continue
+            echo "set_real_ip_from ${ip};"
+        done <<< "$CF_IPV6"
+        echo ""
+        echo "real_ip_header ${real_ip_header};"
+        echo "real_ip_recursive on;"
+    } > "$CF_REALIP_CONF"
+
+    success "已写入: $CF_REALIP_CONF"
+
+    if ! grep -rqE "include\s+.*conf\.d/\*\.conf" "${NGINX_CONF_DIR}/nginx.conf" 2>/dev/null; then
+        warn "未在 nginx.conf 的 http {} 块中检测到 'include ${CONF_D_DIR}/*.conf;'"
+        warn "请手动在 nginx.conf 的 http {} 块内添加该 include，否则此配置不会生效"
+    fi
+
+    warn "重要：Real IP 还原信任该请求头来自 Cloudflare。务必确保源服务器的公网入口"
+    warn "（防火墙/安全组）只放行 Cloudflare 出口 IP 段和你自己的管理网络，"
+    warn "否则任何人都可以直接访问源站并伪造 ${real_ip_header} 头，绕过还原机制。"
+
+    nginx -t && systemctl reload nginx && success "Cloudflare Real IP 还原已生效" || die "配置检查失败，请手动排查"
+}
+
+remove_cloudflare_realip() {
+    if [[ -f "$CF_REALIP_CONF" ]]; then
+        rm -f "$CF_REALIP_CONF"
+        success "已删除: $CF_REALIP_CONF"
+        nginx -t && systemctl reload nginx && success "Nginx 重载完成" || warn "配置检查失败，请手动处理"
+    else
+        warn "未找到 Cloudflare Real IP 配置文件: $CF_REALIP_CONF"
+    fi
 }
 
 # ============================================================
@@ -363,6 +439,8 @@ interactive_menu() {
         echo "  ╚════════════════════════════════════════════════╝"
         echo -e "${NC}"
         echo -e " ${CYAN}1)${NC} 后台访问限制 (WordPress/CDN 双 Server 隔离)"
+        echo -e " ${CYAN}2)${NC} 配置 Cloudflare Real IP 还原 (全局，与站点无关)"
+        echo -e " ${CYAN}3)${NC} 移除 Cloudflare Real IP 配置"
         echo -e " ${RED}R)${NC} 移除站点的安全配置"
         echo -e " ${CYAN}Q)${NC} 退出"
         echo ""
@@ -373,6 +451,12 @@ interactive_menu() {
                 list_domains
                 add_admin_access_restriction
                 nginx -t && systemctl reload nginx && success "后台限制已生效" || die "配置错误，请检查"
+                ;;
+            2)
+                configure_cloudflare_realip
+                ;;
+            3)
+                remove_cloudflare_realip
                 ;;
             [Rr])
                 remove_security
@@ -396,6 +480,19 @@ main() {
         interactive_menu
         exit 0
     fi
+
+    # 与具体站点无关的全局动作，直接处理，不走站点校验
+    case "${1}" in
+        cloudflare-realip)
+            configure_cloudflare_realip
+            exit 0
+            ;;
+        remove-cloudflare-realip)
+            remove_cloudflare_realip
+            exit 0
+            ;;
+    esac
+
     local domain="${1}"
     local action="${2:-admin-restrict}"
 
@@ -415,6 +512,7 @@ main() {
         *)
             echo "未知动作: $action"
             echo "可用动作: admin-restrict remove"
+            echo "全局动作（第一个参数）: cloudflare-realip remove-cloudflare-realip"
             exit 1
             ;;
     esac
