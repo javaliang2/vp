@@ -329,7 +329,7 @@ ensure_slow_attack_protection() {
     client_header_timeout 10s;\
     send_timeout 10s;\
     client_max_body_size 50m;' "$ngxconf"
-        info "已在 nginx.conf 中添加慢速攻击防护参数（超时 10s + 请求体上限 20m）"
+        info "已在 nginx.conf 中添加慢速攻击防护参数（超时 10s + 请求体上限 50m）"
         warn "client_max_body_size 默认 50m，若某站点需要更大上传（如 WordPress 媒体库），可在该站点配置里单独覆盖此指令"
     else
         warn "未能在 nginx.conf 中定位 http{} 块，请手动添加防慢速攻击参数"
