@@ -2084,17 +2084,22 @@ setup_warp_outbound() {
     # 强制重置可能存在的旧状态 (适配新版语法)
     warp-cli --accept-tos disconnect 2>/dev/null
     warp-cli --accept-tos registration delete 2>/dev/null
-    
-    # 执行全自动流：注册 -> 代理模式 -> 绑定端口 -> 连接 (适配新版语法)
-    if warp-cli --accept-tos registration new; then
-        warp-cli --accept-tos mode proxy
-        warp-cli --accept-tos proxy port 40000
+
+    # 先切换到代理模式并绑定端口，再注册/连接
+    # 目的：避免注册后 warp-svc 按默认的全隧道 (warp) 模式自动发起连接，
+    # 那样会把 VPS 全部流量（含 SSH）瞬间劫持进隧道，导致连接中断
+    warp-cli --accept-tos mode proxy
+    warp-cli --accept-tos proxy port 40000
+
+    # 执行全自动流：代理模式 -> 绑定端口 -> 注册 -> 连接 (适配新版语法)
+    # 用 yes 兜底，防止个别版本的 registration new 仍会弹出交互确认导致脚本卡死
+    if yes | warp-cli --accept-tos registration new; then
         warp-cli --accept-tos connect
         
         echo -e "${YELLOW}等待 WARP 隧道建立...${PLAIN}"
         sleep 3
-        
-                if warp-cli --accept-tos status | grep -i "Connected" > /dev/null 2>&1; then
+
+        if warp-cli --accept-tos status | grep -i "Connected" > /dev/null 2>&1; then
             echo -e "${GREEN}✔ WARP 代理已成功稳定运行在 127.0.0.1:40000${PLAIN}"
         else
             echo -e "${RED}✘ WARP 连接未生效，请检查服务器网络或尝试重启机器。${PLAIN}"
@@ -2116,12 +2121,16 @@ setup_warp_outbound() {
     if [[ "$has_warp" == "true" ]]; then
         echo -e "${YELLOW}检测到配置文件中已存在 Tag 为 [warp-out] 的出站节点，无需重复添加。${PLAIN}"
     else
+        # 注意: WARP 本地代理模式只支持 TCP CONNECT，不支持 SOCKS5 UDP ASSOCIATE，
+        # 所以这里显式声明 network 为 tcp，避免 UDP 流量（如 QUIC/HTTP3、DNS UDP 查询）
+        # 被分流到 warp-out 后连接失败或长时间挂起
         jq '.outbounds += [{
             "type": "socks",
             "tag": "warp-out",
             "server": "127.0.0.1",
             "server_port": 40000,
-            "version": "5"
+            "version": "5",
+            "network": "tcp"
         }]' "$CONFIG_FILE" > "$_TMP_JSON"
         
         if save_and_restart; then
