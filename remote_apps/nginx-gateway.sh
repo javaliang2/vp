@@ -64,6 +64,7 @@ init_dirs() {
     ensure_server_tokens_off
     ensure_slow_attack_protection
     _ensure_block_ip
+    _ensure_gzip_conf
 }
 
 # 确保 nginx.conf 引入 sites-enabled（nginx.org 官方包默认不带这个约定，
@@ -137,6 +138,45 @@ map $http_upgrade $connection_upgrade {
 }
 EOF
     info "已生成 WebSocket map 配置: $map_conf"
+}
+
+# 全局 gzip 压缩（conf.d 默认在 http{} 内被 include，无需逐站点写入）
+_ensure_gzip_conf() {
+    local gzip_conf="${NGINX_CONF_DIR}/conf.d/01-gzip.conf"
+    [[ -f "$gzip_conf" ]] && return 0
+    mkdir -p "${NGINX_CONF_DIR}/conf.d" || true
+    cat > "$gzip_conf" <<'EOF'
+gzip on;
+gzip_vary on;
+gzip_proxied any;
+gzip_comp_level 6;
+gzip_min_length 256;
+gzip_disable "msie6";
+gzip_types
+    text/plain
+    text/css
+    text/xml
+    text/javascript
+    application/javascript
+    application/x-javascript
+    application/json
+    application/xml
+    application/rss+xml
+    application/atom+xml
+    application/xml+rss
+    application/vnd.ms-fontobject
+    application/wasm
+    font/ttf
+    font/otf
+    image/svg+xml;
+EOF
+    if nginx -t &>/dev/null; then
+        info "已生成全局 gzip 压缩配置: $gzip_conf"
+    else
+        # 极少数极旧版本 nginx 不识别个别 gzip_types，出错则直接移除避免拖垮启动
+        rm -f "$gzip_conf"
+        warn "gzip 配置校验未通过，已跳过（不影响其他功能）"
+    fi
 }
 
 # ──────────────────────────────────────────────────────────
@@ -217,6 +257,158 @@ check_sub_filter_module() {
         warn "Debian/Ubuntu 可执行: apt install nginx-full"
         safe_read -rp "是否仍继续生成配置？[y/N]: " _c
         [[ "${_c,,}" == "y" ]] || exit 0
+    fi
+}
+
+# ──────────────────────────────────────────────────────────
+# Cloudflare 真实 IP
+# set_real_ip_from 只信任来自 Cloudflare 官方 IP 段的连接，非 Cloudflare
+# 直连请求不受影响，因此全局启用是安全的；不启用时，凡是站点在 Cloudflare
+# 之后，limit_req / ACL / access_log 拿到的都是 CF 边缘节点 IP 而非真实访客 IP。
+# ──────────────────────────────────────────────────────────
+CF_REALIP_CONF="${NGINX_CONF_DIR}/conf.d/02-cf-realip.conf"
+
+ensure_curl() { command -v curl &>/dev/null || install_pkg curl; }
+
+check_realip_module() {
+    if ! nginx -V 2>&1 | grep -q "http_realip_module"; then
+        warn "当前 Nginx 未编译 http_realip_module，无法识别 Cloudflare 真实 IP。"
+        warn "Debian/Ubuntu 可执行: apt install nginx-full"
+        return 1
+    fi
+    return 0
+}
+
+# 内置一份 Cloudflare IP 段快照（生成于脚本编写时），仅在抓取官方接口失败时
+# 兜底使用，可能滞后，网络恢复后建议重新执行 cf-realip 刷新
+_cf_ip_fallback_v4() {
+    cat <<'EOF'
+173.245.48.0/20
+103.21.244.0/22
+103.22.200.0/22
+103.31.4.0/22
+141.101.64.0/18
+108.162.192.0/18
+190.93.240.0/20
+188.114.96.0/20
+197.234.240.0/22
+198.41.128.0/17
+162.158.0.0/15
+104.16.0.0/13
+104.24.0.0/14
+172.64.0.0/13
+131.0.72.0/22
+EOF
+}
+
+_cf_ip_fallback_v6() {
+    cat <<'EOF'
+2400:cb00::/32
+2606:4700::/32
+2803:f800::/32
+2405:b500::/32
+2405:8100::/32
+2a06:98c0::/29
+2c0f:f248::/32
+EOF
+}
+
+cf_realip_update() {
+    require_root
+    check_realip_module || { confirm "是否仍继续生成配置（重载时可能报错）？" || exit 0; }
+    ensure_curl
+
+    info "正在获取 Cloudflare 官方 IP 段..."
+    local v4 v6 source
+    v4=$(curl -fsSL --max-time 8 https://www.cloudflare.com/ips-v4 2>/dev/null || true)
+    v6=$(curl -fsSL --max-time 8 https://www.cloudflare.com/ips-v6 2>/dev/null || true)
+
+    if [[ -z "$v4" || -z "$v6" ]]; then
+        warn "获取 Cloudflare 官方 IP 段失败（网络不通？），使用内置快照兜底"
+        warn "建议网络恢复后重新执行: $0 security cf-realip"
+        v4=$(_cf_ip_fallback_v4)
+        v6=$(_cf_ip_fallback_v6)
+        source="内置快照（可能滞后）"
+    else
+        source="官方接口 (cloudflare.com/ips-v4, ips-v6)"
+    fi
+
+    mkdir -p "${NGINX_CONF_DIR}/conf.d" || true
+    {
+        echo "# Cloudflare 真实 IP 配置 — 数据来源: ${source}"
+        echo "# 生成时间: $(date)"
+        echo "# 仅信任来自以下 Cloudflare 官方 IP 段的 CF-Connecting-IP 头，"
+        echo "# 非 Cloudflare 直连请求不受影响。手动刷新: $0 security cf-realip"
+        while IFS= read -r ip; do
+            [[ -n "$ip" ]] && echo "set_real_ip_from ${ip};"
+        done <<< "$v4"
+        while IFS= read -r ip; do
+            [[ -n "$ip" ]] && echo "set_real_ip_from ${ip};"
+        done <<< "$v6"
+        echo "real_ip_header CF-Connecting-IP;"
+        echo "real_ip_recursive on;"
+    } > "$CF_REALIP_CONF"
+
+    if nginx -t &>/dev/null; then
+        success "Cloudflare 真实 IP 配置已生成: $CF_REALIP_CONF"
+        nginx_reload
+        info "limit_req / ACL / access_log 现在会基于访客真实 IP 生效（而非 Cloudflare 边缘 IP）"
+    else
+        rm -f "$CF_REALIP_CONF"
+        die "配置校验未通过，已回滚，请确认 Nginx 已编译 http_realip_module"
+    fi
+}
+
+cf_realip_remove() {
+    require_root
+    if [[ -f "$CF_REALIP_CONF" ]]; then
+        rm -f "$CF_REALIP_CONF"
+        nginx_reload
+        success "已移除 Cloudflare 真实 IP 配置"
+    else
+        info "未找到 Cloudflare 真实 IP 配置，无需移除"
+    fi
+}
+
+cmd_cf_realip() {
+    require_root; init_dirs
+    local action="${1:-status}"
+    case "$action" in
+        install)
+            warn "该操作会让本机所有站点信任 CF-Connecting-IP 头，请确认本机所有对外站点均已接入 Cloudflare"
+            confirm "确认启用 Cloudflare 真实 IP 还原？" || { info "已取消"; return 0; }
+            cf_realip_update
+            ;;
+        refresh)
+            [[ -f "$CF_REALIP_CONF" ]] || die "尚未安装，请先执行: $0 cf-realip install"
+            cf_realip_update
+            ;;
+        remove) cf_realip_remove ;;
+        status)
+            if [[ -f "$CF_REALIP_CONF" ]]; then
+                success "已启用，配置文件: $CF_REALIP_CONF（生成时间: $(stat -c %y "$CF_REALIP_CONF" 2>/dev/null || stat -f %Sm "$CF_REALIP_CONF" 2>/dev/null)）"
+            else
+                info "未启用。执行 $0 cf-realip install 以启用"
+            fi
+            ;;
+        *) die "用法: $0 cf-realip <install|refresh|remove|status>" ;;
+    esac
+}
+
+# 供基于 IP 的 ACL / 限流调用：若站点在 Cloudflare 后面而真实 IP 还原
+# 未启用，$remote_addr 拿到的是 CF 边缘 IP，白名单/黑名单/限流全部失效。
+_maybe_prompt_cf_realip() {
+    [[ -f "$CF_REALIP_CONF" ]] && return 0
+
+    local _ans=""
+    safe_read -rp "该站点是否经由 Cloudflare 代理? (y/N): " _ans
+    if [[ "${_ans,,}" == "y" || "${_ans,,}" == "yes" ]]; then
+        warn "未启用 Cloudflare 真实 IP 还原：当前 IP 白/黑名单和限流会按 Cloudflare 边缘 IP 生效，起不到实际限制作用"
+        if confirm "是否现在启用真实 IP 还原（全局生效，影响本机所有站点，请确认均已接入 Cloudflare）？"; then
+            cf_realip_update
+        else
+            warn "已跳过，可稍后执行: $0 cf-realip install"
+        fi
     fi
 }
 
@@ -324,6 +516,30 @@ proxy_hide_backend_headers_lines() {
 EOF
 }
 
+# 大文件上传/下载优化（网盘、文件管理类应用，如 AList/Nextcloud）：
+# 默认 60s 的 proxy_read_timeout/proxy_send_timeout 在传输大文件时容易触发
+# 504；同时关闭 proxy_request_buffering，避免 nginx 把整个请求体落盘缓冲
+# 后再转发给后端，减少一次磁盘 I/O、加快断点续传/分片上传的响应速度。
+ask_large_upload_optimization() {
+    local _ans=""
+    safe_read -rp "是否针对大文件上传/下载优化（网盘、文件管理类应用，如 AList）？[y/N]: " _ans
+    if [[ "${_ans,,}" == "y" || "${_ans,,}" == "yes" ]]; then
+        _LARGE_UPLOAD=true
+    else
+        _LARGE_UPLOAD=false
+    fi
+}
+
+large_upload_lines() {
+    [[ "${_LARGE_UPLOAD:-false}" == true ]] || return 0
+    cat <<'EOF'
+        proxy_request_buffering  off;
+        proxy_read_timeout       600s;
+        proxy_send_timeout       600s;
+        client_body_timeout      600s;
+EOF
+}
+
 # 隐藏 Nginx 版本号（server_tokens off，写入 nginx.conf 的 http{} 块）
 ensure_server_tokens_off() {
     local ngxconf="${NGINX_CONF_DIR}/nginx.conf"
@@ -358,6 +574,35 @@ ensure_slow_attack_protection() {
 # 注：裸 IP / 未知 Host 的兜底拦截统一由 _ensure_block_ip() 负责
 # （原 ensure_default_catchall 已移除——两者都声明 default_server，
 #  同时存在会导致 nginx -t 报 "duplicate default server" 而重载失败）
+
+# ──────────────────────────────────────────────────────────
+# HTTP/2（1.25.1+ 用独立的 http2 on; 指令；旧版仍用 listen ... http2;
+#  两种语法混用会导致 nginx -t 报 "invalid parameter http2" 或告警，
+#  必须按实际版本二选一）
+# ──────────────────────────────────────────────────────────
+_http2_new_syntax() {
+    local ver maj min patch
+    ver=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    [[ -z "$ver" ]] && return 1
+    IFS='.' read -r maj min patch <<< "$ver"
+    (( maj > 1 )) && return 0
+    (( maj == 1 && min > 25 )) && return 0
+    (( maj == 1 && min == 25 && patch >= 1 )) && return 0
+    return 1
+}
+
+# 输出一对 SSL 监听指令并按版本自动开启 HTTP/2
+emit_ssl_listen_lines() {
+    local port="$1"
+    if _http2_new_syntax; then
+        echo "    listen ${port} ssl;"
+        echo "    listen [::]:${port} ssl;"
+        echo "    http2 on;"
+    else
+        echo "    listen ${port} ssl http2;"
+        echo "    listen [::]:${port} ssl http2;"
+    fi
+}
 
 # ──────────────────────────────────────────────────────────
 # 通用 SSL 安全配置块
@@ -808,8 +1053,7 @@ HTML
 
         echo "server {"
         if [[ "$_SSL_MODE" != "none" ]]; then
-            echo "    listen ${_SSL_PORT} ssl;"
-            echo "    listen [::]:${_SSL_PORT} ssl;"
+            emit_ssl_listen_lines "$_SSL_PORT"
         else
             echo "    listen ${_SSL_PORT};"
             echo "    listen [::]:${_SSL_PORT};"
@@ -873,6 +1117,7 @@ site_create_proxy() {
     resolve_ssl_cert "$domain"
     _check_port_conflict "$_SSL_PORT"
     _ensure_upgrade_map
+    ask_large_upload_optimization
 
     # ── 推断后端是否为 HTTPS ─────────────────────────────────────
     local backend_is_https=false
@@ -886,8 +1131,7 @@ site_create_proxy() {
 
         echo "server {"
         if [[ "$_SSL_MODE" != "none" ]]; then
-            echo "    listen ${_SSL_PORT} ssl;"
-            echo "    listen [::]:${_SSL_PORT} ssl;"
+            emit_ssl_listen_lines "$_SSL_PORT"
         else
             echo "    listen ${_SSL_PORT};"
             echo "    listen [::]:${_SSL_PORT};"
@@ -915,6 +1159,7 @@ CONF
         proxy_set_header    X-Forwarded-Proto \$scheme;
         proxy_cache_bypass  \$http_upgrade;
 CONF
+        large_upload_lines
         proxy_hide_backend_headers_lines
         # 仅后端为 HTTPS 时才加 proxy_ssl 指令
         if [[ "$backend_is_https" == true ]]; then
@@ -1009,8 +1254,7 @@ LOCEOF
 
         echo "server {"
         if [[ "$_SSL_MODE" != "none" ]]; then
-            echo "    listen ${_SSL_PORT} ssl;"
-            echo "    listen [::]:${_SSL_PORT} ssl;"
+            emit_ssl_listen_lines "$_SSL_PORT"
         else
             echo "    listen ${_SSL_PORT};"
             echo "    listen [::]:${_SSL_PORT};"
@@ -1309,8 +1553,7 @@ site_create_redirect() {
         if $has_ssl; then
             echo ""
             echo "server {"
-            echo "    listen ${_SSL_PORT} ssl;"
-            echo "    listen [::]:${_SSL_PORT} ssl;"
+            emit_ssl_listen_lines "$_SSL_PORT"
             echo "    server_name ${src_domain};"
             echo ""
             ssl_block "$_SSL_CERT" "$_SSL_KEY" "$_HSTS_HEADER" "$_SSL_MODE"
@@ -1391,6 +1634,7 @@ site_create_loadbalance() {
     resolve_ssl_cert "$domain"
     _check_port_conflict "$_SSL_PORT"
     _ensure_upgrade_map
+    ask_large_upload_optimization
 
     local upstream_name="upstream_${domain//./_}"
     local upstream_master="${upstream_name}_master"
@@ -1422,8 +1666,7 @@ site_create_loadbalance() {
         # 主 server 块
         echo "server {"
         if [[ "$_SSL_MODE" != "none" ]]; then
-            echo "    listen ${_SSL_PORT} ssl;"
-            echo "    listen [::]:${_SSL_PORT} ssl;"
+            emit_ssl_listen_lines "$_SSL_PORT"
         else
             echo "    listen ${_SSL_PORT};"
             echo "    listen [::]:${_SSL_PORT};"
@@ -1477,6 +1720,7 @@ CONF
         proxy_next_upstream_timeout 5s;
         proxy_next_upstream_tries 3;
 CONF
+        large_upload_lines
         printf '%s\n' "$(proxy_hide_backend_headers_lines)"
         echo "    }"
 
@@ -1638,6 +1882,10 @@ site_add_acl() {
     echo "  5) 地区/国家 白名单 (仅允许特定国家)"
     echo "  6) 地区/国家 黑名单 (拒绝特定国家)"
     safe_read -rp "选择 [1-6]: " _acl_type
+
+    # IP 白/黑名单及组合类型都依赖 $remote_addr，Cloudflare 后面若未还原真实
+    # IP 会导致这些规则失效，这里提前提醒（地区 ACL 5/6 已用 CF 专属头，不受影响）
+    [[ "${_acl_type:-1}" =~ ^(1|2|4)$ ]] && _maybe_prompt_cf_realip
 
     local acl_conf_file="${NGINX_CONF_DIR}/conf.d/acl-${domain}.conf"
     local snippet_file="${SNIPPET_DIR}/acl-location-${domain}.conf"
@@ -1918,8 +2166,12 @@ site_add_ratelimit() {
     local conf="${SITES_AVAILABLE}/${domain}.conf"
     [[ ! -f "$conf" ]] && die "站点配置不存在，请先创建站点"
 
+    # limit_req/limit_conn 都按 $binary_remote_addr 计数，Cloudflare 后面
+    # 若未还原真实 IP，全站请求会被算成同一个边缘 IP，限流直接失效或误伤
+    _maybe_prompt_cf_realip
+
     echo ""
-    echo -e "${CYAN}── 限流参数 ──${NC}"
+    echo -e "${CYAN}── 请求速率限流（limit_req，防刷接口）──${NC}"
     safe_read -rp "每秒最大请求数（rate，默认 10）: " _rate
     safe_read -rp "内存区大小（zone size，默认 10m）: " _zone_size
     safe_read -rp "突发请求容量（burst，默认 20）: " _burst
@@ -1931,26 +2183,42 @@ site_add_ratelimit() {
     local nodelay_flag=""
     [[ "${_nodelay,,}" != "n" ]] && nodelay_flag=" nodelay"
 
+    echo ""
+    echo -e "${CYAN}── 并发连接数限流（limit_conn，防单 IP 占满 worker 连接）──${NC}"
+    safe_read -rp "是否同时启用？[y/N]: " _use_conn
+    local conn_limit=""
+    if [[ "${_use_conn,,}" == "y" || "${_use_conn,,}" == "yes" ]]; then
+        safe_read -rp "单 IP 最大并发连接数（默认 20）: " conn_limit
+        [[ -z "$conn_limit" ]] && conn_limit=20
+    fi
+
     local zone_name="limit_${domain//./_}"
+    local conn_zone_name="conn_${domain//./_}"
     local rl_conf="${NGINX_CONF_DIR}/conf.d/ratelimit-${domain}.conf"
 
-    cat > "$rl_conf" <<EOF
-# 限流配置: ${domain}  生成时间: $(date)
-limit_req_zone \$binary_remote_addr zone=${zone_name}:${_zone_size} rate=${_rate}r/s;
-limit_req_status 429;
-EOF
+    {
+        echo "# 限流配置: ${domain}  生成时间: $(date)"
+        echo "limit_req_zone \$binary_remote_addr zone=${zone_name}:${_zone_size} rate=${_rate}r/s;"
+        echo "limit_req_status 429;"
+        if [[ -n "$conn_limit" ]]; then
+            echo "limit_conn_zone \$binary_remote_addr zone=${conn_zone_name}:10m;"
+            echo "limit_conn_status 429;"
+        fi
+    } > "$rl_conf"
     success "限流 zone 配置写入: $rl_conf"
 
-    # 自动将 limit_req 注入到站点 location / 块（避免手动编辑）
-    local limit_req_line="limit_req zone=${zone_name} burst=${_burst}${nodelay_flag};"
+    # 自动将 limit_req / limit_conn 注入到站点 location / 块（避免手动编辑）
+    local inject_lines="limit_req zone=${zone_name} burst=${_burst}${nodelay_flag};"
+    [[ -n "$conn_limit" ]] && inject_lines="${inject_lines}\n        limit_conn zone=${conn_zone_name} ${conn_limit};"
+
     local marker="limit_req zone=${zone_name}"
     if grep -qF "$marker" "$conf"; then
-        info "limit_req 指令已存在，跳过注入"
+        info "limit_req 指令已存在，跳过注入（如需补充 limit_conn 请手动添加）"
     elif grep -q 'location[[:space:]]*/[[:space:]]*{' "$conf"; then
-        sed -i "0,/location[[:space:]]*\/[[:space:]]*{/ s//&\n        ${limit_req_line}/" "$conf"
-        success "已自动注入 limit_req 到 location / 块"
+        sed -i "0,/location[[:space:]]*\/[[:space:]]*{/ s//&\n        ${inject_lines}/" "$conf"
+        success "已自动注入限流指令到 location / 块"
     else
-        warn "未找到 location / 块，请手动添加: ${limit_req_line}"
+        warn "未找到 location / 块，请手动添加: ${inject_lines}"
     fi
 
     warn "请确认 nginx.conf 的 http{} 中已 include /etc/nginx/conf.d/*.conf"
@@ -2358,6 +2626,12 @@ ${BOLD}Nginx 控制:${NC}
   nginx restart           重启 Nginx
   nginx status            查看运行状态
  
+${BOLD}Cloudflare 真实 IP（全局，影响本机所有站点，谨慎启用）:${NC}
+  cf-realip install       启用：拉取 CF IP 段并信任 CF-Connecting-IP 头
+  cf-realip refresh       刷新 IP 段（CF 段极少变动，非必需但可定期执行）
+  cf-realip remove        关闭
+  cf-realip status        查看状态
+ 
 ${BOLD}示例:${NC}
   sudo $0                                           # 进入交互式菜单
   sudo $0 site proxy                                # 创建反向代理
@@ -2423,9 +2697,10 @@ interactive_menu() {
         echo " 26) 负载均衡节点管理"
         echo " 27) 查看状态"
         echo " 28) 检查并更新 Nginx"
+        echo " 29) Cloudflare 真实 IP 管理"
         echo "  0) 退出"
         echo ""
-        safe_read -rp "请选择 [0-28]: " choice
+        safe_read -rp "请选择 [0-29]: " choice
 
         case "$choice" in
              1) site_create_static ;;
@@ -2461,6 +2736,16 @@ interactive_menu() {
             26) site_lb_node ;;
             27) nginx_status ;;
             28) nginx_update ;;
+            29)
+                echo "  i) 启用   r) 刷新   d) 关闭   s) 状态"
+                safe_read -rp "选择 [i/r/d/s]: " _cfa
+                case "${_cfa,,}" in
+                    i) cmd_cf_realip install ;;
+                    r) cmd_cf_realip refresh ;;
+                    d) cmd_cf_realip remove ;;
+                    *) cmd_cf_realip status ;;
+                esac
+                ;;
              0) echo "再见！"; exit 0 ;;
              *) warn "无效选项，请重试" ;;
         esac
@@ -2530,6 +2815,9 @@ main() {
                 status)      nginx_status ;;
                 *)           show_help ;;
             esac ;;
+        cf-realip)
+            cmd_cf_realip "${sub:-status}"
+            ;;
         help|--help|-h) show_help ;;
         *) show_help ;;
     esac
