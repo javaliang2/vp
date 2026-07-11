@@ -534,9 +534,9 @@ large_upload_lines() {
     [[ "${_LARGE_UPLOAD:-false}" == true ]] || return 0
     cat <<'EOF'
         proxy_request_buffering  off;
-        proxy_read_timeout       600s;
-        proxy_send_timeout       600s;
-        client_body_timeout      600s;
+        proxy_read_timeout       7200s;
+        proxy_send_timeout       7200s;
+        client_body_timeout      7200s;
 EOF
 }
 
