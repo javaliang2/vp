@@ -298,6 +298,175 @@ delete_key() {
     read -p "按回车键继续..." dummy
 }
 
+# ---------- 修改 SSH 端口 ----------
+change_ssh_port() {
+    printf "${BLUE}===== 修改 SSH 端口 =====${NC}\n"
+    printf "当前端口: ${GREEN}%s${NC}\n" "$SSH_PORT"
+    echo ""
+    read -p "请输入新的 SSH 端口 (1-65535): " new_port
+
+    if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+        printf "${RED}✘ 无效端口号${NC}\n"
+        read -p "按回车键继续..." dummy
+        return
+    fi
+
+    if [ "$new_port" -eq "$SSH_PORT" ]; then
+        printf "${YELLOW}新端口与当前端口相同，无需修改。${NC}\n"
+        read -p "按回车键继续..." dummy
+        return
+    fi
+
+    if [ "$new_port" -lt 1024 ]; then
+        printf "${YELLOW}⚠ 警告：1024 以下为特权端口，部分环境可能有额外限制。${NC}\n"
+        read -p "确定继续？[y/N]: " confirm_low
+        [[ ! $confirm_low =~ ^[Yy]$ ]] && return
+    fi
+
+    # 检测端口是否已被占用
+    if command -v ss &>/dev/null; then
+        if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${new_port}\$"; then
+            printf "${RED}✘ 端口 %s 已被占用！${NC}\n" "$new_port"
+            read -p "按回车键继续..." dummy
+            return
+        fi
+    fi
+
+    printf "${RED}⚠ 警告：修改 SSH 端口前，请务必确认防火墙/安全组已放行新端口 %s！${NC}\n" "$new_port"
+    printf "${YELLOW}   本操作会同时保留旧端口 %s 作为回退，避免因端口未放行而被锁死。${NC}\n" "$SSH_PORT"
+    read -p "是否继续？[y/N]: " confirm
+    [[ ! $confirm =~ ^[Yy]$ ]] && return
+
+    backup_ssh
+
+    # 移除主配置文件中已存在的 Port 指令（保留注释行）
+    sed -i '/^Port /d' "$SSH_CONF"
+    {
+        echo "Port ${SSH_PORT}"
+        echo "Port ${new_port}"
+    } >> "$SSH_CONF"
+
+    # 处理 sshd_config.d 目录下可能覆盖 Port 的配置
+    if [ -d /etc/ssh/sshd_config.d ]; then
+        find /etc/ssh/sshd_config.d/ -type f -name "*.conf" -exec sed -i '/^Port /d' {} \;
+    fi
+
+    printf "${YELLOW}正在检查配置文件语法...${NC}\n"
+    if ! sshd -t 2>/dev/null; then
+        printf "${RED}✘ SSH 配置文件语法错误！已中止操作，并恢复备份。${NC}\n"
+        cp "${SSH_CONF}.bak" "$SSH_CONF"
+        read -p "按回车键继续..." dummy
+        return
+    fi
+    printf "${GREEN}配置语法正确。${NC}\n"
+
+    read -p "即将重启 SSH 服务，同时监听新旧两个端口，继续？[y/N]: " confirm2
+    if [[ ! $confirm2 =~ ^[Yy]$ ]]; then
+        printf "${YELLOW}已取消重启，配置已写入但未生效。${NC}\n"
+        read -p "按回车键继续..." dummy
+        return
+    fi
+
+    local restarted=false
+    if systemctl restart ssh 2>/dev/null; then
+        restarted=true
+    elif systemctl restart sshd 2>/dev/null; then
+        restarted=true
+    elif service ssh restart 2>/dev/null; then
+        restarted=true
+    elif service sshd restart 2>/dev/null; then
+        restarted=true
+    elif /etc/init.d/ssh restart 2>/dev/null; then
+        restarted=true
+    fi
+
+    if $restarted; then
+        printf "${GREEN}✔ SSH 服务已重启，新端口 %s 已生效，旧端口 %s 仍保留作为回退。${NC}\n" "$new_port" "$SSH_PORT"
+        printf "${GREEN}   请务必保持当前会话不要断开，新开窗口测试新端口连接成功后，${NC}\n"
+        printf "${GREEN}   再使用菜单选项「确认端口切换」移除旧端口。${NC}\n"
+        printf "${YELLOW}   提示：如使用了防火墙脚本(如 firewall_fail2ban.sh)，请记得放行 %s/tcp，确认切换后再关闭旧端口 %s。${NC}\n" "$new_port" "$SSH_PORT"
+    else
+        printf "${RED}✘ SSH 服务重启失败！配置已写入但未生效，请手动检查。${NC}\n"
+        read -p "按回车键继续..." dummy
+        return
+    fi
+    read -p "按回车键继续..." dummy
+}
+
+# ---------- 确认端口切换（移除多余的 Port 指令） ----------
+confirm_ssh_port() {
+    printf "${BLUE}===== 确认 SSH 端口切换 =====${NC}\n"
+    local ports
+    ports=$(grep -E '^Port ' "$SSH_CONF" 2>/dev/null)
+
+    if [ -z "$ports" ]; then
+        printf "${YELLOW}未检测到显式 Port 配置（使用默认 22）。${NC}\n"
+        read -p "按回车键继续..." dummy
+        return
+    fi
+
+    local port_count
+    port_count=$(echo "$ports" | wc -l)
+
+    if [ "$port_count" -le 1 ]; then
+        printf "${GREEN}当前只有一个端口在监听，无需确认。${NC}\n"
+        echo "$ports"
+        read -p "按回车键继续..." dummy
+        return
+    fi
+
+    printf "当前监听的端口:\n"
+    echo "$ports" | nl
+    echo ""
+    read -p "请输入要保留的端口号: " keep_port
+
+    if ! echo "$ports" | grep -qE "^Port ${keep_port}\$"; then
+        printf "${RED}✘ 输入的端口不在当前监听列表中${NC}\n"
+        read -p "按回车键继续..." dummy
+        return
+    fi
+
+    read -p "确认只保留端口 ${keep_port}，移除其他端口？[y/N]: " confirm
+    [[ ! $confirm =~ ^[Yy]$ ]] && return
+
+    backup_ssh
+    sed -i '/^Port /d' "$SSH_CONF"
+    echo "Port ${keep_port}" >> "$SSH_CONF"
+
+    if [ -d /etc/ssh/sshd_config.d ]; then
+        find /etc/ssh/sshd_config.d/ -type f -name "*.conf" -exec sed -i '/^Port /d' {} \;
+    fi
+
+    printf "${YELLOW}正在检查配置文件语法...${NC}\n"
+    if ! sshd -t 2>/dev/null; then
+        printf "${RED}✘ SSH 配置文件语法错误！已中止操作，并恢复备份。${NC}\n"
+        cp "${SSH_CONF}.bak" "$SSH_CONF"
+        read -p "按回车键继续..." dummy
+        return
+    fi
+
+    local restarted=false
+    if systemctl restart ssh 2>/dev/null; then
+        restarted=true
+    elif systemctl restart sshd 2>/dev/null; then
+        restarted=true
+    elif service ssh restart 2>/dev/null; then
+        restarted=true
+    elif service sshd restart 2>/dev/null; then
+        restarted=true
+    elif /etc/init.d/ssh restart 2>/dev/null; then
+        restarted=true
+    fi
+
+    if $restarted; then
+        SSH_PORT=$keep_port
+        printf "${GREEN}✔ 已确认，SSH 仅监听端口 %s。${NC}\n" "$keep_port"
+    else
+        printf "${RED}✘ SSH 服务重启失败！配置已写入但未生效，请手动检查。${NC}\n"
+    fi
+    read -p "按回车键继续..." dummy
+}
+
 # ---------- 主菜单 ----------
 while true; do
     clear
@@ -313,6 +482,8 @@ while true; do
     echo "6. 开启密码登录 (恢复)"
     echo "--------------------------------------"
     echo "7. 查看 SSH 配置摘要"
+    echo "8. 修改 SSH 端口 (保留旧端口回退)"
+    echo "9. 确认端口切换 (移除旧端口)"
     echo "0. 返回主菜单"
     read -p "请选择: " choice
 
@@ -324,6 +495,8 @@ while true; do
         5) disable_password_auth ;;
         6) enable_password_auth ;;
         7) show_config ;;
+        8) change_ssh_port ;;
+        9) confirm_ssh_port ;;
         0) break ;;
         *) printf "${RED}无效选项${NC}\n"; sleep 1 ;;
     esac
