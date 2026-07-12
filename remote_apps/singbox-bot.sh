@@ -89,11 +89,42 @@ source /etc/sing-box/tg_bot.conf
 LINK_DIR="/etc/sing-box/links"
 SB_CONFIG="/etc/sing-box/config.json"
 OFFSET_FILE="/etc/sing-box/tg_bot_offset"
+STATE_DIR="/etc/sing-box/tg_state"
 LAST_ALERT_TIME=0
 LAST_PUSH_TIME=0
 
+mkdir -p "$STATE_DIR"
+
 SERVER_IP=$(curl -s --max-time 5 http://ip-api.com/line?fields=query 2>/dev/null || echo "未知")
 CPU_CORES=$(nproc)
+
+# ──────────────────────────────────────────
+# 会话状态管理（多步交互，如添加节点）
+# ──────────────────────────────────────────
+
+get_state() {
+    local chat_id=$1
+    cat "$STATE_DIR/${chat_id}.json" 2>/dev/null
+}
+
+set_state() {
+    local chat_id=$1
+    local json=$2
+    echo "$json" | jq --arg ts "$(date +%s)" '. + {ts: ($ts|tonumber)}' > "$STATE_DIR/${chat_id}.json"
+}
+
+clear_state() {
+    rm -f "$STATE_DIR/${1}.json"
+}
+
+# 状态超过 5 分钟未完成视为过期，防止用户中途放弃后残留脏状态
+state_expired() {
+    local chat_id=$1
+    local ts now
+    ts=$(jq -r '.ts // 0' "$STATE_DIR/${chat_id}.json" 2>/dev/null)
+    now=$(date +%s)
+    (( now - ts > 300 ))
+}
 
 # ──────────────────────────────────────────
 # 权限校验：支持多管理员（逗号分隔）
@@ -363,9 +394,146 @@ get_links_menu_kb() {
     echo "{\"inline_keyboard\":$rows}"
 }
 
+# 节点列表按钮：每个节点一个按钮 + 添加节点入口
+get_nodes_kb() {
+    local count
+    count=$(jq '.inbounds | length' "$SB_CONFIG" 2>/dev/null || echo 0)
+    local rows="["
+    if [[ "$count" -gt 0 ]]; then
+        local i=0
+        while [[ $i -lt $count ]]; do
+            local tag type
+            tag=$(jq -r ".inbounds[$i].tag"  "$SB_CONFIG" 2>/dev/null)
+            type=$(jq -r ".inbounds[$i].type" "$SB_CONFIG" 2>/dev/null)
+            rows+="[{\"text\":\"🔹 $tag [$type]\",\"callback_data\":\"node_detail_$tag\"}],"
+            (( i++ ))
+        done
+    fi
+    rows+="[{\"text\":\"➕ 添加节点\",\"callback_data\":\"node_add_menu\"}],"
+    rows+="[{\"text\":\"⬅️ 返回主菜单\",\"callback_data\":\"menu_main\"}]"
+    rows+="]"
+    echo "{\"inline_keyboard\":$rows}"
+}
+
 # ──────────────────────────────────────────
-# Inline Keyboard 定义
+# 添加节点：VLESS+Reality（与 sing-box.sh 的
+# add_node 选项1 生成逻辑保持一致，便于互通）
 # ──────────────────────────────────────────
+
+finalize_add_reality() {
+    local chat_id=$1 port=$2 sni=$3
+
+    local ip uuid tag keys private public sid
+    ip=$(curl -s4 --connect-timeout 3 icanhazip.com 2>/dev/null || curl -s4 --connect-timeout 3 ifconfig.me 2>/dev/null)
+    uuid=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+    tag="reality-${port}"
+
+    # tag 唯一性兜底，避免和已有节点冲突
+    if jq -e --arg t "$tag" '.inbounds[] | select(.tag==$t)' "$SB_CONFIG" >/dev/null 2>&1; then
+        tag="reality-${port}-$(date +%s | tail -c4)"
+    fi
+
+    keys=$(sing-box generate reality-keypair 2>/dev/null)
+    private=$(echo "$keys" | awk -F': ' '/Private/{print $2}' | tr -d '[:space:]')
+    public=$(echo "$keys"  | awk -F': ' '/Public/{print $2}'  | tr -d '[:space:]')
+    sid=$(openssl rand -hex 8)
+
+    if [[ -z "$private" || -z "$public" ]]; then
+        send_msg "$chat_id" "❌ Reality 密钥对生成失败，节点未添加"
+        return
+    fi
+
+    local tmp_json="/tmp/sb_bot_add_$$.json"
+    jq --arg port "$port" --arg uuid "$uuid" --arg sni "$sni" \
+       --arg priv "$private" --arg sid "$sid" --arg tag "$tag" \
+       '.inbounds += [{"type":"vless","tag":$tag,"listen":"::","listen_port":($port|tonumber),
+         "users":[{"uuid":$uuid,"flow":"xtls-rprx-vision"}],
+         "tls":{"enabled":true,"server_name":$sni,
+           "reality":{"enabled":true,"handshake":{"server":$sni,"server_port":443},
+             "private_key":$priv,"short_id":[$sid]}}}]' \
+       "$SB_CONFIG" > "$tmp_json"
+
+    if ! sing-box check -c "$tmp_json" &>/dev/null; then
+        send_msg "$chat_id" "❌ 配置校验失败，节点未添加（原配置未改动）"
+        rm -f "$tmp_json"
+        return
+    fi
+
+    cp "$SB_CONFIG" "${SB_CONFIG}.bak"
+    mv "$tmp_json" "$SB_CONFIG"
+
+    if systemctl restart sing-box; then
+        local link="vless://$uuid@$ip:$port?security=reality&sni=$sni&fp=chrome&pbk=$public&sid=$sid&type=tcp&flow=xtls-rprx-vision#$tag"
+        mkdir -p "$LINK_DIR"
+        echo "$link" > "$LINK_DIR/${tag}.link"
+        send_keyboard "$chat_id" "✅ *节点添加成功！*
+━━━━━━━━━━━━━━━━━━━━━━
+🏷 Tag: \`$tag\`
+🔌 端口: $port
+🌐 SNI: $sni
+
+\`$link\`" "$KB_BACK_MAIN"
+    else
+        send_msg "$chat_id" "⚠️ 配置已写入，但 sing-box 重启失败，请用 /singbox 检查状态"
+    fi
+}
+
+# 多步会话状态机：目前仅支持添加 VLESS+Reality 节点，
+# 后续可在 case 里按 action 继续扩展其他协议
+handle_conversation() {
+    local chat_id=$1 text=$2
+    local state
+    state=$(get_state "$chat_id")
+    [[ -z "$state" ]] && return
+
+    if state_expired "$chat_id"; then
+        clear_state "$chat_id"
+        send_msg "$chat_id" "⌛ 操作已超时（超过5分钟未完成），请重新发起"
+        return
+    fi
+
+    local action step
+    action=$(echo "$state" | jq -r '.action')
+    step=$(echo "$state" | jq -r '.step')
+
+    case "$action" in
+        add_reality)
+            case "$step" in
+                1) # 端口
+                    local port="$text"
+                    [[ "$port" == "-" ]] && port="443"
+                    if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+                        send_msg "$chat_id" "❌ 端口无效，请输入 1-65535 之间的数字，或发送 /cancel 取消"
+                        return
+                    fi
+                    if ss -tulnp 2>/dev/null | grep -qP ":${port}(?:\s|$)"; then
+                        send_msg "$chat_id" "❌ 端口 $port 已被占用，请换一个，或发送 /cancel 取消"
+                        return
+                    fi
+                    set_state "$chat_id" "{\"action\":\"add_reality\",\"step\":2,\"port\":\"$port\"}"
+                    send_msg "$chat_id" "✅ 端口: $port
+请输入 Reality 目标 SNI 域名
+发送 \`-\` 使用默认值 music.apple.com
+发送 /cancel 取消"
+                    ;;
+                2) # SNI
+                    local sni="$text"
+                    [[ "$sni" == "-" ]] && sni="music.apple.com"
+                    local port
+                    port=$(echo "$state" | jq -r '.port')
+                    clear_state "$chat_id"
+                    send_msg "$chat_id" "⏳ 正在生成节点，请稍候..."
+                    finalize_add_reality "$chat_id" "$port" "$sni"
+                    ;;
+            esac
+            ;;
+        *)
+            clear_state "$chat_id"
+            ;;
+    esac
+}
+
+
 
 KB_MAIN='{
     "inline_keyboard":[
@@ -468,7 +636,7 @@ handle_command() {
             send_keyboard "$chat_id" "$(get_sb_status)" "$KB_SINGBOX"
             ;;
         /nodes)
-            send_keyboard "$chat_id" "$(get_nodes_text)" "$KB_BACK_MAIN"
+            send_keyboard "$chat_id" "$(get_nodes_text)" "$(get_nodes_kb)"
             ;;
         /links)
             local kb
@@ -512,7 +680,7 @@ handle_callback() {
             ;;
         menu_nodes)
             new_text="$(get_nodes_text)"
-            new_kb="$KB_BACK_MAIN"
+            new_kb="$(get_nodes_kb)"
             toast="节点列表"
             ;;
         menu_system)
@@ -570,6 +738,60 @@ ${log_text:0:3500}
             return
             ;;
 
+        # ── 节点管理 ──
+        node_add_menu)
+            new_text="➕ *添加节点*
+━━━━━━━━━━━━━━━━━━━━━━
+请选择协议类型："
+            new_kb='{"inline_keyboard":[[{"text":"VLESS + Reality","callback_data":"node_add_reality"}],[{"text":"其他协议 (敬请期待)","callback_data":"noop"}],[{"text":"⬅️ 返回","callback_data":"menu_nodes"}]]}'
+            toast="选择协议"
+            ;;
+        node_add_reality)
+            set_state "$chat_id" '{"action":"add_reality","step":1}'
+            new_text="➕ *添加 VLESS+Reality 节点 (1/2)*
+━━━━━━━━━━━━━━━━━━━━━━
+请直接回复监听端口号
+发送 \`-\` 使用默认端口 443
+发送 /cancel 取消"
+            new_kb='{"inline_keyboard":[[{"text":"❌ 取消","callback_data":"cancel_conv"}]]}'
+            toast="等待输入端口"
+            ;;
+        node_detail_*)
+            tag="${data#node_detail_}"
+            link_file="$LINK_DIR/${tag}.link"
+            link_text="(无保存链接)"
+            [[ -f "$link_file" ]] && link_text=$(cat "$link_file")
+            new_text="🔗 *节点详情*
+━━━━━━━━━━━━━━━━━━━━━━
+🏷 Tag: \`$tag\`
+
+\`$link_text\`"
+            new_kb="{\"inline_keyboard\":[[{\"text\":\"🗑 删除此节点\",\"callback_data\":\"node_del_confirm_$tag\"}],[{\"text\":\"⬅️ 返回节点列表\",\"callback_data\":\"menu_nodes\"}]]}"
+            toast="节点详情"
+            ;;
+        node_del_confirm_*)
+            tag="${data#node_del_confirm_}"
+            new_text="⚠️ 确定要删除节点 \`$tag\` 吗？此操作不可撤销，路由分流规则如果引用了该节点需要手动检查。"
+            new_kb="{\"inline_keyboard\":[[{\"text\":\"✅ 确认删除\",\"callback_data\":\"node_del_do_$tag\"},{\"text\":\"❌ 取消\",\"callback_data\":\"node_detail_$tag\"}]]}"
+            toast="请确认"
+            ;;
+        node_del_do_*)
+            tag="${data#node_del_do_}"
+            answer_cb "$cb_id" "删除中..."
+            tmp_json="/tmp/sb_bot_del_$$.json"
+            jq --arg t "$tag" '.inbounds |= map(select(.tag != $t))' "$SB_CONFIG" > "$tmp_json"
+            if sing-box check -c "$tmp_json" &>/dev/null; then
+                mv "$tmp_json" "$SB_CONFIG"
+                rm -f "$LINK_DIR/${tag}.link"
+                systemctl restart sing-box
+                edit_msg "$chat_id" "$msg_id" "✅ 节点 \`$tag\` 已删除" "$KB_BACK_MAIN"
+            else
+                rm -f "$tmp_json"
+                edit_msg "$chat_id" "$msg_id" "❌ 删除失败，配置校验未通过（原配置未改动）" "$KB_BACK_MAIN"
+            fi
+            return
+            ;;
+
         # ── 分享链接 ──
         getlink_*)
             local fname="${data#getlink_}"
@@ -592,6 +814,13 @@ ${log_text:0:3500}
             answer_cb "$cb_id" ""
             return
             ;;
+
+        cancel_conv)
+            clear_state "$chat_id"
+            new_text="✅ 已取消"
+            new_kb="$(get_nodes_kb)"
+            toast="已取消"
+            ;;
     esac
 
     answer_cb "$cb_id" "$toast"
@@ -612,6 +841,7 @@ send_keyboard "$(first_admin)" "✅ *机器人已启动*
 🕒 $(date '+%Y-%m-%d %H:%M:%S')" "$KB_MAIN"
 
 OFFSET=$(cat "$OFFSET_FILE" 2>/dev/null || echo 0)
+FAIL_COUNT=0
 
 while true; do
     check_alerts
@@ -622,8 +852,14 @@ while true; do
         "https://api.telegram.org/bot${TOKEN}/getUpdates?offset=${OFFSET}&timeout=20" \
         2>/dev/null)
 
-    # jq 解析失败时跳过（网络抖动等）
-    echo "$RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1 || { sleep 2; continue; }
+    # 失败时指数退避（网络中断/Token失效等持续性故障），避免狂打 API；最长 60s
+    if ! echo "$RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
+        (( FAIL_COUNT++ ))
+        BACKOFF=$(( FAIL_COUNT > 6 ? 60 : 2 ** FAIL_COUNT ))
+        sleep "$BACKOFF"
+        continue
+    fi
+    FAIL_COUNT=0
 
     while IFS= read -r update; do
         [[ -z "$update" ]] && continue
@@ -650,9 +886,17 @@ while true; do
 
         if [[ -n "$MSG_TEXT" ]]; then
             # 只取第一个词作为命令（忽略 /cmd@botname 格式后缀）
-            local cmd
             cmd=$(echo "$MSG_TEXT" | awk '{print $1}' | cut -d'@' -f1)
-            handle_command "$local_chat" "$cmd"
+
+            if [[ "$cmd" == "/cancel" ]]; then
+                clear_state "$local_chat"
+                send_msg "$local_chat" "✅ 已取消当前操作"
+            elif [[ -f "$STATE_DIR/${local_chat}.json" && "$MSG_TEXT" != /* ]]; then
+                # 存在待处理的多步会话（如添加节点流程），且不是命令 → 交给会话处理器
+                handle_conversation "$local_chat" "$MSG_TEXT"
+            else
+                handle_command "$local_chat" "$cmd"
+            fi
         fi
 
         if [[ -n "$CB_DATA" ]]; then
