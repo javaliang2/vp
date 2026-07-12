@@ -262,6 +262,120 @@ view_logs() {
 }
 
 # ============================================================
+# [F16] 日志管理（大小限制 / 级别调整 / 清理）
+# ============================================================
+JOURNALD_DROPIN="/etc/systemd/journald.conf.d/99-singbox.conf"
+
+_get_journal_disk_usage() {
+    journalctl --disk-usage 2>/dev/null | grep -oP '[\d.]+[KMGT]?' | head -1
+}
+
+_get_sb_log_level() {
+    jq -r '.log.level // "未设置"' "$CONFIG_FILE" 2>/dev/null
+}
+
+set_journald_limit() {
+    echo -e "${YELLOW}--- 设置 journald 日志大小限制 ---${PLAIN}"
+    echo -e "当前 journal 磁盘占用: ${CYAN}$(_get_journal_disk_usage)${PLAIN}"
+    read -p "最大占用空间，如 200M / 500M (默认 200M): " max_use
+    max_use=${max_use:-200M}
+    read -p "最长保留天数 (默认 7): " retain_days
+    retain_days=${retain_days:-7}
+
+    mkdir -p "$(dirname "$JOURNALD_DROPIN")"
+    cat > "$JOURNALD_DROPIN" <<EOF
+[Journal]
+SystemMaxUse=${max_use}
+MaxRetentionSec=${retain_days}day
+EOF
+    systemctl restart systemd-journald
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}✔ 已设置: 最大占用 ${max_use}，保留 ${retain_days} 天${PLAIN}"
+        echo -e "${GREEN}✔ 配置文件: ${BLUE}$JOURNALD_DROPIN${PLAIN}"
+    else
+        echo -e "${RED}✘ systemd-journald 重启失败，请检查配置${PLAIN}"
+    fi
+    pause
+}
+
+set_sb_log_level() {
+    [[ ! -f "$CONFIG_FILE" ]] && { echo -e "${RED}✘ 未找到配置文件: $CONFIG_FILE${PLAIN}"; pause; return; }
+
+    echo -e "${YELLOW}--- 调整 sing-box 日志级别 ---${PLAIN}"
+    echo -e "当前级别: ${CYAN}$(_get_sb_log_level)${PLAIN}"
+    echo -e "级别越低越安静，日志量越小；trace > debug > info > warn > error > fatal > panic"
+    echo "1. info  (默认，记录连接等常规信息)"
+    echo "2. warn  (仅警告及以上，推荐用于减少日志量)"
+    echo "3. error (仅错误及以上，最安静)"
+    echo "0. 返回"
+    read -p "请选择: " lvl_choice
+    local new_level=""
+    case $lvl_choice in
+        1) new_level="info" ;;
+        2) new_level="warn" ;;
+        3) new_level="error" ;;
+        0) return ;;
+        *) echo -e "${RED}无效输入${PLAIN}"; pause; return ;;
+    esac
+
+    make_tmp
+    jq --arg lvl "$new_level" '.log.level = $lvl' "$CONFIG_FILE" > "$_TMP_JSON"
+    if jq -e . "$_TMP_JSON" >/dev/null 2>&1; then
+        save_and_restart
+        echo -e "${GREEN}✔ 日志级别已改为: $new_level (已重启 sing-box)${PLAIN}"
+    else
+        echo -e "${RED}✘ JSON 校验失败，未修改${PLAIN}"
+    fi
+    pause
+}
+
+clean_exported_logs() {
+    echo -e "${YELLOW}--- 清理已导出的日志文件 ---${PLAIN}"
+    local files
+    files=$(ls -1 /root/singbox_*.log 2>/dev/null)
+    if [[ -z "$files" ]]; then
+        echo -e "${GREEN}没有找到已导出的日志文件${PLAIN}"; pause; return
+    fi
+    echo -e "找到以下文件:"
+    echo "$files"
+    echo -e "总占用: ${CYAN}$(du -ch /root/singbox_*.log 2>/dev/null | tail -1 | cut -f1)${PLAIN}"
+    read -p "确定全部删除？(y/n): " confirm
+    if [[ "$confirm" =~ ^[yY]$ ]]; then
+        rm -f /root/singbox_*.log
+        echo -e "${GREEN}✔ 已清理${PLAIN}"
+    fi
+    pause
+}
+
+manage_logs() {
+    while true; do
+        clear
+        echo -e "${YELLOW}--- 日志管理 ---${PLAIN}"
+        echo -e "journal 磁盘占用: ${CYAN}$(_get_journal_disk_usage)${PLAIN}    sing-box 日志级别: ${CYAN}$(_get_sb_log_level)${PLAIN}"
+        echo "-----------------------------------------------"
+        echo "1. 查看日志"
+        echo "2. 设置 journald 大小/保留限制 (防止磁盘写爆)"
+        echo "3. 调整 sing-box 日志级别 (减少日志量)"
+        echo "4. 清理已导出的日志文件 (/root/singbox_*.log)"
+        echo "5. 立即清理超限日志 (journalctl --vacuum-size)"
+        echo "0. 返回"
+        read -p "请选择: " choice
+        case $choice in
+            1) view_logs ;;
+            2) set_journald_limit ;;
+            3) set_sb_log_level ;;
+            4) clean_exported_logs ;;
+            5) read -p "清理到多大 (如 100M，默认100M): " vsize
+               vsize=${vsize:-100M}
+               journalctl --vacuum-size="$vsize"
+               pause ;;
+            0) return ;;
+            *) echo -e "${RED}无效输入${PLAIN}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ============================================================
 # 功能模块
 # ============================================================
 
@@ -2185,7 +2299,7 @@ while true; do
     echo -e "  ${GREEN}8.${PLAIN} 申请 SSL 证书 (ACME)"
     echo -e "  ${GREEN}9.${PLAIN} 添加出站/自动优选/轮询"
     echo -e " ${GREEN}10.${PLAIN} 修改/删除节点"
-    echo -e " ${GREEN}11.${PLAIN} 日志查看"
+    echo -e " ${GREEN}11.${PLAIN} 日志管理"
     echo -e " ${GREEN}12.${PLAIN} 一键订阅"
     echo -e " ${GREEN}13.${PLAIN} 一键部署WARP出站"
     echo -e " ${GREEN}14.${PLAIN} 出站管理"
@@ -2205,7 +2319,7 @@ while true; do
         8)  apply_cert ;;
         9)  add_outbound ;;
         10) edit_node ;;
-        11) view_logs ;;
+        11) manage_logs ;;
         12) manage_subscription ;;
         13) setup_warp_outbound ;;
         14) manage_outbounds ;;
