@@ -1648,7 +1648,9 @@ EOF
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   minio:
-    image: minio/minio:latest
+    # 2025-05-24 之后的版本删除了控制台大部分管理功能（用户/策略/Bucket管理等）
+    # 固定到最后一个保留完整 Web 管理界面的版本；官方已于 2025-12 进入维护模式，此后不再有安全更新
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
@@ -1683,8 +1685,11 @@ deploy_lskypro() {
     NET=$(net_name "$DIR")
 
     header "部署 Lsky Pro 图床 → $DIR (端口 $HOST_PORT)"
-    mkdir -p "$DIR"/{uploads,db}
+    mkdir -p "$DIR"/{html,db}
 
+    # 注：兰空图床没有官方 Docker 镜像（作者只发布源码），且不支持通过环境变量
+    # 自动写入数据库配置——必须走 Web 安装向导手动填写。这里只负责把 MariaDB
+    # 起好、把连接信息记录到 .env，方便你在安装向导里直接抄。
     local DB_ROOT_PW DB_PW
     DB_ROOT_PW=$(randpw); DB_PW=$(randpw)
     cat > "$DIR/.env" <<EOF
@@ -1713,18 +1718,13 @@ services:
       retries: 5
 
   lskypro:
-    # 官方镜像 lskypro/lsky-pro 已停止维护，使用社区维护镜像
-    image: bestzwei/lskypro:latest
+    # 社区维护镜像，目前更新最活跃（原 bestzwei/lskypro 镜像不存在）
+    image: coldpig/lskypro-docker:latest
     restart: unless-stopped
-    environment:
-      DB_CONNECTION: mysql
-      DB_HOST: lskypro-db
-      DB_PORT: 3306
-      DB_DATABASE: lskypro
-      DB_USERNAME: lskypro
-      DB_PASSWORD: \${MARIADB_PASSWORD}
+    # 整个网站目录都要持久化：Web 安装向导写入的 .env / 配置都在这里，
+    # 只挂 uploads 会导致容器重建后安装信息丢失、需要重装一遍。
     volumes:
-      - ./uploads:/var/www/html/storage/app/uploads
+      - ./html:/var/www/html
     ports:
       - "127.0.0.1:${HOST_PORT}:80"
     depends_on:
@@ -1739,8 +1739,9 @@ YAML
 
     run_compose "$DIR" "Lsky Pro"
     log "Lsky Pro 已启动 → http://127.0.0.1:${HOST_PORT}"
-    warn "首次访问需完成 Web 安装向导（数据库主机填 lskypro-db）"
-    log "数据库: lskypro  用户: lskypro  密码见 $DIR/.env"
+    warn "首次访问需完成 Web 安装向导，数据库信息填："
+    log "  数据库主机: lskypro-db  端口: 3306"
+    log "  数据库名: lskypro  用户: lskypro  密码见 $DIR/.env"
 }
 
 deploy_easyimage() {
@@ -1836,7 +1837,9 @@ deploy_alist() {
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   alist:
-    image: xhofe/alist:latest
+    # 原作者 xhofe 的账号已于 2025 年易主，官方文档已改为推荐 alist666/alist，
+    # 不再建议使用 xhofe/alist（来源不再可信）
+    image: alist666/alist:latest
     restart: unless-stopped
     environment:
       - PUID=${puid}
