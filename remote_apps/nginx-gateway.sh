@@ -247,8 +247,20 @@ check_and_install_nginx() {
 nginx_reload() {
     info "检查 Nginx 配置语法..."
     nginx -t 2>&1 >&2 || die "Nginx 配置检查失败，请修正后重试"
-    systemctl reload nginx
-    success "Nginx 已重载"
+    # FIX: service 若因之前的故障（如 default_server 冲突导致启动失败）
+    # 处于 inactive 状态，reload 会直接报错 "not active, cannot reload"。
+    # 配置语法已确认无误，此时应 start 而非 reload。
+    if systemctl is-active --quiet nginx; then
+        systemctl reload nginx
+        success "Nginx 已重载"
+    else
+        warn "Nginx 当前未运行，尝试启动而非重载..."
+        if systemctl start nginx 2>&1; then
+            success "Nginx 已启动"
+        else
+            die "Nginx 启动失败，请执行 'systemctl status nginx' 和 'journalctl -xeu nginx' 排查"
+        fi
+    fi
 }
 
 nginx_restart() { require_root; systemctl restart nginx && success "Nginx 已重启"; }
@@ -875,14 +887,20 @@ cert_issue_auto() {
         --agree-tos --email "$email" --no-eff-email --non-interactive; then
         if $nginx_was_active; then
             info "正在恢复 Nginx 服务..."
-            systemctl start nginx 2>/dev/null || true
+            # FIX: 之前用 "|| true" 静默吞掉启动失败，导致证书申请成功后
+            # nginx 实际处于停止状态而脚本毫无察觉，直到后面 reload 时才报错。
+            if systemctl start nginx 2>&1; then
+                success "Nginx 已恢复运行"
+            else
+                warn "Nginx 恢复启动失败！请立即执行 'nginx -t' 和 'journalctl -xeu nginx' 排查，当前站点可能不可访问"
+            fi
         fi
         success "证书申请成功: ${LE_CERT_BASE}/${domain}/"
         return 0
     else
         if $nginx_was_active; then
             info "申请失败，正在尝试恢复 Nginx 服务..."
-            systemctl start nginx 2>/dev/null || true
+            systemctl start nginx 2>&1 || warn "Nginx 恢复启动也失败了，请手动检查"
         fi
         die "证书申请彻底失败！请检查域名解析、防火墙 80 端口是否开放，或查看上方 Certbot 日志。"
     fi
@@ -924,7 +942,11 @@ _cert_issue_standalone() {
 
     if $nginx_was_active; then
         info "正在恢复 Nginx 服务..."
-        systemctl start nginx 2>/dev/null || true
+        if systemctl start nginx 2>&1; then
+            success "Nginx 已恢复运行"
+        else
+            warn "Nginx 恢复启动失败！请立即执行 'nginx -t' 和 'journalctl -xeu nginx' 排查，当前站点可能不可访问"
+        fi
     fi
     return $rc
 }
@@ -2430,6 +2452,16 @@ config_backup_list() {
 _ensure_block_ip() {
     local block_conf="${SITES_AVAILABLE}/00-block-ip.conf"
     local block_link="${SITES_DIR}/00-block-ip.conf"
+
+    # FIX: 系统自带的 sites-enabled/default 同样声明了 default_server，
+    # 与本函数生成的 00-block-ip.conf 冲突（"duplicate default server"）。
+    # 之前只在 _site_activate() 里移除，导致证书申请阶段（在建站之前）
+    # 就已经因为这个冲突而 nginx -t 失败，并可能连带导致 standalone
+    # 模式申请证书后 nginx 重启失败。这里提前、无条件地清理掉。
+    if [[ -e "${SITES_DIR}/default" ]]; then
+        rm -f "${SITES_DIR}/default"
+        info "已移除系统默认站点 default（与 default_server 冲突）"
+    fi
 
     # 检测 nginx 是否支持 ssl_reject_handshake（1.19.4+）
     local support_reject=true
