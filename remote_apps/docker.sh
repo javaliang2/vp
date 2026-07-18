@@ -131,6 +131,11 @@ declare -A APP_DEFAULT_PORT=(
     [sunpanel]=3002 [vaultwarden]=8099 [emby]=8096
 )
 
+# MinIO 的 API 端口(S3协议)和控制台端口是两个独立服务，不能用"控制台端口+1"推算，
+# 否则控制台端口一变 API 端口就跟着悄悄变。这里给一个独立默认值。
+# 之所以不用标准的 9000，是因为 Portainer 默认已经占了 9000（见上表）。
+MINIO_API_DEFAULT_PORT=9002
+
 get_instance_url() {
     local inst_dir="$1" app="$2"
     local port=""
@@ -1630,11 +1635,12 @@ YAML
 deploy_minio() {
     local DIR="${1:-$BASE_DIR/minio}"
     local HOST_PORT="${2:-${APP_DEFAULT_PORT[minio]}}"
-    local API_PORT=$((HOST_PORT + 1))
+    local API_PORT="${3:-$MINIO_API_DEFAULT_PORT}"
     local NET
     NET=$(net_name "$DIR")
 
     header "部署 MinIO → $DIR (控制台 $HOST_PORT, API $API_PORT)"
+    warn "控制台和 API 是两个独立端口，容器内固定是 9001/9000；这里 $HOST_PORT/$API_PORT 只是宿主机映射端口"
     mkdir -p "$DIR/data"
 
     local SECRET_KEY; SECRET_KEY=$(randpw 32)
