@@ -157,6 +157,18 @@ EOF
 _ensure_gzip_conf() {
     local gzip_conf="${NGINX_CONF_DIR}/conf.d/01-gzip.conf"
     [[ -f "$gzip_conf" ]] && return 0
+
+    # FIX: Debian/Ubuntu 官方包的 nginx.conf 默认就在 http{} 里写了
+    # "gzip on;"（且未注释），与本文件的 "gzip on;" 同处一个 http 上下文，
+    # nginx 会报 "gzip" directive is duplicate 并整体加载失败。
+    # 这里先把 nginx.conf 里裸的 "gzip on;" 注释掉，避免冲突。
+    local main_conf="${NGINX_CONF_DIR}/nginx.conf"
+    if [[ -f "$main_conf" ]] && grep -qE "^[[:space:]]*gzip[[:space:]]+on[[:space:]]*;" "$main_conf"; then
+        cp "$main_conf" "${main_conf}.bak.$(date +%s)" 2>/dev/null || true
+        sed -i -E 's/^([[:space:]]*)(gzip[[:space:]]+on[[:space:]]*;)/\1# \2  # 已由 nginx-gateway.sh 迁移至 conf.d\/01-gzip.conf/' "$main_conf"
+        info "检测到 nginx.conf 内置的 gzip on;，已注释以避免与全局 gzip 配置冲突"
+    fi
+
     mkdir -p "${NGINX_CONF_DIR}/conf.d" || true
     cat > "$gzip_conf" <<'EOF'
 gzip on;
