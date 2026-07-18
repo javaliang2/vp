@@ -84,12 +84,18 @@ ensure_sites_enabled_include() {
     if grep -qE '^\s*http\s*\{' "$ngxconf"; then
         cp "$ngxconf" "${ngxconf}.bak.$(date +%s)"
         sed -i '/^\s*http\s*{/a\    include /etc/nginx/sites-enabled/*;' "$ngxconf"
-        if nginx -t &>/dev/null; then
+        # FIX: 保留 nginx -t 的真实输出。原来 &>/dev/null 吞掉报错，回滚后
+        # 用户只看到"语法检查未通过"，看不出到底是这次改动的问题，还是
+        # 系统里其它站点配置本来就是坏的（和这次改动无关）。
+        local test_output
+        if test_output=$(nginx -t 2>&1); then
             info "已在 nginx.conf 中添加 include /etc/nginx/sites-enabled/*;（原文件已备份）"
         else
             # 修改后语法检查不过，回滚，避免留下一个无法启动的 nginx.conf
             cp "${ngxconf}.bak."* "$ngxconf" 2>/dev/null
             warn "自动添加 sites-enabled include 后语法检查未通过，已回滚，请手动添加: include /etc/nginx/sites-enabled/*;"
+            warn "nginx -t 真实报错如下（也可能是其它站点配置本身有问题，与本次改动无关）:"
+            echo "$test_output" | tee -a "$LOG_FILE" 1>&2
         fi
     else
         warn "未能在 nginx.conf 中定位 http{} 块，请手动添加: include /etc/nginx/sites-enabled/*;"
@@ -177,12 +183,24 @@ gzip_types
     font/otf
     image/svg+xml;
 EOF
-    if nginx -t &>/dev/null; then
+    # FIX: 原来用 `nginx -t &>/dev/null` 做全局校验，一旦系统里有任何
+    # 其它站点配置本身就是坏的（和这份 gzip 配置毫无关系），也会被判定
+    # 为"gzip 校验未通过"并把这份完全正常的文件删掉，且看不到真实报错。
+    # 现在：保留 nginx -t 的完整输出；只有报错明确指向这个文件本身时才
+    # 删除它，否则保留文件、把真实错误打印出来，避免误判和信息丢失。
+    local test_output
+    if test_output=$(nginx -t 2>&1); then
         info "已生成全局 gzip 压缩配置: $gzip_conf"
-    else
-        # 极少数极旧版本 nginx 不识别个别 gzip_types，出错则直接移除避免拖垮启动
+    elif echo "$test_output" | grep -qF "$gzip_conf"; then
+        # 极少数极旧版本 nginx 不识别个别 gzip_types，错误确实指向本文件才移除
         rm -f "$gzip_conf"
-        warn "gzip 配置校验未通过，已跳过（不影响其他功能）"
+        warn "gzip 配置校验未通过，已跳过（不影响其他功能）:"
+        echo "$test_output" | tee -a "$LOG_FILE" 1>&2
+    else
+        # 报错与 gzip 配置无关，说明是其它站点配置本身有问题；保留该文件，
+        # 把真实的 nginx -t 报错打印出来，方便定位
+        warn "nginx -t 校验失败，但错误与 gzip 配置无关（已保留该文件），请检查下方报错定位真实原因:"
+        echo "$test_output" | tee -a "$LOG_FILE" 1>&2
     fi
 }
 
@@ -356,13 +374,16 @@ cf_realip_update() {
         echo "real_ip_recursive on;"
     } > "$CF_REALIP_CONF"
 
-    if nginx -t &>/dev/null; then
+    local test_output
+    if test_output=$(nginx -t 2>&1); then
         success "Cloudflare 真实 IP 配置已生成: $CF_REALIP_CONF"
         nginx_reload
         info "limit_req / ACL / access_log 现在会基于访客真实 IP 生效（而非 Cloudflare 边缘 IP）"
     else
         rm -f "$CF_REALIP_CONF"
-        die "配置校验未通过，已回滚，请确认 Nginx 已编译 http_realip_module"
+        error "配置校验未通过，已回滚（也可能是其它站点配置本身有问题，与本次改动无关），真实报错如下:"
+        echo "$test_output" | tee -a "$LOG_FILE" 1>&2
+        die "请确认 Nginx 已编译 http_realip_module，或先排查上方报错"
     fi
 }
 
