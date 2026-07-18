@@ -1301,7 +1301,14 @@ CONF
         cat <<CONF
     }
 
-    # 允许 ACME webroot 验证，屏蔽其他隐藏路径
+    # FIX: 之前只 "allow all" 却没设 root，反代站点没有 root 指令时
+    # nginx 会退回内置默认根目录（如 /usr/share/nginx/html），验证文件
+    # 根本不在那，webroot 方式续期/换绑此域名必然 404 失败。
+    # 这里显式指到与 00-block-ip.conf 相同的共享 ACME 目录。
+    location ^~ /.well-known/acme-challenge/ {
+        default_type "text/plain";
+        root ${ACME_WEBROOT};
+    }
     location ~ /\.well-known { allow all; }
     location ~ /\.           { deny all; }
 CONF
@@ -1855,6 +1862,11 @@ CONF
 
         cat <<CONF
 
+    # FIX: 同上 — 负载均衡站点也没有 root 指令，webroot 验证文件会 404。
+    location ^~ /.well-known/acme-challenge/ {
+        default_type "text/plain";
+        root ${ACME_WEBROOT};
+    }
     location ~ /\.well-known { allow all; }
     location ~ /\.           { deny all; }
 CONF
