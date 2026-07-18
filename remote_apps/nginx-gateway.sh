@@ -20,7 +20,14 @@ LE_CERT_BASE="/etc/letsencrypt/live"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/nginx-gateway}"
 LOG_FILE="/var/log/nginx-gateway.log"
 SNIPPET_DIR="${NGINX_CONF_DIR}/snippets"
+# FIX: 共享 ACME HTTP-01 验证目录。裸 IP 拦截块（00-block-ip.conf）默认会把
+# 所有 Host 不匹配的请求 444 掉，这会连带把还没建站的新域名的验证请求也拦截，
+# 导致 webroot / nginx 方式申请证书必然失败。让默认拦截块单独放行这个目录，
+# 证书申请统一使用该目录作为 webroot，即可在建站前就完成验证。
+ACME_WEBROOT="${ACME_WEBROOT:-${WEBROOT_BASE}/_acme-challenge}"
 mkdir -p "$SNIPPET_DIR"
+mkdir -p "${ACME_WEBROOT}/.well-known/acme-challenge" 2>/dev/null || true
+chmod -R 755 "$ACME_WEBROOT" 2>/dev/null || true
 
 # ──────────────────────────────────────────────────────────
 # 颜色 & 日志工具
@@ -797,11 +804,25 @@ cert_issue_auto() {
     [[ -z "$domain" ]] && die "错误: 未提供域名参数"
 
     ensure_certbot
+    _ensure_block_ip   # 确保裸 IP 拦截块已放行 /.well-known/acme-challenge/
     local email
     safe_read -rp "请输入邮箱（用于证书到期通知）: " email
     [[ -z "$email" ]] && die "邮箱不能为空"
 
     info "申请 Let's Encrypt 证书: ${domain}..."
+
+    # FIX: 优先用共享 webroot 方式（00-block-ip.conf 已放行该目录），
+    # 不需要停止/依赖 nginx 已有站点配置，新域名建站前也能直接申请成功，
+    # 且不会像 standalone 那样导致本机其它站点短暂中断
+    if systemctl is-active --quiet nginx && nginx -t &>/dev/null; then
+        mkdir -p "${ACME_WEBROOT}/.well-known/acme-challenge"
+        if certbot certonly --webroot -w "$ACME_WEBROOT" -d "$domain" \
+            --agree-tos --email "$email" --no-eff-email --non-interactive; then
+            success "证书申请成功: ${LE_CERT_BASE}/${domain}/"
+            return 0
+        fi
+        warn "Webroot 方式申请失败，尝试 Nginx 插件方式..."
+    fi
 
     if certbot certonly --nginx -d "$domain" \
         --agree-tos --email "$email" --no-eff-email --non-interactive; then
@@ -853,9 +874,33 @@ cert_self_signed_auto() {
     success "自签名证书已生成: ${cert_dir}/"
 }
 
+_cert_issue_standalone() {
+    local domain="$1" email="$2"
+    local nginx_was_active=false
+    if systemctl is-active --quiet nginx; then
+        nginx_was_active=true
+        info "检测到 Nginx 正在运行，正在暂时停止以释放 80 端口（本机其它站点会短暂中断）..."
+        systemctl stop nginx 2>/dev/null || true
+    fi
+
+    local rc=1
+    if certbot certonly --standalone -d "$domain" \
+        --agree-tos --email "$email" --no-eff-email --non-interactive; then
+        rc=0
+    fi
+
+    if $nginx_was_active; then
+        info "正在恢复 Nginx 服务..."
+        systemctl start nginx 2>/dev/null || true
+    fi
+    return $rc
+}
+
 cmd_cert_issue() {
     require_root
     ensure_certbot
+    _ensure_block_ip   # FIX: 确保裸 IP 拦截块已放行 /.well-known/acme-challenge/，
+                        # 否则新域名建站前申请证书（webroot / nginx 方式）必然被 444 拦截失败
     local domain="" email="" method="nginx" wildcard=false
 
     while [[ $# -gt 0 ]]; do
@@ -890,32 +935,28 @@ cmd_cert_issue() {
                 if certbot certonly --nginx -d "$domain" --agree-tos --email "$email" \
                     --no-eff-email --non-interactive; then
                     success_flag=true
+                else
+                    # FIX: 域名还没建站时，nginx 插件大概率找不到匹配的 server 块而失败，
+                    # 原来直接报错退出；现在自动回退到 standalone，避免用户申请失败
+                    warn "Nginx 插件方式失败（该域名可能尚未建站，找不到匹配的 server 块），尝试回退到 Standalone 模式..."
+                    _cert_issue_standalone "$domain" "$email" && success_flag=true
                 fi
                 ;;
             webroot)
-                local wr="/var/www/html"; mkdir -p "$wr"
-                if certbot certonly --webroot -w "$wr" -d "$domain" \
+                # FIX: 改用 00-block-ip.conf 已放行的共享 ACME 目录，而不是 /var/www/html。
+                # 原来的 /var/www/html 在域名尚未建站时，请求会被裸 IP 拦截块 444 掉，
+                # 验证文件永远无法被 Let's Encrypt 访问到，webroot 方式必然失败。
+                mkdir -p "${ACME_WEBROOT}/.well-known/acme-challenge"
+                if certbot certonly --webroot -w "$ACME_WEBROOT" -d "$domain" \
                     --agree-tos --email "$email" --no-eff-email --non-interactive; then
                     success_flag=true
+                else
+                    warn "Webroot 方式失败，尝试回退到 Standalone 模式..."
+                    _cert_issue_standalone "$domain" "$email" && success_flag=true
                 fi
                 ;;
             standalone)
-                local nginx_was_active=false
-                if systemctl is-active --quiet nginx; then
-                    nginx_was_active=true
-                    info "检测到 Nginx 正在运行，正在暂时停止以释放 80 端口..."
-                    systemctl stop nginx 2>/dev/null || true
-                fi
-
-                if certbot certonly --standalone -d "$domain" \
-                    --agree-tos --email "$email" --no-eff-email --non-interactive; then
-                    success_flag=true
-                fi
-
-                if $nginx_was_active; then
-                    info "正在恢复 Nginx 服务..."
-                    systemctl start nginx 2>/dev/null || true
-                fi
+                _cert_issue_standalone "$domain" "$email" && success_flag=true
                 ;;
             *) die "未知验证方式: $method" ;;
         esac
@@ -924,8 +965,12 @@ cmd_cert_issue() {
     if $success_flag; then
         success "证书申请并生成成功！"
         success "证书路径: ${LE_CERT_BASE}/${domain}/"
+        if $wildcard; then
+            warn "泛域名证书使用手动 DNS 验证获取，certbot renew 无法非交互式自动续期此证书；"
+            warn "到期前（约 90 天）需要重新手动执行本次申请流程，或自行配置 --manual-auth-hook 实现自动化。"
+        fi
     else
-        die "证书申请失败，未生成新证书。请查看上方 Certbot 错误日志进行排查。"
+        die "证书申请失败，未生成新证书。请检查域名解析是否已指向本机公网 IP、80 端口是否对外开放，并查看上方 Certbot 错误日志。"
     fi
 }
 
@@ -978,6 +1023,23 @@ cmd_cert_list() {
 
 cmd_cert_auto_renew() {
     require_root
+
+    # FIX: manual 方式（泛域名证书）获取的证书无法非交互续期，提前提示，
+    # 避免用户误以为配置了自动续期后所有证书都能自动续上
+    local manual_certs=""
+    if command -v certbot &>/dev/null; then
+        for renewal_conf in /etc/letsencrypt/renewal/*.conf; do
+            [[ -f "$renewal_conf" ]] || continue
+            if grep -q "^authenticator = manual" "$renewal_conf" 2>/dev/null; then
+                manual_certs+="  - $(basename "$renewal_conf" .conf)\n"
+            fi
+        done
+    fi
+    if [[ -n "$manual_certs" ]]; then
+        warn "以下证书是通过手动 DNS 验证（泛域名）获取的，无法被自动续期任务非交互式续期："
+        echo -e "$manual_certs"
+        warn "到期前请手动重新执行: $0 cert issue -d <域名> -e <邮箱> --wildcard"
+    fi
 
     if systemctl list-timers 2>/dev/null | grep -q "certbot"; then
         info "检测到系统已自带 Certbot systemd 定时任务。"
@@ -2342,14 +2404,19 @@ _ensure_block_ip() {
         support_reject=false
     fi
 
-    # 若文件已存在，检查内容是否与当前 nginx 能力匹配，不匹配则重新生成
+    mkdir -p "${ACME_WEBROOT}/.well-known/acme-challenge" 2>/dev/null || true
+
+    # 若文件已存在，检查内容是否与当前 nginx 能力匹配 且已包含 ACME 放行规则，
+    # 否则重新生成（FIX: 旧版本文件没有 acme-challenge 例外，需要强制刷新一次）
     if [[ -f "$block_conf" ]] && [[ -L "$block_link" ]]; then
-        if $support_reject && grep -q "ssl_reject_handshake" "$block_conf"; then
-            return 0
-        elif ! $support_reject && ! grep -q "ssl_reject_handshake" "$block_conf"; then
-            return 0
+        if grep -q "acme-challenge" "$block_conf"; then
+            if $support_reject && grep -q "ssl_reject_handshake" "$block_conf"; then
+                return 0
+            elif ! $support_reject && ! grep -q "ssl_reject_handshake" "$block_conf"; then
+                return 0
+            fi
         fi
-        info "检测到裸 IP 拦截配置需要更新（nginx 版本变化），重新生成..."
+        info "检测到裸 IP 拦截配置需要更新（nginx 版本变化 / ACME 放行规则），重新生成..."
     fi
 
     # 自签名证书目录（旧版 nginx 兜底用）
@@ -2365,6 +2432,13 @@ server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
+
+    # FIX: 放行 ACME HTTP-01 验证请求，避免挡住尚未建站的新域名申请证书
+    location ^~ /.well-known/acme-challenge/ {
+        default_type "text/plain";
+        root ${ACME_WEBROOT};
+    }
+
     return 444;
 }
 
@@ -2391,6 +2465,13 @@ server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
+
+    # FIX: 放行 ACME HTTP-01 验证请求，避免挡住尚未建站的新域名申请证书
+    location ^~ /.well-known/acme-challenge/ {
+        default_type "text/plain";
+        root ${ACME_WEBROOT};
+    }
+
     return 444;
 }
 
@@ -2411,6 +2492,13 @@ server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
+
+    # FIX: 放行 ACME HTTP-01 验证请求，避免挡住尚未建站的新域名申请证书
+    location ^~ /.well-known/acme-challenge/ {
+        default_type "text/plain";
+        root ${ACME_WEBROOT};
+    }
+
     return 444;
 }
 BLOCKEOF
