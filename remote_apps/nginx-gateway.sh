@@ -598,6 +598,18 @@ _http2_new_syntax() {
     return 1
 }
 
+# FIX: resolver 去重。proxy/mirror 站点原来固定写死一行 resolver 用于
+# 动态解析后端域名，但当 SSL 模式非 none/self 时，ssl_block() 为了 OCSP
+# stapling 也会再输出一次 resolver，两条指令落在同一个 server{} 块里，
+# 会导致 nginx -t 报 "resolver" directive is duplicate 而失败。
+# 这里统一只输出一次：SSL 模式为 none/self（ssl_block 不会输出 resolver）
+# 时才在这里输出；其余情况交给 ssl_block 输出的那一条即可。
+emit_resolver_line() {
+    if [[ "$_SSL_MODE" == "none" || "$_SSL_MODE" == "self" ]]; then
+        echo "    resolver    1.1.1.1 8.8.8.8 valid=300s;"
+    fi
+}
+
 # 输出一对 SSL 监听指令并按版本自动开启 HTTP/2
 emit_ssl_listen_lines() {
     local port="$1"
@@ -1200,12 +1212,12 @@ site_create_proxy() {
         fi
         cat <<CONF
     server_name ${domain};
-    resolver    1.1.1.1 8.8.8.8 valid=300s;
     access_log /var/log/nginx/${domain}.access.log;
     error_log  /var/log/nginx/${domain}.error.log;
 
     client_max_body_size 0;
 CONF
+        emit_resolver_line
         deny_dangerous_methods_lines
         [[ "$_SSL_MODE" != "none" ]] && ssl_block "$_SSL_CERT" "$_SSL_KEY" "$_HSTS_HEADER" "$_SSL_MODE" && echo ""
 
@@ -1324,12 +1336,12 @@ LOCEOF
 
         cat <<CONF
     server_name ${domain};
-    resolver    1.1.1.1 8.8.8.8 valid=300s;
 
     access_log /var/log/nginx/${domain}.access.log;
     error_log  /var/log/nginx/${domain}.error.log;
 
 CONF
+        emit_resolver_line
         deny_dangerous_methods_lines
         [[ "$_SSL_MODE" != "none" ]] && ssl_block "$_SSL_CERT" "$_SSL_KEY" "$_HSTS_HEADER" "$_SSL_MODE" && echo ""
 
