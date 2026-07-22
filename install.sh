@@ -24,6 +24,7 @@ BASE_MODULES=(
     "ssh_harden.sh"
     "traffic_monitor.sh"
     "logs.sh"
+    "wireguard-mesh.sh"
     "tgbot.sh"
 )
 
