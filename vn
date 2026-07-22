@@ -172,7 +172,7 @@ main_menu() {
         echo -e "--------------------------------------------"
         echo -e " 1. 防火墙 / Fail2Ban 管理"
         echo -e " 2. 系统信息与优化 (BBR/Swap)"
-        echo -e " 3. sing-box 管理"
+        echo -e " 3. sing-box"
         echo -e " 4. 系统实时监控"
         echo -e " 5. 流量统计"
         echo -e " 6. 日志查看/删除"
