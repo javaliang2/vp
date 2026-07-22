@@ -41,6 +41,8 @@ MODULES_LIST=(
     "install_rsync.sh"
     "tg_bot.sh"
     "tg-relay-bot.sh"
+    "infra-shared.sh"
+    "wp-deploy.sh"
 
 )
 
@@ -188,6 +190,8 @@ main_menu() {
         echo -e "16. rsync安装"
         echo -e "17. sing-box/系统/监控机器人"
         echo -e "18. telegram 私聊机器人"
+        echo -e "19. MaraDB+Reids"
+        echo -e "20. wordpress单/多节点部署”
         echo -e "--------------------------------------------"
         echo -e "u. 更新全部       x. 卸载       0. 退出"
         echo -e "--------------------------------------------"
@@ -212,6 +216,8 @@ main_menu() {
             16) run_module "install_rsync.sh" ;;
             17) run_module "tg_bot.sh" ;;
             18) run_module "tg-relay-bot.sh" ;;
+            19) run_module "infra-shared.sh" ;;
+            20) run_module "wp-deploy.sh" ;;
             u) update_all ;;
             x) uninstall_script ;;
             0) exit 0 ;;
