@@ -170,7 +170,7 @@ main_menu() {
     while true; do
         clear
         echo -e "--------------------------------------------"
-        printf "${GREEN}========== VPS 综合管理面板 (vn) ==========${PLAIN}\n"
+        printf "${GREEN}========== VPS 综合脚本 (vn) ==========${PLAIN}\n"
         echo -e "--------------------------------------------"
         echo -e " 1. 防火墙 / Fail2Ban 管理"
         echo -e " 2. 系统信息与优化 (BBR/Swap)"
