@@ -191,7 +191,7 @@ main_menu() {
         echo -e "17. sing-box/系统/监控机器人"
         echo -e "18. telegram 私聊机器人"
         echo -e "19. MaraDB+Reids"
-        echo -e "20. wordpress单/多节点部署"
+        echo -e "20. wordpress 多节点部署"
         echo -e "--------------------------------------------"
         echo -e "u. 更新全部       x. 卸载       0. 退出"
         echo -e "--------------------------------------------"
