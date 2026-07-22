@@ -25,7 +25,7 @@ BASE_MODULES=(
     "traffic_monitor.sh"
     "logs.sh"
     "wireguard-mesh.sh"
-    "tgbot.sh"
+    "nginx-gateway.sh"
 )
 
 # 动态提取主控中的 MODULES_LIST
