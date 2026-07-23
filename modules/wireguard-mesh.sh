@@ -6,7 +6,7 @@ set -euo pipefail
 
 # ── 常量 ────────────────────────────────────────────────────
 readonly WG_IFACE="${WG_IFACE:-wg0}"
-readonly WG_PORT="${WG_PORT:-51820}"
+readonly WG_PORT="${WG_PORT:-52018}"
 readonly WG_DIR="/etc/wireguard"
 readonly WG_CONF="${WG_DIR}/${WG_IFACE}.conf"
 readonly WG_KEY_DIR="${WG_DIR}/keys"
