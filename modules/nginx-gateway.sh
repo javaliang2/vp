@@ -72,6 +72,22 @@ init_dirs() {
     ensure_slow_attack_protection
     _ensure_block_ip
     _ensure_gzip_conf
+
+    # FIX: 上面这几个 ensure_* 都只是把配置写到磁盘文件，不会让正在跑的 nginx
+    # 进程自动生效——比如 _ensure_block_ip 刚补上/更新了 /.well-known/acme-challenge/
+    # 放行规则，但 nginx 内存里用的还是上次重载时的旧配置，webroot 方式申请证书
+    # 照样 404，而且现象上"看起来没规律"：能不能踩上取决于上次手动重载 nginx
+    # 是什么时候，很难排查。这里在 nginx 已经在跑的前提下补一次检查+重载，让
+    # ensure_* 的改动立刻生效。语法检查失败只警告不中断——避免因为这里冒出一个
+    # 跟本次操作无关的 nginx -t 报错，把本来在做别的事（比如加站点）的命令也卡死；
+    # 真出这种情况会在下面提示，命令本身继续往后走。
+    if command -v nginx &>/dev/null && systemctl is-active --quiet nginx 2>/dev/null; then
+        if nginx -t &>/dev/null; then
+            systemctl reload nginx 2>/dev/null
+        else
+            warn "Nginx 配置检查未通过，跳过自动重载；本次网关配置改动（含 ACME 验证放行规则）要等 'nginx -t' 排查修好后才会生效，可以手动跑 nginx-gateway.sh reload 排查"
+        fi
+    fi
 }
 
 # 确保 nginx.conf 引入 sites-enabled（nginx.org 官方包默认不带这个约定，
@@ -565,6 +581,23 @@ proxy_hide_backend_headers_lines() {
     cat <<'EOF'
         proxy_hide_header X-Powered-By;
         proxy_hide_header Server;
+EOF
+}
+
+# 放行 ACME HTTP-01 验证路径，指到跟 00-block-ip.conf / 普通反代站点一致的共享
+# webroot 目录（$ACME_WEBROOT）。证书申请/续期用 webroot 方式时，certbot 会把验证
+# 文件写到这个共享目录，不是写到站点自己的 root/target 里——静态文件站点、镜像代理、
+# 跳转站点这几种模板如果不显式放行这条路径，各自的 root/proxy_pass/return 逻辑会
+# 抢在这条路径前面命中，导致验证文件永远访问不到（404 或被跳转走），webroot 方式
+# 必然失败，只能靠 certbot --nginx 插件动态插入配置兜底。
+# location 用 ^~ 前缀匹配，nginx 按最长前缀匹配优先级选择 location，不依赖这段代码
+# 在文件里插入的先后位置，写在 server 块内任意位置都生效。
+acme_challenge_location_lines() {
+    cat <<EOF
+    location ^~ /.well-known/acme-challenge/ {
+        default_type "text/plain";
+        root ${ACME_WEBROOT};
+    }
 EOF
 }
 
@@ -1200,6 +1233,7 @@ CONF
         deny_dangerous_methods_lines
         [[ "$_SSL_MODE" != "none" ]] && ssl_block "$_SSL_CERT" "$_SSL_KEY" "$_HSTS_HEADER" "$_SSL_MODE" && echo ""
 
+        printf '%s\n' "$(acme_challenge_location_lines)"
         cat <<'CONF2'
     location ~* \.(css|js|png|jpg|jpeg|gif|ico|svg|woff2?)$ {
         expires 30d;
@@ -1450,6 +1484,7 @@ CONF
         fi
 
         echo ""
+        printf '%s\n' "$(acme_challenge_location_lines)"
         echo "    location ~ /\. { deny all; }"
         deny_sensitive_files_lines
         echo "}"
@@ -1683,6 +1718,11 @@ site_create_redirect() {
         echo "    access_log /var/log/nginx/${src_domain}-redirect.access.log;"
         echo "    error_log  /var/log/nginx/${src_domain}-redirect.error.log;"
         echo ""
+        # ACME HTTP-01 验证只走 80 端口，跳转站点原本是不管路径一律 return 跳转掉，
+        # 连验证请求也会被跳走，webroot 方式续期必然失败。location 和 server 级别的
+        # 裸 return 能共存：命中这个 location 的请求走这里放行，其余路径照样落到下面
+        # 的 return 跳转，不影响原有跳转行为。443 端口块不需要加，HTTP-01 不会往这走。
+        printf '%s\n' "$(acme_challenge_location_lines)"
         _redirect_return "$code"
         echo "}"
 
